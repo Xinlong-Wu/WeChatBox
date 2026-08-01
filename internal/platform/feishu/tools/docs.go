@@ -143,10 +143,10 @@ type writeOutput struct {
 }
 
 type pendingApprovalOutput struct {
-	Status     string `json:"status"`
-	ApprovalID string `json:"approval_id"`
-	ExpiresAt  string `json:"expires_at"`
-	Message    string `json:"message"`
+	Status    string `json:"status"`
+	RequestID string `json:"request_id"`
+	ExpiresAt string `json:"expires_at"`
+	Message   string `json:"message"`
 }
 
 func (t docsTool) search(ctx context.Context, raw json.RawMessage) (string, error) {
@@ -284,10 +284,10 @@ func (t docsTool) create(ctx context.Context, raw json.RawMessage) (string, erro
 		return "", fmt.Errorf("request feishu document creation approval: %w", err)
 	}
 	return marshalToolOutput(pendingApprovalOutput{
-		Status:     "pending_approval",
-		ApprovalID: pending.ID,
-		ExpiresAt:  pending.ExpiresAt.UTC().Format(time.RFC3339),
-		Message:    "已向本次请求的飞书用户发送授权卡片；可同意本次，或为相同用户、机器人账号、对话和 feishu_docs_create 授权 24 小时。批准后会异步创建文档，请勿重复调用。",
+		Status:    "pending_approval",
+		RequestID: pending.RequestID,
+		ExpiresAt: pending.ExpiresAt.UTC().Format(time.RFC3339),
+		Message:   "已向本次请求的飞书用户发送授权卡片；可同意本次，或为相同用户、机器人账号、对话和 feishu_docs_create 授权 24 小时。批准后会异步创建文档，请勿重复调用。",
 	})
 }
 

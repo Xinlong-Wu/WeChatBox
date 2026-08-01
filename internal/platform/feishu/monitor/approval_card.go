@@ -45,9 +45,9 @@ func (c pendingApprovalCard) JSON() (string, error) {
 	)
 	value := func(action string) map[string]interface{} {
 		return map[string]interface{}{
-			"kind":        approvalCardActionKind,
-			"approval_id": c.approval.ID,
-			"action":      action,
+			"kind":       approvalCardActionKind,
+			"request_id": c.approval.ID,
+			"action":     action,
 		}
 	}
 	card := map[string]interface{}{
@@ -138,12 +138,12 @@ func parseApprovalCardAction(event *callback.CardActionTriggerEvent) (string, st
 		return "", "", false
 	}
 	value := event.Event.Action.Value
-	approvalID := strings.TrimSpace(stringApprovalValue(value, "approval_id"))
+	requestID := strings.TrimSpace(stringApprovalValue(value, "request_id"))
 	action := strings.TrimSpace(stringApprovalValue(value, "action"))
-	if approvalID == "" || (action != approvalCardActionApproveOnce && action != approvalCardActionApproveAll && action != approvalCardActionReject) {
-		return approvalID, action, false
+	if requestID == "" || (action != approvalCardActionApproveOnce && action != approvalCardActionApproveAll && action != approvalCardActionReject) {
+		return requestID, action, false
 	}
-	return approvalID, action, true
+	return requestID, action, true
 }
 
 func approvalCardReason(event *callback.CardActionTriggerEvent) string {

@@ -120,7 +120,7 @@ func (fakeToolApprovalRequester) HasActiveGrant(context.Context, string) (bool, 
 }
 
 func (fakeToolApprovalRequester) RequestApproval(context.Context, feishutools.ApprovalRequest) (feishutools.PendingApproval, error) {
-	return feishutools.PendingApproval{ID: "approval"}, nil
+	return feishutools.PendingApproval{RequestID: "req_approval"}, nil
 }
 
 type sentText struct {

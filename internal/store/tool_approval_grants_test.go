@@ -17,7 +17,7 @@ func TestToolApprovalGrantMatchesExactScopeAndExpiresLazily(t *testing.T) {
 	}
 	created, err := st.UpsertToolApprovalGrant(ToolApprovalGrant{
 		ToolApprovalGrantScope: scope,
-		SourceApprovalID:       "approval_123",
+		SourceRequestID:        "req_123",
 		CreatedAt:              now,
 		ExpiresAt:              now.Add(24 * time.Hour),
 	})
@@ -32,7 +32,7 @@ func TestToolApprovalGrantMatchesExactScopeAndExpiresLazily(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ActiveToolApprovalGrant returned error: %v", err)
 	}
-	if !ok || active.SourceApprovalID != "approval_123" {
+	if !ok || active.SourceRequestID != "req_123" {
 		t.Fatalf("active grant = %#v ok=%v, want exact scope match", active, ok)
 	}
 
@@ -73,7 +73,7 @@ func TestToolApprovalGrantUpsertRenewsExactScope(t *testing.T) {
 	}
 	if _, err := st.UpsertToolApprovalGrant(ToolApprovalGrant{
 		ToolApprovalGrantScope: scope,
-		SourceApprovalID:       "approval_first",
+		SourceRequestID:        "req_first",
 		CreatedAt:              now,
 		ExpiresAt:              now.Add(time.Hour),
 	}); err != nil {
@@ -82,7 +82,7 @@ func TestToolApprovalGrantUpsertRenewsExactScope(t *testing.T) {
 	renewedAt := now.Add(30 * time.Minute)
 	if _, err := st.UpsertToolApprovalGrant(ToolApprovalGrant{
 		ToolApprovalGrantScope: scope,
-		SourceApprovalID:       "approval_second",
+		SourceRequestID:        "req_second",
 		CreatedAt:              renewedAt,
 		ExpiresAt:              renewedAt.Add(24 * time.Hour),
 	}); err != nil {
@@ -93,7 +93,7 @@ func TestToolApprovalGrantUpsertRenewsExactScope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ActiveToolApprovalGrant returned error: %v", err)
 	}
-	if !ok || grant.SourceApprovalID != "approval_second" || !grant.CreatedAt.Equal(renewedAt) || !grant.ExpiresAt.Equal(renewedAt.Add(24*time.Hour)) {
+	if !ok || grant.SourceRequestID != "req_second" || !grant.CreatedAt.Equal(renewedAt) || !grant.ExpiresAt.Equal(renewedAt.Add(24*time.Hour)) {
 		t.Fatalf("renewed grant = %#v ok=%v", grant, ok)
 	}
 }
@@ -115,7 +115,7 @@ func TestDeleteToolApprovalsAlsoRemovesGrantsForMatchingAccount(t *testing.T) {
 	for i, scope := range []ToolApprovalGrantScope{first, second} {
 		if _, err := st.UpsertToolApprovalGrant(ToolApprovalGrant{
 			ToolApprovalGrantScope: scope,
-			SourceApprovalID:       []string{"approval_first", "approval_second"}[i],
+			SourceRequestID:        []string{"req_first", "req_second"}[i],
 			CreatedAt:              now,
 			ExpiresAt:              now.Add(24 * time.Hour),
 		}); err != nil {

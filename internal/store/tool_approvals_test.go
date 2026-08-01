@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -23,8 +24,15 @@ func TestToolApprovalApproveAndCompleteIsSingleUse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateToolApproval returned error: %v", err)
 	}
-	if created.ID == "" || created.State != ToolApprovalStatePending {
+	if !strings.HasPrefix(created.ID, "req_") || created.State != ToolApprovalStatePending {
 		t.Fatalf("created approval = %#v, want generated pending approval", created)
+	}
+	workflow, err := st.GetWorkflowRequest(created.ID, created.AccountID)
+	if err != nil {
+		t.Fatalf("GetWorkflowRequest returned error: %v", err)
+	}
+	if workflow.Kind != WorkflowRequestKindToolApproval || workflow.State != WorkflowRequestStatePending {
+		t.Fatalf("created workflow = %#v", workflow)
 	}
 	if err := st.SetToolApprovalCardMessageID(created.ID, created.AccountID, "om_card", now.Add(time.Second)); err != nil {
 		t.Fatalf("SetToolApprovalCardMessageID returned error: %v", err)
@@ -68,6 +76,10 @@ func TestToolApprovalApproveAndCompleteIsSingleUse(t *testing.T) {
 	}
 	if final.State != ToolApprovalStateSucceeded || final.Payload != "" {
 		t.Fatalf("final approval = %#v, want succeeded with cleared payload", final)
+	}
+	workflow, err = st.GetWorkflowRequest(created.ID, created.AccountID)
+	if err != nil || workflow.State != WorkflowRequestStateSucceeded {
+		t.Fatalf("completed workflow = %#v err=%v", workflow, err)
 	}
 	if err := st.CompleteToolApproval(created.ID, created.AccountID, ToolApprovalStateSucceeded, now.Add(5*time.Second)); !errors.Is(err, ErrToolApprovalResolved) {
 		t.Fatalf("second completion error = %v, want ErrToolApprovalResolved", err)
@@ -155,6 +167,10 @@ func TestToolApprovalDenyAndExpiryClearPayload(t *testing.T) {
 	if expired.State != ToolApprovalStateExpired || expired.Payload != "" {
 		t.Fatalf("expired approval = %#v, want expired with cleared payload", expired)
 	}
+	workflow, err := st.GetWorkflowRequest(expiring.ID, expiring.AccountID)
+	if err != nil || workflow.State != WorkflowRequestStateExpired {
+		t.Fatalf("expired workflow = %#v err=%v", workflow, err)
+	}
 }
 
 func TestDeleteToolApprovalsRemovesOnlyMatchingAccount(t *testing.T) {
@@ -190,6 +206,9 @@ func TestDeleteToolApprovalsRemovesOnlyMatchingAccount(t *testing.T) {
 	}
 	if _, err := st.GetToolApproval(first.ID, first.AccountID); !errors.Is(err, ErrToolApprovalNotFound) {
 		t.Fatalf("deleted approval error = %v, want ErrToolApprovalNotFound", err)
+	}
+	if _, err := st.GetWorkflowRequest(first.ID, first.AccountID); !errors.Is(err, ErrWorkflowRequestNotFound) {
+		t.Fatalf("deleted workflow error = %v, want ErrWorkflowRequestNotFound", err)
 	}
 	if _, err := st.GetToolApproval(second.ID, second.AccountID); err != nil {
 		t.Fatalf("other account approval was deleted: %v", err)

@@ -146,13 +146,13 @@ func (m *approvalManager) HasActiveGrant(ctx context.Context, toolName string) (
 		return false, fmt.Errorf("check active feishu tool approval grant: %w", err)
 	}
 	if active {
-		feishuLog.Debug(ctx, "using active feishu tool approval grant account=%s tool=%s user=%s chat=%s expires_at=%s source_approval=%s",
+		feishuLog.Debug(ctx, "using active feishu tool approval grant account=%s tool=%s user=%s chat=%s expires_at=%s source_request=%s",
 			scope.AccountID,
 			scope.ToolName,
 			scope.ActorID,
 			scope.ChatID,
 			grant.ExpiresAt.Format(time.RFC3339),
-			shortApprovalID(grant.SourceApprovalID),
+			shortRequestID(grant.SourceRequestID),
 		)
 	}
 	return active, nil
@@ -206,24 +206,24 @@ func (m *approvalManager) RequestApproval(ctx context.Context, request feishutoo
 		return feishutools.PendingApproval{}, fmt.Errorf("bind feishu tool approval card: %w", err)
 	}
 	approval.CardMessageID = cardMessageID
-	feishuLog.Info(ctx, "requested feishu tool approval id=%s account=%s tool=%s user=%s chat=%s expires_at=%s",
-		shortApprovalID(approval.ID),
+	feishuLog.Info(ctx, "requested feishu tool approval request=%s account=%s tool=%s user=%s chat=%s expires_at=%s",
+		shortRequestID(approval.ID),
 		approval.AccountID,
 		approval.ToolName,
 		approvalActorID(approval),
 		approval.ChatID,
 		approval.ExpiresAt.Format(time.RFC3339),
 	)
-	return feishutools.PendingApproval{ID: approval.ID, ExpiresAt: approval.ExpiresAt}, nil
+	return feishutools.PendingApproval{RequestID: approval.ID, ExpiresAt: approval.ExpiresAt}, nil
 }
 
 func (m *approvalManager) HandleCardAction(ctx context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
-	approvalID, action, ok := parseApprovalCardAction(event)
+	requestID, action, ok := parseApprovalCardAction(event)
 	if !ok {
 		return nil, nil
 	}
 	if event == nil || event.Event == nil || event.Event.Operator == nil || event.Event.Context == nil {
-		feishuLog.Warn(ctx, "ignored malformed feishu tool approval callback id=%s", shortApprovalID(approvalID))
+		feishuLog.Warn(ctx, "ignored malformed feishu tool approval callback request=%s", shortRequestID(requestID))
 		return cardToast("error", "授权回调信息不完整，请重新发起操作。"), nil
 	}
 	operator := event.Event.Operator
@@ -234,18 +234,18 @@ func (m *approvalManager) HandleCardAction(ctx context.Context, event *callback.
 		CardMessageID: event.Event.Context.OpenMessageID,
 	}
 	reason := approvalCardReason(event)
-	feishuLog.Debug(ctx, "received feishu tool approval callback id=%s account=%s action=%s reason_provided=%t reason_chars=%d",
-		shortApprovalID(approvalID), m.account.ID, action, reason != "", utf8.RuneCountInString(reason))
+	feishuLog.Debug(ctx, "received feishu tool approval callback request=%s account=%s action=%s reason_provided=%t reason_chars=%d",
+		shortRequestID(requestID), m.account.ID, action, reason != "", utf8.RuneCountInString(reason))
 	decidedAt := m.currentTime()
-	approval, err := m.store.DecideToolApproval(approvalID, m.account.ID, approvalDecision(action), match, decidedAt)
+	approval, err := m.store.DecideToolApproval(requestID, m.account.ID, approvalDecision(action), match, decidedAt)
 	if err != nil {
-		return m.handleApprovalDecisionError(ctx, approval, approvalID, match, err), nil
+		return m.handleApprovalDecisionError(ctx, approval, requestID, match, err), nil
 	}
 
 	switch action {
 	case approvalCardActionReject:
-		feishuLog.Info(ctx, "denied feishu tool approval id=%s account=%s tool=%s user=%s chat=%s",
-			shortApprovalID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID)
+		feishuLog.Info(ctx, "denied feishu tool approval request=%s account=%s tool=%s user=%s chat=%s",
+			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID)
 		return approvalCallbackResponse(
 			"success",
 			"已拒绝，本次操作不会执行。",
@@ -254,7 +254,7 @@ func (m *approvalManager) HandleCardAction(ctx context.Context, event *callback.
 	case approvalCardActionApproveOnce, approvalCardActionApproveAll:
 		executor := m.executor(approval.ToolName)
 		if executor == nil {
-			feishuLog.Error(ctx, "approved feishu tool has no executor id=%s account=%s tool=%s", shortApprovalID(approval.ID), approval.AccountID, approval.ToolName)
+			feishuLog.Error(ctx, "approved feishu tool has no executor request=%s account=%s tool=%s", shortRequestID(approval.ID), approval.AccountID, approval.ToolName)
 			m.failApprovalBestEffort(ctx, approval.ID)
 			return approvalCallbackResponse(
 				"error",
@@ -270,8 +270,8 @@ func (m *approvalManager) HandleCardAction(ctx context.Context, event *callback.
 				toast = "已同意本次操作，正在执行；但 24 小时免审批授权保存失败，后续调用仍需审批。"
 			}
 		}
-		feishuLog.Info(ctx, "approved feishu tool approval id=%s account=%s tool=%s user=%s chat=%s mode=%s",
-			shortApprovalID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID, action)
+		feishuLog.Info(ctx, "approved feishu tool approval request=%s account=%s tool=%s user=%s chat=%s mode=%s",
+			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID, action)
 		// The official delayed-update flow requires the callback to return before
 		// using its token, so approval returns only a Toast and updates the final
 		// card state after the asynchronous operation completes.
@@ -285,51 +285,51 @@ func (m *approvalManager) HandleCardAction(ctx context.Context, event *callback.
 func (m *approvalManager) saveReusableApprovalGrant(ctx context.Context, approval store.ToolApproval, now time.Time) (time.Time, bool) {
 	scope, err := toolApprovalGrantScope(approval.AccountID, approval.ToolName, approval.ActorOpenID, approval.ActorUserID, approval.ChatID)
 	if err != nil {
-		feishuLog.Warn(ctx, "cannot scope reusable feishu tool approval id=%s account=%s tool=%s: %v",
-			shortApprovalID(approval.ID), approval.AccountID, approval.ToolName, err)
+		feishuLog.Warn(ctx, "cannot scope reusable feishu tool approval request=%s account=%s tool=%s: %v",
+			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, err)
 		return time.Time{}, false
 	}
 	expiresAt := now.Add(m.approvalGrantTTL())
 	grant, err := m.store.UpsertToolApprovalGrant(store.ToolApprovalGrant{
 		ToolApprovalGrantScope: scope,
-		SourceApprovalID:       approval.ID,
+		SourceRequestID:        approval.ID,
 		CreatedAt:              now,
 		ExpiresAt:              expiresAt,
 	})
 	if err != nil {
-		feishuLog.Warn(ctx, "save reusable feishu tool approval failed id=%s account=%s tool=%s user=%s chat=%s: %v",
-			shortApprovalID(approval.ID), approval.AccountID, approval.ToolName, scope.ActorID, scope.ChatID, err)
+		feishuLog.Warn(ctx, "save reusable feishu tool approval failed request=%s account=%s tool=%s user=%s chat=%s: %v",
+			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, scope.ActorID, scope.ChatID, err)
 		return time.Time{}, false
 	}
-	feishuLog.Info(ctx, "saved reusable feishu tool approval account=%s tool=%s user=%s chat=%s expires_at=%s source_approval=%s",
-		grant.AccountID, grant.ToolName, grant.ActorID, grant.ChatID, grant.ExpiresAt.Format(time.RFC3339), shortApprovalID(grant.SourceApprovalID))
+	feishuLog.Info(ctx, "saved reusable feishu tool approval account=%s tool=%s user=%s chat=%s expires_at=%s source_request=%s",
+		grant.AccountID, grant.ToolName, grant.ActorID, grant.ChatID, grant.ExpiresAt.Format(time.RFC3339), shortRequestID(grant.SourceRequestID))
 	return grant.ExpiresAt, true
 }
 
-func (m *approvalManager) handleApprovalDecisionError(ctx context.Context, approval store.ToolApproval, approvalID string, match store.ToolApprovalMatch, err error) *callback.CardActionTriggerResponse {
+func (m *approvalManager) handleApprovalDecisionError(ctx context.Context, approval store.ToolApproval, requestID string, match store.ToolApprovalMatch, err error) *callback.CardActionTriggerResponse {
 	switch {
 	case errors.Is(err, store.ErrToolApprovalForbidden):
-		feishuLog.Warn(ctx, "rejected feishu tool approval actor mismatch id=%s account=%s callback_user=%s",
-			shortApprovalID(approvalID), m.account.ID, approvalMatchActorID(match))
+		feishuLog.Warn(ctx, "rejected feishu tool approval actor mismatch request=%s account=%s callback_user=%s",
+			shortRequestID(requestID), m.account.ID, approvalMatchActorID(match))
 		return cardToast("error", "只有发起请求的用户可以授权。")
 	case errors.Is(err, store.ErrToolApprovalContextMismatch):
-		feishuLog.Warn(ctx, "rejected feishu tool approval context mismatch id=%s account=%s", shortApprovalID(approvalID), m.account.ID)
+		feishuLog.Warn(ctx, "rejected feishu tool approval context mismatch request=%s account=%s", shortRequestID(requestID), m.account.ID)
 		return cardToast("error", "授权卡片与原请求不匹配。")
 	case errors.Is(err, store.ErrToolApprovalExpired):
-		feishuLog.Info(ctx, "expired feishu tool approval callback id=%s account=%s tool=%s", shortApprovalID(approvalID), m.account.ID, approval.ToolName)
+		feishuLog.Info(ctx, "expired feishu tool approval callback request=%s account=%s tool=%s", shortRequestID(requestID), m.account.ID, approval.ToolName)
 		return approvalCallbackResponse(
 			"error",
 			"授权已过期，请重新发起操作。",
 			statusCard{title: "授权已过期", template: "grey", message: "该请求已超过有效期，请重新发起操作。"},
 		)
 	case errors.Is(err, store.ErrToolApprovalResolved):
-		feishuLog.Debug(ctx, "ignored resolved feishu tool approval callback id=%s account=%s state=%s", shortApprovalID(approvalID), m.account.ID, approval.State)
+		feishuLog.Debug(ctx, "ignored resolved feishu tool approval callback request=%s account=%s state=%s", shortRequestID(requestID), m.account.ID, approval.State)
 		return cardToast("info", "该授权请求已经处理。")
 	case errors.Is(err, store.ErrToolApprovalNotFound):
-		feishuLog.Warn(ctx, "unknown feishu tool approval callback id=%s account=%s", shortApprovalID(approvalID), m.account.ID)
+		feishuLog.Warn(ctx, "unknown feishu tool approval callback request=%s account=%s", shortRequestID(requestID), m.account.ID)
 		return cardToast("error", "授权请求不存在或已失效。")
 	default:
-		feishuLog.Error(ctx, "handle feishu tool approval callback failed id=%s account=%s: %v", shortApprovalID(approvalID), m.account.ID, err)
+		feishuLog.Error(ctx, "handle feishu tool approval callback failed request=%s account=%s: %v", shortRequestID(requestID), m.account.ID, err)
 		return cardToast("error", "处理授权失败，请稍后重试。")
 	}
 }
@@ -341,29 +341,29 @@ func (m *approvalManager) executeApproved(approval store.ToolApproval, executor 
 	completedAt := m.currentTime()
 	if err != nil {
 		if completeErr := m.store.CompleteToolApproval(approval.ID, approval.AccountID, store.ToolApprovalStateFailed, completedAt); completeErr != nil {
-			feishuLog.Error(m.baseContext(), "mark feishu tool approval failed id=%s account=%s: %v", shortApprovalID(approval.ID), approval.AccountID, completeErr)
+			feishuLog.Error(m.baseContext(), "mark feishu tool approval failed request=%s account=%s: %v", shortRequestID(approval.ID), approval.AccountID, completeErr)
 		}
-		feishuLog.Error(m.baseContext(), "execute approved feishu tool failed id=%s account=%s tool=%s user=%s chat=%s: %v",
-			shortApprovalID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID, err)
+		feishuLog.Error(m.baseContext(), "execute approved feishu tool failed request=%s account=%s tool=%s user=%s chat=%s: %v",
+			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID, err)
 		m.notifyApprovalResult(approval, callbackToken, statusCard{title: "执行失败", template: "red", message: "授权已确认，但操作执行失败。请稍后重新发起。"}, "❌ 已授权，但操作执行失败。请稍后重试。")
 		return
 	}
 	if err := m.store.CompleteToolApproval(approval.ID, approval.AccountID, store.ToolApprovalStateSucceeded, completedAt); err != nil {
-		feishuLog.Error(m.baseContext(), "mark feishu tool approval succeeded id=%s account=%s: %v", shortApprovalID(approval.ID), approval.AccountID, err)
+		feishuLog.Error(m.baseContext(), "mark feishu tool approval succeeded request=%s account=%s: %v", shortRequestID(approval.ID), approval.AccountID, err)
 	}
 	message := strings.TrimSpace(result.Message)
 	if message == "" {
 		message = "✅ 已完成授权操作。"
 	}
 	if result.Warning {
-		feishuLog.Warn(m.baseContext(), "completed approved feishu tool with warning id=%s account=%s tool=%s user=%s chat=%s warning=%s",
-			shortApprovalID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID,
+		feishuLog.Warn(m.baseContext(), "completed approved feishu tool with warning request=%s account=%s tool=%s user=%s chat=%s warning=%s",
+			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID,
 			truncateApprovalRunes(strings.TrimSpace(result.WarningReason), approvalCardMaxValueRunes))
 		m.notifyApprovalResult(approval, callbackToken, statusCard{title: "执行完成（有警告）", template: "orange", message: message}, message)
 		return
 	}
-	feishuLog.Info(m.baseContext(), "completed approved feishu tool id=%s account=%s tool=%s user=%s chat=%s",
-		shortApprovalID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID)
+	feishuLog.Info(m.baseContext(), "completed approved feishu tool request=%s account=%s tool=%s user=%s chat=%s",
+		shortRequestID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID)
 	m.notifyApprovalResult(approval, callbackToken, statusCard{title: "执行完成", template: "green", message: message}, message)
 }
 
@@ -372,7 +372,7 @@ func (m *approvalManager) notifyApprovalResult(approval store.ToolApproval, call
 	defer cancel()
 	m.updateCardAfterInteractionBestEffort(ctx, approval, callbackToken, card)
 	if err := m.notifier.SendText(ctx, approval.ChatID, message); err != nil {
-		feishuLog.Warn(ctx, "send feishu tool approval result failed id=%s account=%s chat=%s: %v", shortApprovalID(approval.ID), approval.AccountID, approval.ChatID, err)
+		feishuLog.Warn(ctx, "send feishu tool approval result failed request=%s account=%s chat=%s: %v", shortRequestID(approval.ID), approval.AccountID, approval.ChatID, err)
 	}
 }
 
@@ -387,17 +387,17 @@ func (m *approvalManager) updateCardBestEffort(ctx context.Context, messageID st
 
 func (m *approvalManager) updateCardAfterInteractionBestEffort(ctx context.Context, approval store.ToolApproval, callbackToken string, card Card) {
 	if strings.TrimSpace(callbackToken) == "" || card == nil {
-		feishuLog.Warn(ctx, "skip delayed feishu tool approval card update id=%s account=%s: callback token unavailable", shortApprovalID(approval.ID), approval.AccountID)
+		feishuLog.Warn(ctx, "skip delayed feishu tool approval card update request=%s account=%s: callback token unavailable", shortRequestID(approval.ID), approval.AccountID)
 		return
 	}
 	if err := m.cards.UpdateByCallbackToken(ctx, callbackToken, card); err != nil {
-		feishuLog.Warn(ctx, "delay-update feishu tool approval card failed id=%s account=%s: %v", shortApprovalID(approval.ID), approval.AccountID, err)
+		feishuLog.Warn(ctx, "delay-update feishu tool approval card failed request=%s account=%s: %v", shortRequestID(approval.ID), approval.AccountID, err)
 	}
 }
 
-func (m *approvalManager) failApprovalBestEffort(ctx context.Context, approvalID string) {
-	if err := m.store.FailToolApproval(approvalID, m.account.ID, m.currentTime()); err != nil && !errors.Is(err, store.ErrToolApprovalResolved) {
-		feishuLog.Error(ctx, "close failed feishu tool approval id=%s account=%s: %v", shortApprovalID(approvalID), m.account.ID, err)
+func (m *approvalManager) failApprovalBestEffort(ctx context.Context, requestID string) {
+	if err := m.store.FailToolApproval(requestID, m.account.ID, m.currentTime()); err != nil && !errors.Is(err, store.ErrToolApprovalResolved) {
+		feishuLog.Error(ctx, "close failed feishu tool approval request=%s account=%s: %v", shortRequestID(requestID), m.account.ID, err)
 	}
 }
 
@@ -509,7 +509,7 @@ func toolApprovalGrantScope(accountID, toolName, actorOpenID, actorUserID, chatI
 	return scope, nil
 }
 
-func shortApprovalID(id string) string {
+func shortRequestID(id string) string {
 	id = strings.TrimSpace(id)
 	if len(id) <= 12 {
 		return id

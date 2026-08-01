@@ -23,7 +23,7 @@ type ApprovalRequest struct {
 
 // PendingApproval identifies a durable approval request sent to Feishu.
 type PendingApproval struct {
-	ID        string
+	RequestID string
 	ExpiresAt time.Time
 }
 

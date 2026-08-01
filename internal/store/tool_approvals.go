@@ -22,18 +22,19 @@ var (
 )
 
 const (
-	ToolApprovalStatePending   = "pending"
-	ToolApprovalStateExecuting = "executing"
-	ToolApprovalStateDenied    = "denied"
-	ToolApprovalStateSucceeded = "succeeded"
-	ToolApprovalStateFailed    = "failed"
-	ToolApprovalStateExpired   = "expired"
+	ToolApprovalStatePending   = WorkflowRequestStatePending
+	ToolApprovalStateExecuting = WorkflowRequestStateExecuting
+	ToolApprovalStateDenied    = WorkflowRequestStateDenied
+	ToolApprovalStateSucceeded = WorkflowRequestStateSucceeded
+	ToolApprovalStateFailed    = WorkflowRequestStateFailed
+	ToolApprovalStateExpired   = WorkflowRequestStateExpired
 
 	ToolApprovalDecisionApprove = "approve"
 	ToolApprovalDecisionDeny    = "deny"
 )
 
-// ToolApproval is one durable, single-use human authorization request for a tool call.
+// ToolApproval is one durable, single-use human authorization request for a
+// tool call. ID is the globally unique root workflow request ID.
 type ToolApproval struct {
 	ID              string
 	AccountID       string
@@ -58,16 +59,20 @@ type ToolApprovalMatch struct {
 	CardMessageID string
 }
 
-// CreateToolApproval persists a new pending approval and generates an ID when omitted.
+// CreateToolApproval atomically persists a root workflow request and its pending approval.
 func (s *Store) CreateToolApproval(approval ToolApproval) (ToolApproval, error) {
 	approval = normalizeToolApproval(approval)
-	if approval.ID == "" {
-		id, err := generateID()
-		if err != nil {
-			return ToolApproval{}, err
-		}
-		approval.ID = id
+	request, err := prepareWorkflowRequest(WorkflowRequest{
+		ID:        approval.ID,
+		AccountID: approval.AccountID,
+		Kind:      WorkflowRequestKindToolApproval,
+		State:     WorkflowRequestStatePending,
+		CreatedAt: approval.CreatedAt,
+	})
+	if err != nil {
+		return ToolApproval{}, err
 	}
+	approval.ID = request.ID
 	if err := validateNewToolApproval(approval); err != nil {
 		return ToolApproval{}, err
 	}
@@ -77,7 +82,15 @@ func (s *Store) CreateToolApproval(approval ToolApproval) (ToolApproval, error) 
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return ToolApproval{}, fmt.Errorf("begin create tool approval: %w", err)
+	}
+	defer tx.Rollback()
+	if err := insertWorkflowRequest(tx, request); err != nil {
+		return ToolApproval{}, err
+	}
+	_, err = tx.Exec(
 		`INSERT INTO tool_approvals (
 			id, account_id, tool_name, actor_open_id, actor_user_id, chat_id,
 			source_message_id, card_message_id, payload, state,
@@ -98,6 +111,9 @@ func (s *Store) CreateToolApproval(approval ToolApproval) (ToolApproval, error) 
 	)
 	if err != nil {
 		return ToolApproval{}, fmt.Errorf("create tool approval: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return ToolApproval{}, fmt.Errorf("commit tool approval: %w", err)
 	}
 	return approval, nil
 }
@@ -163,6 +179,9 @@ func (s *Store) DecideToolApproval(id, accountID, decision string, match ToolApp
 		); err != nil {
 			return ToolApproval{}, fmt.Errorf("expire tool approval: %w", err)
 		}
+		if err := updateWorkflowRequestState(tx, id, accountID, WorkflowRequestStateExpired, now); err != nil {
+			return ToolApproval{}, err
+		}
 		if err := tx.Commit(); err != nil {
 			return ToolApproval{}, fmt.Errorf("commit expired tool approval: %w", err)
 		}
@@ -195,6 +214,9 @@ func (s *Store) DecideToolApproval(id, accountID, decision string, match ToolApp
 	if err := requireOneToolApprovalRow(result); err != nil {
 		return ToolApproval{}, err
 	}
+	if err := updateWorkflowRequestState(tx, id, accountID, nextState, now); err != nil {
+		return ToolApproval{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return ToolApproval{}, fmt.Errorf("commit tool approval decision: %w", err)
 	}
@@ -216,7 +238,12 @@ func (s *Store) CompleteToolApproval(id, accountID, state string, now time.Time)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	result, err := s.db.Exec(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin complete tool approval: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(
 		`UPDATE tool_approvals SET state=?, payload='', updated_at_ms=?
 		 WHERE id=? AND account_id=? AND state=?`,
 		state, now.UnixMilli(), id, accountID, ToolApprovalStateExecuting,
@@ -224,7 +251,16 @@ func (s *Store) CompleteToolApproval(id, accountID, state string, now time.Time)
 	if err != nil {
 		return fmt.Errorf("complete tool approval: %w", err)
 	}
-	return requireOneToolApprovalRow(result)
+	if err := requireOneToolApprovalRow(result); err != nil {
+		return err
+	}
+	if err := updateWorkflowRequestState(tx, id, accountID, state, now); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit complete tool approval: %w", err)
+	}
+	return nil
 }
 
 // FailToolApproval closes a pending or executing request and clears its payload.
@@ -232,7 +268,12 @@ func (s *Store) FailToolApproval(id, accountID string, now time.Time) error {
 	now = normalizedApprovalTime(now)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	result, err := s.db.Exec(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin fail tool approval: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(
 		`UPDATE tool_approvals SET state=?, payload='', updated_at_ms=?
 		 WHERE id=? AND account_id=? AND state IN (?, ?)`,
 		ToolApprovalStateFailed,
@@ -245,7 +286,16 @@ func (s *Store) FailToolApproval(id, accountID string, now time.Time) error {
 	if err != nil {
 		return fmt.Errorf("fail tool approval: %w", err)
 	}
-	return requireOneToolApprovalRow(result)
+	if err := requireOneToolApprovalRow(result); err != nil {
+		return err
+	}
+	if err := updateWorkflowRequestState(tx, strings.TrimSpace(id), strings.TrimSpace(accountID), WorkflowRequestStateFailed, now); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit fail tool approval: %w", err)
+	}
+	return nil
 }
 
 // ExpireToolApprovals closes all elapsed pending requests for one account and clears their payloads.
@@ -257,7 +307,26 @@ func (s *Store) ExpireToolApprovals(accountID string, now time.Time) (int64, err
 	now = normalizedApprovalTime(now)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	result, err := s.db.Exec(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin expire tool approvals: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
+		`UPDATE workflow_requests SET state=?, updated_at_ms=?
+		 WHERE account_id=? AND id IN (
+			SELECT id FROM tool_approvals WHERE account_id=? AND state=? AND expires_at_ms<=?
+		 )`,
+		WorkflowRequestStateExpired,
+		now.UnixMilli(),
+		accountID,
+		accountID,
+		ToolApprovalStatePending,
+		now.UnixMilli(),
+	); err != nil {
+		return 0, fmt.Errorf("expire tool approval workflows: %w", err)
+	}
+	result, err := tx.Exec(
 		`UPDATE tool_approvals SET state=?, payload='', updated_at_ms=?
 		 WHERE account_id=? AND state=? AND expires_at_ms<=?`,
 		ToolApprovalStateExpired,
@@ -273,6 +342,9 @@ func (s *Store) ExpireToolApprovals(accountID string, now time.Time) (int64, err
 	if err != nil {
 		return 0, fmt.Errorf("count expired tool approvals: %w", err)
 	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit expire tool approvals: %w", err)
+	}
 	return count, nil
 }
 
@@ -286,7 +358,25 @@ func (s *Store) FailExecutingToolApprovals(accountID string, now time.Time) (int
 	now = normalizedApprovalTime(now)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	result, err := s.db.Exec(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin fail interrupted tool approvals: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
+		`UPDATE workflow_requests SET state=?, updated_at_ms=?
+		 WHERE account_id=? AND id IN (
+			SELECT id FROM tool_approvals WHERE account_id=? AND state=?
+		 )`,
+		WorkflowRequestStateFailed,
+		now.UnixMilli(),
+		accountID,
+		accountID,
+		ToolApprovalStateExecuting,
+	); err != nil {
+		return 0, fmt.Errorf("fail interrupted tool approval workflows: %w", err)
+	}
+	result, err := tx.Exec(
 		`UPDATE tool_approvals SET state=?, payload='', updated_at_ms=?
 		 WHERE account_id=? AND state=?`,
 		ToolApprovalStateFailed,
@@ -300,6 +390,9 @@ func (s *Store) FailExecutingToolApprovals(accountID string, now time.Time) (int
 	count, err := result.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("count interrupted tool approvals: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit fail interrupted tool approvals: %w", err)
 	}
 	return count, nil
 }
@@ -319,6 +412,9 @@ func (s *Store) DeleteToolApprovals(accountID string) error {
 	}
 	if _, err := tx.Exec(`DELETE FROM tool_approval_grants WHERE account_id=?`, accountID); err != nil {
 		return fmt.Errorf("delete tool approval grants: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM workflow_requests WHERE account_id=? AND kind=?`, accountID, WorkflowRequestKindToolApproval); err != nil {
+		return fmt.Errorf("delete tool approval workflow requests: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit delete tool approvals: %w", err)

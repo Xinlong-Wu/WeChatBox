@@ -132,7 +132,7 @@ func TestApprovalManagerRequestsBoundCardWithoutDisplayingPayload(t *testing.T) 
 	if err != nil {
 		t.Fatalf("RequestApproval returned error: %v", err)
 	}
-	if pending.ID == "" || !pending.ExpiresAt.Equal(manager.currentTime().Add(manager.ttl)) {
+	if pending.RequestID == "" || !pending.ExpiresAt.Equal(manager.currentTime().Add(manager.ttl)) {
 		t.Fatalf("pending = %#v, want generated ID and configured expiry", pending)
 	}
 	cards, _, _ := sender.snapshot()
@@ -145,9 +145,9 @@ func TestApprovalManagerRequestsBoundCardWithoutDisplayingPayload(t *testing.T) 
 	if strings.Contains(cards[0].text, "private document body") {
 		t.Fatalf("approval card leaked payload content: %s", cards[0].text)
 	}
-	assertApprovalCardActions(t, cards[0].text, pending.ID)
+	assertApprovalCardActions(t, cards[0].text, pending.RequestID)
 
-	record, err := st.GetToolApproval(pending.ID, "feishu:cli_test")
+	record, err := st.GetToolApproval(pending.RequestID, "feishu:cli_test")
 	if err != nil {
 		t.Fatalf("GetToolApproval returned error: %v", err)
 	}
@@ -157,10 +157,10 @@ func TestApprovalManagerRequestsBoundCardWithoutDisplayingPayload(t *testing.T) 
 }
 
 func TestApprovalCardActionParsesFormCallbackAndReason(t *testing.T) {
-	event := approvalCardEvent("approval_123", approvalCardActionApproveAll, "ou_requester", "oc_chat", "om_card", "请保持标题简洁")
-	approvalID, action, ok := parseApprovalCardAction(event)
-	if !ok || approvalID != "approval_123" || action != approvalCardActionApproveAll {
-		t.Fatalf("parseApprovalCardAction = %q %q %v", approvalID, action, ok)
+	event := approvalCardEvent("req_123", approvalCardActionApproveAll, "ou_requester", "oc_chat", "om_card", "请保持标题简洁")
+	requestID, action, ok := parseApprovalCardAction(event)
+	if !ok || requestID != "req_123" || action != approvalCardActionApproveAll {
+		t.Fatalf("parseApprovalCardAction = %q %q %v", requestID, action, ok)
 	}
 	if reason := approvalCardReason(event); reason != "请保持标题简洁" {
 		t.Fatalf("approvalCardReason = %q", reason)
@@ -179,9 +179,9 @@ func TestApprovalManagerActiveGrantRequiresExactUserChatAndTool(t *testing.T) {
 			ActorID:   "ou_requester",
 			ChatID:    "oc_chat",
 		},
-		SourceApprovalID: "approval_all",
-		CreatedAt:        now,
-		ExpiresAt:        now.Add(24 * time.Hour),
+		SourceRequestID: "req_all",
+		CreatedAt:       now,
+		ExpiresAt:       now.Add(24 * time.Hour),
 	}); err != nil {
 		t.Fatalf("UpsertToolApprovalGrant returned error: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestApprovalManagerOnlyRequesterCanApprove(t *testing.T) {
 	}
 	pending := requestTestApproval(t, manager)
 
-	resp, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.ID, approvalCardActionApproveOnce, "ou_other", "oc_chat", "om_card", ""))
+	resp, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.RequestID, approvalCardActionApproveOnce, "ou_other", "oc_chat", "om_card", ""))
 	if err != nil {
 		t.Fatalf("HandleCardAction returned error: %v", err)
 	}
@@ -230,7 +230,7 @@ func TestApprovalManagerOnlyRequesterCanApprove(t *testing.T) {
 	if calls, _ := executor.snapshot(); calls != 0 {
 		t.Fatalf("executor calls = %d, want 0", calls)
 	}
-	record, err := st.GetToolApproval(pending.ID, "feishu:cli_test")
+	record, err := st.GetToolApproval(pending.RequestID, "feishu:cli_test")
 	if err != nil {
 		t.Fatalf("GetToolApproval returned error: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestApprovalManagerApprovesExecutesAndNotifiesOnce(t *testing.T) {
 	}
 	pending := requestTestApproval(t, manager)
 
-	resp, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.ID, approvalCardActionApproveOnce, "ou_requester", "oc_chat", "om_card", ""))
+	resp, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.RequestID, approvalCardActionApproveOnce, "ou_requester", "oc_chat", "om_card", ""))
 	if err != nil {
 		t.Fatalf("HandleCardAction returned error: %v", err)
 	}
@@ -265,14 +265,14 @@ func TestApprovalManagerApprovesExecutesAndNotifiesOnce(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("approved executor was not called")
 	}
-	waitForApprovalState(t, st, pending.ID, store.ToolApprovalStateSucceeded)
+	waitForApprovalState(t, st, pending.RequestID, store.ToolApprovalStateSucceeded)
 	waitForApprovalNotifications(t, sender, 1, 1)
 
 	calls, payload := executor.snapshot()
 	if calls != 1 || !strings.Contains(string(payload), "Quarterly plan") {
 		t.Fatalf("executor calls/payload = %d/%s, want one approved payload", calls, payload)
 	}
-	record, err := st.GetToolApproval(pending.ID, "feishu:cli_test")
+	record, err := st.GetToolApproval(pending.RequestID, "feishu:cli_test")
 	if err != nil {
 		t.Fatalf("GetToolApproval returned error: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestApprovalManagerApprovesExecutesAndNotifiesOnce(t *testing.T) {
 		t.Fatalf("messages = %#v, want created document notification", messages)
 	}
 
-	second, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.ID, approvalCardActionApproveOnce, "ou_requester", "oc_chat", "om_card", ""))
+	second, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.RequestID, approvalCardActionApproveOnce, "ou_requester", "oc_chat", "om_card", ""))
 	if err != nil {
 		t.Fatalf("second HandleCardAction returned error: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestApprovalManagerApproveAllCreates24HourScopedGrant(t *testing.T) {
 	clickedAt := manager.currentTime()
 
 	resp, err := manager.HandleCardAction(t.Context(), approvalCardEvent(
-		pending.ID,
+		pending.RequestID,
 		approvalCardActionApproveAll,
 		"ou_requester",
 		"oc_chat",
@@ -336,7 +336,7 @@ func TestApprovalManagerApproveAllCreates24HourScopedGrant(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("approve-all executor was not called")
 	}
-	waitForApprovalState(t, st, pending.ID, store.ToolApprovalStateSucceeded)
+	waitForApprovalState(t, st, pending.RequestID, store.ToolApprovalStateSucceeded)
 
 	scope, err := toolApprovalGrantScope("feishu:cli_test", "feishu_docs_create", "ou_requester", "u_requester", "oc_chat")
 	if err != nil {
@@ -346,7 +346,7 @@ func TestApprovalManagerApproveAllCreates24HourScopedGrant(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ActiveToolApprovalGrant returned error: %v", err)
 	}
-	if !active || grant.SourceApprovalID != pending.ID || !grant.CreatedAt.Equal(clickedAt) || !grant.ExpiresAt.Equal(clickedAt.Add(24*time.Hour)) {
+	if !active || grant.SourceRequestID != pending.RequestID || !grant.CreatedAt.Equal(clickedAt) || !grant.ExpiresAt.Equal(clickedAt.Add(24*time.Hour)) {
 		t.Fatalf("grant = %#v active=%v, want 24 hours from click", grant, active)
 	}
 	if active, err := manager.HasActiveGrant(approvalRequestContext(), "feishu_docs_create"); err != nil || !active {
@@ -375,7 +375,7 @@ func TestApprovalManagerApproveAllFallsBackToCurrentRequestWhenGrantSaveFails(t 
 	pending := requestTestApproval(t, manager)
 
 	resp, err := manager.HandleCardAction(t.Context(), approvalCardEvent(
-		pending.ID,
+		pending.RequestID,
 		approvalCardActionApproveAll,
 		"ou_requester",
 		"oc_chat",
@@ -393,7 +393,7 @@ func TestApprovalManagerApproveAllFallsBackToCurrentRequestWhenGrantSaveFails(t 
 	case <-time.After(time.Second):
 		t.Fatal("executor was not called after grant save failure")
 	}
-	waitForApprovalState(t, st, pending.ID, store.ToolApprovalStateSucceeded)
+	waitForApprovalState(t, st, pending.RequestID, store.ToolApprovalStateSucceeded)
 	if active, err := manager.HasActiveGrant(approvalRequestContext(), "feishu_docs_create"); err != nil || active {
 		t.Fatalf("failed grant returned active=%v err=%v", active, err)
 	}
@@ -409,14 +409,14 @@ func TestApprovalManagerDenyDoesNotExecute(t *testing.T) {
 	}
 	pending := requestTestApproval(t, manager)
 
-	resp, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.ID, approvalCardActionReject, "ou_requester", "oc_chat", "om_card", "标题不够清楚"))
+	resp, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.RequestID, approvalCardActionReject, "ou_requester", "oc_chat", "om_card", "标题不够清楚"))
 	if err != nil {
 		t.Fatalf("HandleCardAction returned error: %v", err)
 	}
 	if resp == nil || resp.Toast == nil || resp.Toast.Type != "success" || !strings.Contains(resp.Toast.Content, "不会执行") || !approvalResponseCardContains(t, resp, "已拒绝授权") {
 		t.Fatalf("response = %#v, want denied toast and immediate terminal card", resp)
 	}
-	waitForApprovalState(t, st, pending.ID, store.ToolApprovalStateDenied)
+	waitForApprovalState(t, st, pending.RequestID, store.ToolApprovalStateDenied)
 	_, updates, _ := sender.snapshot()
 	if len(updates) != 0 {
 		t.Fatalf("card updates = %#v, want denial handled in callback response", updates)
@@ -424,7 +424,7 @@ func TestApprovalManagerDenyDoesNotExecute(t *testing.T) {
 	if calls, _ := executor.snapshot(); calls != 0 {
 		t.Fatalf("executor calls = %d, want 0", calls)
 	}
-	record, err := st.GetToolApproval(pending.ID, "feishu:cli_test")
+	record, err := st.GetToolApproval(pending.RequestID, "feishu:cli_test")
 	if err != nil {
 		t.Fatalf("GetToolApproval returned error: %v", err)
 	}
@@ -519,7 +519,7 @@ func requestTestApproval(t *testing.T, manager *approvalManager) feishutools.Pen
 	return pending
 }
 
-func approvalCardEvent(approvalID, action, openID, chatID, messageID, reason string) *callback.CardActionTriggerEvent {
+func approvalCardEvent(requestID, action, openID, chatID, messageID, reason string) *callback.CardActionTriggerEvent {
 	userID := "u_requester"
 	if openID != "ou_requester" {
 		userID = "u_other"
@@ -531,9 +531,9 @@ func approvalCardEvent(approvalID, action, openID, chatID, messageID, reason str
 			Context:  &callback.Context{OpenChatID: chatID, OpenMessageID: messageID},
 			Action: &callback.CallBackAction{
 				Value: map[string]interface{}{
-					"kind":        approvalCardActionKind,
-					"approval_id": approvalID,
-					"action":      action,
+					"kind":       approvalCardActionKind,
+					"request_id": requestID,
+					"action":     action,
 				},
 				FormValue: map[string]interface{}{"reason": reason},
 			},
@@ -553,7 +553,7 @@ func approvalResponseCardContains(t *testing.T, response *callback.CardActionTri
 	return strings.Contains(string(data), want)
 }
 
-func assertApprovalCardActions(t *testing.T, cardJSON, approvalID string) {
+func assertApprovalCardActions(t *testing.T, cardJSON, requestID string) {
 	t.Helper()
 	var card map[string]interface{}
 	if err := json.Unmarshal([]byte(cardJSON), &card); err != nil {
@@ -589,8 +589,8 @@ func assertApprovalCardActions(t *testing.T, cardJSON, approvalID string) {
 	if markdown["tag"] != "markdown" || markdown["element_id"] != "SnLSJiYBwzi2qzhJsFPP" || !strings.Contains(markdown["content"].(string), "24 小时") {
 		t.Fatalf("approval markdown = %#v", markdown)
 	}
-	assertApprovalFormButton(t, formElements[1], approvalID, approvalCardActionApproveOnce, "同意一次", "primary_filled", "Button_ruivkstdali")
-	assertApprovalFormButton(t, formElements[2], approvalID, approvalCardActionApproveAll, "全部同意", "primary", "Button_zrwjazvut3f")
+	assertApprovalFormButton(t, formElements[1], requestID, approvalCardActionApproveOnce, "同意一次", "primary_filled", "Button_ruivkstdali")
+	assertApprovalFormButton(t, formElements[2], requestID, approvalCardActionApproveAll, "全部同意", "primary", "Button_zrwjazvut3f")
 
 	reasonRow, _ := formElements[3].(map[string]interface{})
 	columns, _ := reasonRow["columns"].([]interface{})
@@ -606,10 +606,10 @@ func assertApprovalCardActions(t *testing.T, cardJSON, approvalID string) {
 	}
 	rejectColumn, _ := columns[1].(map[string]interface{})
 	rejectElements, _ := rejectColumn["elements"].([]interface{})
-	assertApprovalFormButton(t, rejectElements[0], approvalID, approvalCardActionReject, "拒绝", "danger", "Button_k7l2449r9dj")
+	assertApprovalFormButton(t, rejectElements[0], requestID, approvalCardActionReject, "拒绝", "danger", "Button_k7l2449r9dj")
 }
 
-func assertApprovalFormButton(t *testing.T, raw interface{}, approvalID, action, text, buttonType, name string) {
+func assertApprovalFormButton(t *testing.T, raw interface{}, requestID, action, text, buttonType, name string) {
 	t.Helper()
 	button, _ := raw.(map[string]interface{})
 	label, _ := button["text"].(map[string]interface{})
@@ -622,18 +622,18 @@ func assertApprovalFormButton(t *testing.T, raw interface{}, approvalID, action,
 	}
 	behavior, _ := behaviors[0].(map[string]interface{})
 	value, _ := behavior["value"].(map[string]interface{})
-	if behavior["type"] != "callback" || value["approval_id"] != approvalID || value["action"] != action || value["kind"] != approvalCardActionKind {
+	if behavior["type"] != "callback" || value["request_id"] != requestID || value["action"] != action || value["kind"] != approvalCardActionKind {
 		t.Fatalf("approval button callback = %#v", behavior)
 	}
 }
 
-func waitForApprovalState(t *testing.T, st *store.Store, approvalID, want string) {
+func waitForApprovalState(t *testing.T, st *store.Store, requestID, want string) {
 	t.Helper()
 	deadline := time.After(time.Second)
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		record, err := st.GetToolApproval(approvalID, "feishu:cli_test")
+		record, err := st.GetToolApproval(requestID, "feishu:cli_test")
 		if err == nil && record.State == want {
 			return
 		}

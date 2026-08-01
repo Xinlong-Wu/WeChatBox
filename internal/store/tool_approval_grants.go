@@ -25,10 +25,10 @@ type ToolApprovalGrantScope struct {
 // ToolApprovalGrant authorizes repeated calls within one scope until ExpiresAt.
 type ToolApprovalGrant struct {
 	ToolApprovalGrantScope
-	SourceApprovalID string
-	CreatedAt        time.Time
-	ExpiresAt        time.Time
-	UpdatedAt        time.Time
+	SourceRequestID string
+	CreatedAt       time.Time
+	ExpiresAt       time.Time
+	UpdatedAt       time.Time
 }
 
 // UpsertToolApprovalGrant creates or renews one exact reusable authorization scope.
@@ -44,10 +44,10 @@ func (s *Store) UpsertToolApprovalGrant(grant ToolApprovalGrant) (ToolApprovalGr
 	_, err := s.db.Exec(
 		`INSERT INTO tool_approval_grants (
 			account_id, tool_name, actor_type, actor_id, chat_id,
-			source_approval_id, created_at_ms, expires_at_ms, updated_at_ms
+			source_request_id, created_at_ms, expires_at_ms, updated_at_ms
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(account_id, tool_name, actor_type, actor_id, chat_id) DO UPDATE SET
-			source_approval_id=excluded.source_approval_id,
+			source_request_id=excluded.source_request_id,
 			created_at_ms=excluded.created_at_ms,
 			expires_at_ms=excluded.expires_at_ms,
 			updated_at_ms=excluded.updated_at_ms`,
@@ -56,7 +56,7 @@ func (s *Store) UpsertToolApprovalGrant(grant ToolApprovalGrant) (ToolApprovalGr
 		grant.ActorType,
 		grant.ActorID,
 		grant.ChatID,
-		grant.SourceApprovalID,
+		grant.SourceRequestID,
 		grant.CreatedAt.UnixMilli(),
 		grant.ExpiresAt.UnixMilli(),
 		grant.UpdatedAt.UnixMilli(),
@@ -93,7 +93,7 @@ func (s *Store) ActiveToolApprovalGrant(scope ToolApprovalGrantScope, now time.T
 	}
 	grant, err := scanToolApprovalGrant(s.db.QueryRow(
 		`SELECT account_id, tool_name, actor_type, actor_id, chat_id,
-		 source_approval_id, created_at_ms, expires_at_ms, updated_at_ms
+		 source_request_id, created_at_ms, expires_at_ms, updated_at_ms
 		 FROM tool_approval_grants
 		 WHERE account_id=? AND tool_name=? AND actor_type=? AND actor_id=? AND chat_id=?
 		 AND expires_at_ms>?`,
@@ -126,7 +126,7 @@ func scanToolApprovalGrant(row toolApprovalGrantScanner) (ToolApprovalGrant, err
 		&grant.ActorType,
 		&grant.ActorID,
 		&grant.ChatID,
-		&grant.SourceApprovalID,
+		&grant.SourceRequestID,
 		&createdAtMS,
 		&expiresAtMS,
 		&updatedAtMS,
@@ -141,7 +141,7 @@ func scanToolApprovalGrant(row toolApprovalGrantScanner) (ToolApprovalGrant, err
 
 func normalizeToolApprovalGrant(grant ToolApprovalGrant) ToolApprovalGrant {
 	grant.ToolApprovalGrantScope = normalizeToolApprovalGrantScope(grant.ToolApprovalGrantScope)
-	grant.SourceApprovalID = strings.TrimSpace(grant.SourceApprovalID)
+	grant.SourceRequestID = strings.TrimSpace(grant.SourceRequestID)
 	grant.CreatedAt = normalizedApprovalTime(grant.CreatedAt)
 	grant.ExpiresAt = grant.ExpiresAt.UTC()
 	return grant
@@ -160,8 +160,8 @@ func validateToolApprovalGrant(grant ToolApprovalGrant) error {
 	if err := validateToolApprovalGrantScope(grant.ToolApprovalGrantScope); err != nil {
 		return err
 	}
-	if grant.SourceApprovalID == "" {
-		return fmt.Errorf("tool approval grant source_approval_id is required")
+	if grant.SourceRequestID == "" {
+		return fmt.Errorf("tool approval grant source_request_id is required")
 	}
 	if !grant.ExpiresAt.After(grant.CreatedAt) {
 		return fmt.Errorf("tool approval grant expires_at must be after created_at")
