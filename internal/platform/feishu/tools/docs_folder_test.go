@@ -19,15 +19,18 @@ func TestDocsFolderToolRegistration(t *testing.T) {
 	st := openDocsFolderTestStore(t)
 	client := &lark.Client{}
 	accountID := "feishu:cli_test"
-	if got := NewDocsFolderTools(client, st, accountID, Config{}); len(got) != 0 {
+	if got := NewDocsFolderTools(client, st, accountID, Config{}, nil); len(got) != 0 {
 		t.Fatalf("disabled folder tools = %d, want 0", len(got))
 	}
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true}}
-	if got := NewDocsFolderTools(client, st, accountID, cfg); len(got) != 1 || got[0].Spec().Name != folderListToolName {
+	if got := NewDocsFolderTools(client, st, accountID, cfg, nil); len(got) != 1 || got[0].Spec().Name != folderListToolName {
 		t.Fatalf("read-only folder tools = %#v, want list", toolNamesForTest(got))
 	}
 	cfg.Docs.AllowWrite = true
-	if got := NewDocsFolderTools(client, st, accountID, cfg); len(got) != 2 || got[0].Spec().Name != folderCreateToolName || got[1].Spec().Name != folderListToolName {
+	if got := NewDocsFolderTools(client, st, accountID, cfg, nil); len(got) != 1 || got[0].Spec().Name != folderListToolName {
+		t.Fatalf("write folder tools without resource access = %#v, want list only", toolNamesForTest(got))
+	}
+	if got := NewDocsFolderTools(client, st, accountID, cfg, grantedResourceAccessController("req_access")); len(got) != 2 || got[0].Spec().Name != folderCreateToolName || got[1].Spec().Name != folderListToolName {
 		t.Fatalf("write folder tools = %#v, want create/list", toolNamesForTest(got))
 	}
 }
@@ -86,11 +89,12 @@ func TestDocsFolderCreateUsesApplicationRootAndSharesGroup(t *testing.T) {
 	defer server.Close()
 
 	client := newDocsFolderTestClient(server)
-	tool := findDocsTool(t, NewDocsFolderTools(client, st, "feishu:cli_test", Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}), folderCreateToolName)
+	access := grantedResourceAccessController("req_access")
+	tool := findDocsTool(t, NewDocsFolderTools(client, st, "feishu:cli_test", Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}, access), folderCreateToolName)
 	result := tool.Execute(groupDocsContext(), tooltypes.Call{
 		ID:        "call_folder",
 		Name:      folderCreateToolName,
-		Arguments: json.RawMessage(`{"name":" Team Docs "}`),
+		Arguments: json.RawMessage(`{"name":" Team Docs ","access_request_id":"req_access"}`),
 	})
 	if result.IsError {
 		t.Fatalf("Execute result = %#v, want created folder", result)
@@ -105,6 +109,9 @@ func TestDocsFolderCreateUsesApplicationRootAndSharesGroup(t *testing.T) {
 	if rootCalls != 1 || createCalls != 1 || shareCalls != 1 || createBody.Name != "Team Docs" || createBody.FolderToken != "fld_root" {
 		t.Fatalf("root/create/share calls=%d/%d/%d create=%#v", rootCalls, createCalls, shareCalls, createBody)
 	}
+	if access.validation.RequestID != "req_access" || access.validation.ResourceType != "folder" || access.validation.ResourceToken != "fld_root" || access.validation.Permission != ResourcePermissionWrite {
+		t.Fatalf("access validation = %#v", access.validation)
+	}
 	if shareBody.MemberType != "openchat" || shareBody.MemberID != "oc_chat" || shareBody.Perm != "full_access" || shareBody.Type != "chat" {
 		t.Fatalf("share body = %#v", shareBody)
 	}
@@ -115,6 +122,10 @@ func TestDocsFolderCreateUsesApplicationRootAndSharesGroup(t *testing.T) {
 	workflow, err := st.GetWorkflowRequest(output.RequestID, "feishu:cli_test")
 	if err != nil || workflow.State != store.WorkflowRequestStateSucceeded {
 		t.Fatalf("folder workflow = %#v err=%v", workflow, err)
+	}
+	resource, err := st.GetFeishuBotResource("feishu:cli_test", "folder", "fld_created")
+	if err != nil || resource.ParentToken != "fld_root" || resource.SourceRequestID != output.RequestID {
+		t.Fatalf("stored Bot folder resource = %#v err=%v", resource, err)
 	}
 }
 
@@ -143,9 +154,9 @@ func TestDocsFolderCreatePartialRetryOnlyRepeatsSharing(t *testing.T) {
 	}))
 	defer server.Close()
 
-	tools := NewDocsFolderTools(newDocsFolderTestClient(server), st, "feishu:cli_test", Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}})
+	tools := NewDocsFolderTools(newDocsFolderTestClient(server), st, "feishu:cli_test", Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}, grantedResourceAccessController("req_access"))
 	tool := findDocsTool(t, tools, folderCreateToolName)
-	first := tool.Execute(groupDocsContext(), tooltypes.Call{ID: "call_1", Name: folderCreateToolName, Arguments: json.RawMessage(`{"name":"Retry Docs"}`)})
+	first := tool.Execute(groupDocsContext(), tooltypes.Call{ID: "call_1", Name: folderCreateToolName, Arguments: json.RawMessage(`{"name":"Retry Docs","access_request_id":"req_access"}`)})
 	if first.IsError {
 		t.Fatalf("first Execute result = %#v, want partial success", first)
 	}
@@ -225,15 +236,19 @@ func TestDocsFolderCreatePrivateUsesBoundParentAndOpenID(t *testing.T) {
 	}))
 	defer server.Close()
 
-	tool := findDocsTool(t, NewDocsFolderTools(newDocsFolderTestClient(server), st, parent.AccountID, Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}), folderCreateToolName)
+	access := grantedResourceAccessController("req_access")
+	tool := findDocsTool(t, NewDocsFolderTools(newDocsFolderTestClient(server), st, parent.AccountID, Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}, access), folderCreateToolName)
 	ctx := WithActor(context.Background(), Actor{OpenID: "ou_private", UserID: "u_private"})
 	ctx = WithChatContext(ctx, ChatContext{ChatID: "oc_private", IsGroup: false})
-	result := tool.Execute(ctx, tooltypes.Call{ID: "call", Name: folderCreateToolName, Arguments: json.RawMessage(`{"name":"Child","parent_folder_token":"fld_parent","set_default":true}`)})
+	result := tool.Execute(ctx, tooltypes.Call{ID: "call", Name: folderCreateToolName, Arguments: json.RawMessage(`{"name":"Child","parent_folder_token":"fld_parent","set_default":true,"access_request_id":"req_access"}`)})
 	if result.IsError {
 		t.Fatalf("Execute result = %#v", result)
 	}
 	if createParent != "fld_parent" || shareMemberType != "openid" || shareMemberID != "ou_private" {
 		t.Fatalf("parent/share = %q/%q/%q", createParent, shareMemberType, shareMemberID)
+	}
+	if access.validation.ResourceToken != "fld_parent" || access.actor.OpenID != "ou_private" || access.chat.ChatID != "oc_private" {
+		t.Fatalf("private access validation=%#v actor=%#v chat=%#v", access.validation, access.actor, access.chat)
 	}
 	defaultFolder, err := st.DefaultFeishuChatFolder(parent.AccountID, parent.ChatID)
 	if err != nil || defaultFolder.FolderToken != "fld_child" {
@@ -259,7 +274,7 @@ func TestDocsFolderListReturnsOnlyCurrentChat(t *testing.T) {
 			t.Fatalf("SaveFeishuChatFolder returned error: %v", err)
 		}
 	}
-	tool := findDocsTool(t, NewDocsFolderTools(&lark.Client{}, st, "feishu:cli_test", Config{Docs: DocsToolsConfig{Enabled: true}}), folderListToolName)
+	tool := findDocsTool(t, NewDocsFolderTools(&lark.Client{}, st, "feishu:cli_test", Config{Docs: DocsToolsConfig{Enabled: true}}, nil), folderListToolName)
 	result := tool.Execute(groupDocsContext(), tooltypes.Call{ID: "list", Name: folderListToolName, Arguments: json.RawMessage(`{}`)})
 	if result.IsError {
 		t.Fatalf("Execute result = %#v", result)
@@ -270,6 +285,24 @@ func TestDocsFolderListReturnsOnlyCurrentChat(t *testing.T) {
 	}
 	if len(output.Folders) != 1 || output.Folders[0].FolderToken != "fld_oc_chat" {
 		t.Fatalf("list output = %#v", output)
+	}
+}
+
+func TestDocsFolderCreateRequiresGrantedParentAccessBeforeFeishuAPI(t *testing.T) {
+	st := openDocsFolderTestStore(t)
+	access := grantedResourceAccessController("req_access")
+	tool := findDocsTool(t, NewDocsFolderTools(&lark.Client{}, st, "feishu:cli_test", Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}, access), folderCreateToolName)
+
+	missing := tool.Execute(groupDocsContext(), tooltypes.Call{
+		ID:        "missing",
+		Name:      folderCreateToolName,
+		Arguments: json.RawMessage(`{"name":"No access"}`),
+	})
+	if !missing.IsError || !strings.Contains(missing.Content, "access_request_id is required") {
+		t.Fatalf("missing access result = %#v", missing)
+	}
+	if access.validation.RequestID != "" {
+		t.Fatalf("unexpected access validation = %#v", access.validation)
 	}
 }
 

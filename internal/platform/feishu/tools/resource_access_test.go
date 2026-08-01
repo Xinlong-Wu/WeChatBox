@@ -14,6 +14,8 @@ type fakeResourceAccessController struct {
 	validation ResourceAccessValidation
 	result     ResourceAccessResult
 	err        error
+	actor      Actor
+	chat       ChatContext
 }
 
 func (f *fakeResourceAccessController) RequestAccess(_ context.Context, request ResourceAccessRequest) (ResourceAccessResult, error) {
@@ -21,9 +23,18 @@ func (f *fakeResourceAccessController) RequestAccess(_ context.Context, request 
 	return f.result, f.err
 }
 
-func (f *fakeResourceAccessController) ValidateAccess(_ context.Context, validation ResourceAccessValidation) (ResourceAccessResult, error) {
+func (f *fakeResourceAccessController) ValidateAccess(ctx context.Context, validation ResourceAccessValidation) (ResourceAccessResult, error) {
 	f.validation = validation
+	f.actor, _ = ActorFromContext(ctx)
+	f.chat, _ = ChatContextFromContext(ctx)
 	return f.result, f.err
+}
+
+func grantedResourceAccessController(requestID string) *fakeResourceAccessController {
+	return &fakeResourceAccessController{result: ResourceAccessResult{
+		RequestID: requestID,
+		Status:    ResourceAccessStatusGranted,
+	}}
 }
 
 func TestDocsResourceAccessToolRegistrationAndNormalization(t *testing.T) {

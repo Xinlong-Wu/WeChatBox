@@ -30,18 +30,19 @@ const (
 )
 
 type docsTool struct {
-	name      string
-	spec      tooltypes.Spec
-	client    *lark.Client
-	store     *store.Store
-	accountID string
-	cfg       Config
-	approver  ApprovalRequester
-	now       func() time.Time
+	name           string
+	spec           tooltypes.Spec
+	client         *lark.Client
+	store          *store.Store
+	accountID      string
+	cfg            Config
+	approver       ApprovalRequester
+	resourceAccess ResourceAccessController
+	now            func() time.Time
 }
 
 // NewDocsTools returns Feishu document tools for tool-capable LLM providers.
-func NewDocsTools(client *lark.Client, st *store.Store, accountID string, cfg Config, approver ApprovalRequester) []tooltypes.Tool {
+func NewDocsTools(client *lark.Client, st *store.Store, accountID string, cfg Config, approver ApprovalRequester, resourceAccess ResourceAccessController) []tooltypes.Tool {
 	cfg = NormalizeConfig(cfg)
 	accountID = strings.TrimSpace(accountID)
 	if client == nil || st == nil || st.PlatformID() != store.PlatformFeishu || accountID == "" || !cfg.Docs.Enabled {
@@ -52,8 +53,8 @@ func NewDocsTools(client *lark.Client, st *store.Store, accountID string, cfg Co
 		docsTool{name: readToolName, spec: docsReadSpec(), client: client, store: st, accountID: accountID, cfg: cfg, now: time.Now},
 	}
 	if cfg.Docs.AllowWrite {
-		if approver != nil {
-			tools = append(tools, docsTool{name: createToolName, spec: docsCreateSpec(), client: client, store: st, accountID: accountID, cfg: cfg, approver: approver, now: time.Now})
+		if approver != nil && resourceAccess != nil {
+			tools = append(tools, docsTool{name: createToolName, spec: docsCreateSpec(), client: client, store: st, accountID: accountID, cfg: cfg, approver: approver, resourceAccess: resourceAccess, now: time.Now})
 		}
 		tools = append(tools, docsTool{name: appendToolName, spec: docsAppendSpec(), client: client, store: st, accountID: accountID, cfg: cfg, now: time.Now})
 	}
@@ -106,9 +107,10 @@ type readArgs struct {
 }
 
 type createArgs struct {
-	Title       string `json:"title"`
-	Content     string `json:"content,omitempty"`
-	FolderToken string `json:"folder_token,omitempty"`
+	Title           string `json:"title"`
+	Content         string `json:"content,omitempty"`
+	FolderToken     string `json:"folder_token,omitempty"`
+	AccessRequestID string `json:"access_request_id"`
 }
 
 type approvedCreatePayload struct {
@@ -418,7 +420,12 @@ func (t docsTool) ExecuteApproved(ctx context.Context, requestID string, payload
 	if err != nil {
 		return ApprovalExecution{}, err
 	}
-	out, err := t.createDocument(ctx, requestID, args)
+	executionCtx := WithActor(ctx, Actor{OpenID: args.ActorOpenID, UserID: args.ActorUserID})
+	executionCtx = WithChatContext(executionCtx, ChatContext{ChatID: args.ChatID})
+	if err := t.validateDocumentCreateAccess(executionCtx, args); err != nil {
+		return ApprovalExecution{}, fmt.Errorf("revalidate approved document target access: %w", err)
+	}
+	out, err := t.createDocument(executionCtx, requestID, args)
 	if err != nil {
 		if out.DocumentID != "" {
 			return ApprovalExecution{
@@ -441,11 +448,15 @@ func (t docsTool) parseCreateArgs(raw json.RawMessage) (createArgs, error) {
 	}
 	args.Title = strings.TrimSpace(args.Title)
 	args.FolderToken = strings.TrimSpace(args.FolderToken)
+	args.AccessRequestID = strings.TrimSpace(args.AccessRequestID)
 	if args.Title == "" {
 		return createArgs{}, fmt.Errorf("title is required")
 	}
 	if utf8.RuneCountInString(args.Title) > maxDocxTitle {
 		return createArgs{}, fmt.Errorf("title must not exceed %d characters", maxDocxTitle)
+	}
+	if args.AccessRequestID == "" {
+		return createArgs{}, fmt.Errorf("access_request_id is required; call %s with folder/write before creating a document", ResourceAccessToolName)
 	}
 	return args, nil
 }
@@ -464,12 +475,16 @@ func (t docsTool) resolveCreatePayload(ctx context.Context, raw json.RawMessage)
 		return approvedCreatePayload{}, err
 	}
 	args.FolderToken = folder.FolderToken
-	return approvedCreatePayload{
+	payload := approvedCreatePayload{
 		createArgs:  args,
 		ChatID:      chat.ChatID,
 		ActorOpenID: actor.OpenID,
 		ActorUserID: actor.UserID,
-	}, nil
+	}
+	if err := t.validateDocumentCreateAccess(ctx, payload); err != nil {
+		return approvedCreatePayload{}, err
+	}
+	return payload, nil
 }
 
 func (t docsTool) parseApprovedCreatePayload(raw json.RawMessage) (approvedCreatePayload, error) {
@@ -524,6 +539,20 @@ func (t docsTool) resolveChatFolder(chatID, folderToken string) (store.FeishuCha
 	return folder, nil
 }
 
+func (t docsTool) validateDocumentCreateAccess(ctx context.Context, payload approvedCreatePayload) error {
+	if _, err := validateGrantedResourceAccess(ctx, t.resourceAccess, ResourceAccessValidation{
+		RequestID:     payload.AccessRequestID,
+		ResourceType:  "folder",
+		ResourceToken: payload.FolderToken,
+		Permission:    ResourcePermissionWrite,
+	}); err != nil {
+		return fmt.Errorf("validate target folder access: %w", err)
+	}
+	feishuToolsLog.Debug(ctx, "validated feishu document create access request=%s account=%s chat=%s folder_ref=%s",
+		shortToolRequestID(payload.AccessRequestID), t.accountID, payload.ChatID, hashString(payload.FolderToken))
+	return nil
+}
+
 func (t docsTool) createDocument(ctx context.Context, requestID string, payload approvedCreatePayload) (writeOutput, error) {
 	args := payload.createArgs
 	req := larkdocx.NewCreateDocumentReqBuilder().
@@ -550,6 +579,18 @@ func (t docsTool) createDocument(ctx context.Context, requestID string, payload 
 		return writeOutput{}, fmt.Errorf("create feishu document returned no document_id")
 	}
 	out := writeOutput{RequestID: requestID, DocumentID: docID, Title: args.Title, URL: "https://docs.feishu.cn/docx/" + docID}
+	if _, err := t.store.SaveFeishuBotResource(store.FeishuBotResource{
+		AccountID:       t.accountID,
+		ResourceType:    "docx",
+		ResourceToken:   docID,
+		ParentToken:     args.FolderToken,
+		Name:            args.Title,
+		URL:             out.URL,
+		SourceRequestID: requestID,
+		CreatedAt:       t.currentTime(),
+	}); err != nil {
+		return out, fmt.Errorf("record created Feishu document ownership: %w", err)
+	}
 	if strings.TrimSpace(args.Content) != "" {
 		if err := t.appendTextBlocks(ctx, docID, args.Content); err != nil {
 			return out, err
@@ -745,8 +786,8 @@ func docsReadSpec() tooltypes.Spec {
 func docsCreateSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        createToolName,
-		Description: "Create a Feishu docx document only in a Bot-owned folder bound to the current trusted chat. Omit folder_token to use that chat's default Bot folder. A matching 24-hour operation grant executes immediately; otherwise creation starts after the requester approves the operation card.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"title":{"type":"string","minLength":1,"maxLength":800},"content":{"type":"string"},"folder_token":{"type":"string","description":"Optional Bot-owned folder token already bound to this exact Feishu chat."}},"required":["title"],"additionalProperties":false}`),
+		Description: "Create a Feishu docx document only in a Bot-owned folder bound to the current trusted chat. Before every creation, call feishu_docs_request_access for folder/write on the target folder and pass its granted request_id as access_request_id. Omit folder_token to use the chat's default Bot folder. To place a document in a non-Bot-owned directory, use the create-in-Bot-folder, copy-to-target, then delete-temporary-resource flow. A matching 24-hour operation grant executes immediately; otherwise creation starts after the requester approves the operation card.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"title":{"type":"string","minLength":1,"maxLength":800},"content":{"type":"string"},"folder_token":{"type":"string","description":"Optional Bot-owned folder token already bound to this exact Feishu chat."},"access_request_id":{"type":"string","description":"Granted request_id returned by feishu_docs_request_access for write access to the resolved target folder."}},"required":["title","access_request_id"],"additionalProperties":false}`),
 	}
 }
 

@@ -83,6 +83,27 @@ type ResourceAccessController interface {
 	ValidateAccess(context.Context, ResourceAccessValidation) (ResourceAccessResult, error)
 }
 
+func validateGrantedResourceAccess(ctx context.Context, controller ResourceAccessController, validation ResourceAccessValidation) (ResourceAccessResult, error) {
+	validation.RequestID = strings.TrimSpace(validation.RequestID)
+	validation.ResourceType = NormalizeResourceType(validation.ResourceType)
+	validation.ResourceToken = strings.TrimSpace(validation.ResourceToken)
+	validation.Permission = strings.ToLower(strings.TrimSpace(validation.Permission))
+	if controller == nil {
+		return ResourceAccessResult{}, fmt.Errorf("feishu resource access workflow is unavailable")
+	}
+	if validation.RequestID == "" {
+		return ResourceAccessResult{}, fmt.Errorf("access_request_id is required; call %s before creating the resource", ResourceAccessToolName)
+	}
+	result, err := controller.ValidateAccess(ctx, validation)
+	if err != nil {
+		return ResourceAccessResult{}, err
+	}
+	if result.Status != ResourceAccessStatusGranted || strings.TrimSpace(result.RequestID) != validation.RequestID {
+		return ResourceAccessResult{}, fmt.Errorf("access_request_id is not a granted request for this operation; call %s again", ResourceAccessToolName)
+	}
+	return result, nil
+}
+
 type resourceAccessTool struct {
 	controller ResourceAccessController
 }

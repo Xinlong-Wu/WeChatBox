@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -50,18 +51,21 @@ func TestDocsToolConfigDefaultsAndRegistration(t *testing.T) {
 
 	client := &lark.Client{}
 	st := openDocsFolderTestStore(t)
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil); len(got) != 0 {
+	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil, nil); len(got) != 0 {
 		t.Fatalf("disabled tools = %d, want 0", len(got))
 	}
 	cfg.Docs.Enabled = true
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil); len(got) != 2 {
+	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil, nil); len(got) != 2 {
 		t.Fatalf("read-only tools = %d, want search/read", len(got))
 	}
 	cfg.Docs.AllowWrite = true
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil); len(got) != 3 {
+	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil, nil); len(got) != 3 {
 		t.Fatalf("write tools without approval workflow = %d, want search/read/append", len(got))
 	}
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, &fakeApprovalRequester{}); len(got) != 4 {
+	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, &fakeApprovalRequester{}, nil); len(got) != 3 {
+		t.Fatalf("write tools without resource access workflow = %d, want search/read/append", len(got))
+	}
+	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, &fakeApprovalRequester{}, grantedResourceAccessController("req_access")); len(got) != 4 {
 		t.Fatalf("write tools with approval workflow = %d, want four tools", len(got))
 	}
 }
@@ -70,12 +74,12 @@ func TestDocsCreateToolReturnsPendingApprovalWithoutCallingFeishuDocs(t *testing
 	expiresAt := time.Date(2026, time.August, 1, 12, 10, 0, 0, time.UTC)
 	approver := &fakeApprovalRequester{pending: PendingApproval{RequestID: "req_123", ExpiresAt: expiresAt}}
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
-	_, tools := newDocsToolsForTest(t, &lark.Client{}, cfg, approver)
+	_, tools, _ := newDocsToolsForTest(t, &lark.Client{}, cfg, approver)
 	tool := findDocsTool(t, tools, createToolName)
 	result := tool.Execute(groupDocsContext(), tooltypes.Call{
 		ID:        "call_1",
 		Name:      createToolName,
-		Arguments: json.RawMessage(`{"title":" Quarterly plan ","content":"private body","folder_token":" fld_token "}`),
+		Arguments: json.RawMessage(`{"title":" Quarterly plan ","content":"private body","folder_token":" fld_token ","access_request_id":"req_access"}`),
 	})
 	if result.IsError {
 		t.Fatalf("Execute result = %#v, want pending approval success", result)
@@ -97,7 +101,7 @@ func TestDocsCreateToolReturnsPendingApprovalWithoutCallingFeishuDocs(t *testing
 	if err := json.Unmarshal(approver.request.Payload, &approvedArgs); err != nil {
 		t.Fatalf("unmarshal approval payload: %v", err)
 	}
-	if approvedArgs.Title != "Quarterly plan" || approvedArgs.FolderToken != "fld_token" || approvedArgs.Content != "private body" || approvedArgs.ChatID != "oc_chat" {
+	if approvedArgs.Title != "Quarterly plan" || approvedArgs.FolderToken != "fld_token" || approvedArgs.Content != "private body" || approvedArgs.AccessRequestID != "req_access" || approvedArgs.ChatID != "oc_chat" {
 		t.Fatalf("approved args = %#v, want normalized exact payload", approvedArgs)
 	}
 	for _, field := range approver.request.Fields {
@@ -138,12 +142,12 @@ func TestDocsCreateToolUsesActiveGrantWithoutSendingCard(t *testing.T) {
 	)
 	approver := &fakeApprovalRequester{active: true}
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
-	st, tools := newDocsToolsForTest(t, client, cfg, approver)
+	st, tools, _ := newDocsToolsForTest(t, client, cfg, approver)
 	tool := findDocsTool(t, tools, createToolName)
 	result := tool.Execute(groupDocsContext(), tooltypes.Call{
 		ID:        "call_1",
 		Name:      createToolName,
-		Arguments: json.RawMessage(`{"title":"Quarterly plan","folder_token":"fld_token"}`),
+		Arguments: json.RawMessage(`{"title":"Quarterly plan","folder_token":"fld_token","access_request_id":"req_access"}`),
 	})
 	if result.IsError {
 		t.Fatalf("Execute result = %#v, want direct create", result)
@@ -160,6 +164,10 @@ func TestDocsCreateToolUsesActiveGrantWithoutSendingCard(t *testing.T) {
 	}
 	if _, err := st.GetFeishuChatDocument("feishu:cli_test", "oc_chat", output.DocumentID); err != nil {
 		t.Fatalf("created document was not bound to chat: %v", err)
+	}
+	resource, err := st.GetFeishuBotResource("feishu:cli_test", "docx", output.DocumentID)
+	if err != nil || resource.ParentToken != "fld_token" || resource.SourceRequestID != output.RequestID {
+		t.Fatalf("stored Bot document resource = %#v err=%v", resource, err)
 	}
 }
 
@@ -193,12 +201,12 @@ func TestDocsCreateToolActiveGrantReportsPartialSuccessWithoutRetrySignal(t *tes
 		lark.WithHttpClient(server.Client()),
 	)
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
-	_, tools := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{active: true})
+	_, tools, _ := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{active: true})
 	tool := findDocsTool(t, tools, createToolName)
 	result := tool.Execute(groupDocsContext(), tooltypes.Call{
 		ID:        "call_1",
 		Name:      createToolName,
-		Arguments: json.RawMessage(`{"title":"Quarterly plan","content":"body","folder_token":"fld_token"}`),
+		Arguments: json.RawMessage(`{"title":"Quarterly plan","content":"body","folder_token":"fld_token","access_request_id":"req_access"}`),
 	})
 	if result.IsError {
 		t.Fatalf("Execute result = %#v, want partial success", result)
@@ -215,11 +223,12 @@ func TestDocsCreateToolActiveGrantReportsPartialSuccessWithoutRetrySignal(t *tes
 func TestDocsCreateToolRejectsTitleLongerThanFeishuLimit(t *testing.T) {
 	approver := &fakeApprovalRequester{}
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
-	_, tools := newDocsToolsForTest(t, &lark.Client{}, cfg, approver)
+	_, tools, _ := newDocsToolsForTest(t, &lark.Client{}, cfg, approver)
 	tool := findDocsTool(t, tools, createToolName)
 	args, err := json.Marshal(createArgs{
-		Title:       strings.Repeat("文", maxDocxTitle+1),
-		FolderToken: "fld_token",
+		Title:           strings.Repeat("文", maxDocxTitle+1),
+		FolderToken:     "fld_token",
+		AccessRequestID: "req_access",
 	})
 	if err != nil {
 		t.Fatalf("marshal create args: %v", err)
@@ -274,13 +283,13 @@ func TestDocsCreateApprovedExecutionCreatesDocument(t *testing.T) {
 		lark.WithHttpClient(server.Client()),
 	)
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
-	_, tools := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
+	_, tools, access := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
 	tool := findDocsTool(t, tools, createToolName)
 	executor, ok := tool.(ApprovalExecutor)
 	if !ok {
 		t.Fatalf("create tool %T does not implement ApprovalExecutor", tool)
 	}
-	result, err := executor.ExecuteApproved(context.Background(), "req_approved", json.RawMessage(`{"title":"Quarterly plan","folder_token":"fld_token","chat_id":"oc_chat","actor_open_id":"ou_requester"}`))
+	result, err := executor.ExecuteApproved(context.Background(), "req_approved", json.RawMessage(`{"title":"Quarterly plan","folder_token":"fld_token","access_request_id":"req_access","chat_id":"oc_chat","actor_open_id":"ou_requester"}`))
 	if err != nil {
 		t.Fatalf("ExecuteApproved returned error: %v", err)
 	}
@@ -289,6 +298,9 @@ func TestDocsCreateApprovedExecutionCreatesDocument(t *testing.T) {
 	}
 	if createRequest.Title != "Quarterly plan" || createRequest.FolderToken != "fld_token" {
 		t.Fatalf("create request = %#v", createRequest)
+	}
+	if access.validation.RequestID != "req_access" || access.validation.ResourceToken != "fld_token" || access.actor.OpenID != "ou_requester" || access.chat.ChatID != "oc_chat" {
+		t.Fatalf("approved access validation=%#v actor=%#v chat=%#v", access.validation, access.actor, access.chat)
 	}
 }
 
@@ -322,15 +334,27 @@ func TestDocsCreateApprovedExecutionReportsPartialSuccessWithoutRetryingCreate(t
 		lark.WithHttpClient(server.Client()),
 	)
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
-	_, tools := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
+	_, tools, _ := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
 	tool := findDocsTool(t, tools, createToolName)
 	executor := tool.(ApprovalExecutor)
-	result, err := executor.ExecuteApproved(context.Background(), "req_approved", json.RawMessage(`{"title":"Quarterly plan","content":"body","folder_token":"fld_token","chat_id":"oc_chat","actor_open_id":"ou_requester"}`))
+	result, err := executor.ExecuteApproved(context.Background(), "req_approved", json.RawMessage(`{"title":"Quarterly plan","content":"body","folder_token":"fld_token","access_request_id":"req_access","chat_id":"oc_chat","actor_open_id":"ou_requester"}`))
 	if err != nil {
 		t.Fatalf("ExecuteApproved returned error after document creation: %v", err)
 	}
 	if !result.Warning || !strings.Contains(result.WarningReason, "append denied") || !strings.Contains(result.Message, "请勿重复创建") || !strings.Contains(result.Message, "doxcn12345678") {
 		t.Fatalf("partial result = %#v, want warning with existing document link", result)
+	}
+}
+
+func TestDocsCreateApprovedExecutionStopsWhenAccessWasRevoked(t *testing.T) {
+	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
+	_, tools, access := newDocsToolsForTest(t, &lark.Client{}, cfg, &fakeApprovalRequester{})
+	access.err = errors.New("permission revoked")
+	executor := findDocsTool(t, tools, createToolName).(ApprovalExecutor)
+
+	_, err := executor.ExecuteApproved(context.Background(), "req_approved", json.RawMessage(`{"title":"Quarterly plan","folder_token":"fld_token","access_request_id":"req_access","chat_id":"oc_chat","actor_open_id":"ou_requester"}`))
+	if err == nil || !strings.Contains(err.Error(), "revalidate approved document target access") || !strings.Contains(err.Error(), "permission revoked") {
+		t.Fatalf("ExecuteApproved error = %v", err)
 	}
 }
 
@@ -372,6 +396,41 @@ func TestTruncateRunes(t *testing.T) {
 	}
 }
 
+func TestDocsCreateRequiresAndRevalidatesFolderAccess(t *testing.T) {
+	approver := &fakeApprovalRequester{}
+	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
+	st := openDocsFolderTestStore(t)
+	if _, err := st.SaveFeishuChatFolder(store.FeishuChatFolder{
+		AccountID:       "feishu:cli_test",
+		ChatID:          "oc_chat",
+		FolderToken:     "fld_token",
+		Name:            "Docs",
+		ShareMemberType: "openchat",
+		ShareMemberID:   "oc_chat",
+		ShareState:      store.FeishuFolderShareStateSucceeded,
+		CreateRequestID: "req_folder",
+		CreatedAt:       time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed folder: %v", err)
+	}
+	access := grantedResourceAccessController("req_access")
+	tools := NewDocsTools(&lark.Client{}, st, "feishu:cli_test", cfg, approver, access)
+	tool := findDocsTool(t, tools, createToolName)
+
+	missing := tool.Execute(groupDocsContext(), tooltypes.Call{ID: "missing", Name: createToolName, Arguments: json.RawMessage(`{"title":"No access","folder_token":"fld_token"}`)})
+	if !missing.IsError || !strings.Contains(missing.Content, "access_request_id is required") || approver.checks != 0 {
+		t.Fatalf("missing access result=%#v approval_checks=%d", missing, approver.checks)
+	}
+
+	result := tool.Execute(groupDocsContext(), tooltypes.Call{ID: "pending", Name: createToolName, Arguments: json.RawMessage(`{"title":"With access","folder_token":"fld_token","access_request_id":"req_access"}`)})
+	if result.IsError {
+		t.Fatalf("granted access result = %#v", result)
+	}
+	if access.validation.RequestID != "req_access" || access.validation.ResourceToken != "fld_token" || access.validation.Permission != ResourcePermissionWrite || access.actor.OpenID != "ou_requester" || access.chat.ChatID != "oc_chat" {
+		t.Fatalf("access validation=%#v actor=%#v chat=%#v", access.validation, access.actor, access.chat)
+	}
+}
+
 func findDocsTool(t *testing.T, tools []tooltypes.Tool, name string) tooltypes.Tool {
 	t.Helper()
 	for _, tool := range tools {
@@ -383,7 +442,7 @@ func findDocsTool(t *testing.T, tools []tooltypes.Tool, name string) tooltypes.T
 	return nil
 }
 
-func newDocsToolsForTest(t *testing.T, client *lark.Client, cfg Config, approver ApprovalRequester) (*store.Store, []tooltypes.Tool) {
+func newDocsToolsForTest(t *testing.T, client *lark.Client, cfg Config, approver ApprovalRequester) (*store.Store, []tooltypes.Tool, *fakeResourceAccessController) {
 	t.Helper()
 	st := openDocsFolderTestStore(t)
 	if _, err := st.SaveFeishuChatFolder(store.FeishuChatFolder{
@@ -399,5 +458,6 @@ func newDocsToolsForTest(t *testing.T, client *lark.Client, cfg Config, approver
 	}); err != nil {
 		t.Fatalf("seed Feishu chat folder: %v", err)
 	}
-	return st, NewDocsTools(client, st, "feishu:cli_test", cfg, approver)
+	access := grantedResourceAccessController("req_access")
+	return st, NewDocsTools(client, st, "feishu:cli_test", cfg, approver, access), access
 }

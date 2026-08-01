@@ -25,16 +25,17 @@ const (
 )
 
 type docsFolderTool struct {
-	name      string
-	spec      tooltypes.Spec
-	client    *lark.Client
-	store     *store.Store
-	accountID string
-	now       func() time.Time
+	name           string
+	spec           tooltypes.Spec
+	client         *lark.Client
+	store          *store.Store
+	accountID      string
+	resourceAccess ResourceAccessController
+	now            func() time.Time
 }
 
 // NewDocsFolderTools returns chat-scoped application-folder tools.
-func NewDocsFolderTools(client *lark.Client, st *store.Store, accountID string, cfg Config) []tooltypes.Tool {
+func NewDocsFolderTools(client *lark.Client, st *store.Store, accountID string, cfg Config, resourceAccess ResourceAccessController) []tooltypes.Tool {
 	cfg = NormalizeConfig(cfg)
 	accountID = strings.TrimSpace(accountID)
 	if client == nil || st == nil || st.PlatformID() != store.PlatformFeishu || accountID == "" || !cfg.Docs.Enabled {
@@ -43,9 +44,9 @@ func NewDocsFolderTools(client *lark.Client, st *store.Store, accountID string, 
 	tools := []tooltypes.Tool{
 		docsFolderTool{name: folderListToolName, spec: docsFolderListSpec(), client: client, store: st, accountID: accountID, now: time.Now},
 	}
-	if cfg.Docs.AllowWrite {
+	if cfg.Docs.AllowWrite && resourceAccess != nil {
 		tools = append([]tooltypes.Tool{
-			docsFolderTool{name: folderCreateToolName, spec: docsFolderCreateSpec(), client: client, store: st, accountID: accountID, now: time.Now},
+			docsFolderTool{name: folderCreateToolName, spec: docsFolderCreateSpec(), client: client, store: st, accountID: accountID, resourceAccess: resourceAccess, now: time.Now},
 		}, tools...)
 	}
 	return tools
@@ -78,6 +79,7 @@ type folderCreateArgs struct {
 	Name              string `json:"name,omitempty"`
 	ParentFolderToken string `json:"parent_folder_token,omitempty"`
 	SetDefault        bool   `json:"set_default,omitempty"`
+	AccessRequestID   string `json:"access_request_id,omitempty"`
 	RequestID         string `json:"request_id,omitempty"`
 }
 
@@ -121,14 +123,15 @@ func (t docsFolderTool) createFolder(ctx context.Context, raw json.RawMessage) (
 	}
 	args.Name = strings.TrimSpace(args.Name)
 	args.ParentFolderToken = strings.TrimSpace(args.ParentFolderToken)
+	args.AccessRequestID = strings.TrimSpace(args.AccessRequestID)
 	args.RequestID = strings.TrimSpace(args.RequestID)
 	actor, chat, err := trustedDocsScope(ctx)
 	if err != nil {
 		return "", err
 	}
 	if args.RequestID != "" {
-		if args.Name != "" || args.ParentFolderToken != "" || args.SetDefault {
-			return "", fmt.Errorf("request_id retry must not include name, parent_folder_token, or set_default")
+		if args.Name != "" || args.ParentFolderToken != "" || args.SetDefault || args.AccessRequestID != "" {
+			return "", fmt.Errorf("request_id retry must not include name, parent_folder_token, set_default, or access_request_id")
 		}
 		return t.retryFolderShare(ctx, actor, chat, args.RequestID)
 	}
@@ -140,6 +143,9 @@ func (t docsFolderTool) createFolder(ctx context.Context, raw json.RawMessage) (
 	}
 	if utf8.RuneCountInString(args.Name) == 0 {
 		return "", fmt.Errorf("name is required")
+	}
+	if args.AccessRequestID == "" {
+		return "", fmt.Errorf("access_request_id is required; call %s with folder/write before creating a folder", ResourceAccessToolName)
 	}
 	parentToken := args.ParentFolderToken
 	createParentToken := parentToken
@@ -162,6 +168,16 @@ func (t docsFolderTool) createFolder(ctx context.Context, raw json.RawMessage) (
 		createParentToken = root.Token
 		feishuToolsLog.Debug(ctx, "resolved feishu application root account=%s root_id=%s owner_id=%s", t.accountID, root.ID, root.UserID)
 	}
+	if _, err := validateGrantedResourceAccess(ctx, t.resourceAccess, ResourceAccessValidation{
+		RequestID:     args.AccessRequestID,
+		ResourceType:  "folder",
+		ResourceToken: createParentToken,
+		Permission:    ResourcePermissionWrite,
+	}); err != nil {
+		return "", fmt.Errorf("validate parent folder access: %w", err)
+	}
+	feishuToolsLog.Debug(ctx, "validated feishu folder create access request=%s account=%s chat=%s parent_ref=%s",
+		shortToolRequestID(args.AccessRequestID), t.accountID, chat.ChatID, hashString(createParentToken))
 	shareMemberType, shareMemberID, err := folderShareTarget(actor, chat)
 	if err != nil {
 		return "", err
@@ -182,6 +198,30 @@ func (t docsFolderTool) createFolder(ctx context.Context, raw json.RawMessage) (
 	if err != nil {
 		t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStateFailed)
 		return "", fmt.Errorf("create feishu application folder: %w", err)
+	}
+	if _, err := t.store.SaveFeishuBotResource(store.FeishuBotResource{
+		AccountID:       t.accountID,
+		ResourceType:    "folder",
+		ResourceToken:   created.FolderToken,
+		ParentToken:     createParentToken,
+		Name:            args.Name,
+		URL:             created.URL,
+		SourceRequestID: request.ID,
+		CreatedAt:       now,
+	}); err != nil {
+		t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStatePartial)
+		feishuToolsLog.Error(ctx, "persist created feishu folder ownership failed request=%s account=%s chat=%s folder_ref=%s: %v",
+			shortToolRequestID(request.ID), t.accountID, chat.ChatID, hashString(created.FolderToken), err)
+		return marshalToolOutput(folderCreateOutput{
+			Status:            "partial",
+			RequestID:         request.ID,
+			FolderToken:       created.FolderToken,
+			Name:              args.Name,
+			URL:               created.URL,
+			ParentFolderToken: parentToken,
+			Shared:            false,
+			Warning:           "文件夹已创建，但 Bot 资源归属记录失败。请勿用相同名称重复创建；请联系管理员检查数据库。",
+		})
 	}
 	folder, saveErr := t.store.SaveFeishuChatFolder(store.FeishuChatFolder{
 		AccountID:         t.accountID,
@@ -498,8 +538,8 @@ func folderOutput(folder store.FeishuChatFolder, status string, shared bool, war
 func docsFolderCreateSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        folderCreateToolName,
-		Description: "Create an application-owned Feishu folder for the current trusted chat and grant that chat or private-chat user full access. This operation does not require an approval card. If folder creation succeeds but sharing fails, retry with only the returned request_id so the folder is not created twice.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"name":{"type":"string","description":"Folder name for a new folder; maximum 256 UTF-8 bytes."},"parent_folder_token":{"type":"string","description":"Optional parent folder already bound to this exact Feishu chat. Omit to use the application's root folder."},"set_default":{"type":"boolean","description":"Make the new folder the default for this chat. The first folder is always default."},"request_id":{"type":"string","description":"Retry a prior partial result by sharing the already-created folder; when set, omit all other fields."}},"oneOf":[{"required":["name"]},{"required":["request_id"]}],"additionalProperties":false}`),
+		Description: "Create a Bot-owned Feishu folder under the Bot root or another Bot-owned folder bound to the current trusted chat, then grant the chat or private-chat user full access. Before creating, call feishu_docs_request_access for folder/write on the actual parent and pass its granted request_id as access_request_id. This operation has no separate operation-approval card. If sharing fails after creation, retry with only request_id so the folder is not created twice.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"name":{"type":"string","description":"Folder name for a new folder; maximum 256 UTF-8 bytes."},"parent_folder_token":{"type":"string","description":"Optional Bot-owned parent folder already bound to this exact Feishu chat. Omit to use the Bot root."},"set_default":{"type":"boolean","description":"Make the new folder the default for this chat. The first folder is always default."},"access_request_id":{"type":"string","description":"Granted request_id returned by feishu_docs_request_access for write access to the actual parent folder."},"request_id":{"type":"string","description":"Retry a prior partial result by sharing the already-created folder; when set, omit all other fields."}},"oneOf":[{"required":["name","access_request_id"]},{"required":["request_id"]}],"additionalProperties":false}`),
 	}
 }
 

@@ -173,8 +173,8 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 func newFeishuTools(client *lark.Client, st *store.Store, accountID string, cfg feishutools.Config, approver feishutools.ApprovalRequester, resourceAccess feishutools.ResourceAccessController) []tooltypes.Tool {
 	tools := feishutools.NewChatHistoryTools(client, cfg)
 	tools = append(tools, feishutools.NewDocsResourceAccessTools(resourceAccess, cfg)...)
-	tools = append(tools, feishutools.NewDocsTools(client, st, accountID, cfg, approver)...)
-	tools = append(tools, feishutools.NewDocsFolderTools(client, st, accountID, cfg)...)
+	tools = append(tools, feishutools.NewDocsTools(client, st, accountID, cfg, approver, resourceAccess)...)
+	tools = append(tools, feishutools.NewDocsFolderTools(client, st, accountID, cfg, resourceAccess)...)
 	tools = append(tools, feishutools.NewLiteLLMAccountTools(client, cfg)...)
 	return tools
 }
