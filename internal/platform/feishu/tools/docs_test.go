@@ -88,7 +88,7 @@ func TestDocsCreateToolReturnsPendingApprovalWithoutCallingFeishuDocs(t *testing
 	if err := json.Unmarshal([]byte(result.Content), &output); err != nil {
 		t.Fatalf("unmarshal pending output: %v", err)
 	}
-	if output.Status != "pending_approval" || output.ApprovalID != "approval_123" || output.ExpiresAt != expiresAt.Format(time.RFC3339) || !strings.Contains(output.Message, "请勿重复调用") {
+	if output.Status != "pending_approval" || output.ApprovalID != "approval_123" || output.ExpiresAt != expiresAt.Format(time.RFC3339) || !strings.Contains(output.Message, "24 小时") || !strings.Contains(output.Message, "请勿重复调用") {
 		t.Fatalf("pending output = %#v", output)
 	}
 	if approver.checks != 1 || approver.checkedTool != createToolName {

@@ -73,6 +73,15 @@ type fakeApprovalExecutor struct {
 	done    chan struct{}
 }
 
+type failingGrantStore struct {
+	toolApprovalStore
+	err error
+}
+
+func (f failingGrantStore) UpsertToolApprovalGrant(store.ToolApprovalGrant) (store.ToolApprovalGrant, error) {
+	return store.ToolApprovalGrant{}, f.err
+}
+
 func (f *fakeApprovalExecutor) ApprovalToolName() string {
 	return f.name
 }
@@ -147,6 +156,17 @@ func TestApprovalManagerRequestsBoundCardWithoutDisplayingPayload(t *testing.T) 
 	}
 }
 
+func TestApprovalCardActionParsesFormCallbackAndReason(t *testing.T) {
+	event := approvalCardEvent("approval_123", approvalCardActionApproveAll, "ou_requester", "oc_chat", "om_card", "请保持标题简洁")
+	approvalID, action, ok := parseApprovalCardAction(event)
+	if !ok || approvalID != "approval_123" || action != approvalCardActionApproveAll {
+		t.Fatalf("parseApprovalCardAction = %q %q %v", approvalID, action, ok)
+	}
+	if reason := approvalCardReason(event); reason != "请保持标题简洁" {
+		t.Fatalf("approvalCardReason = %q", reason)
+	}
+}
+
 func TestApprovalManagerActiveGrantRequiresExactUserChatAndTool(t *testing.T) {
 	st := openFeishuApprovalTestStore(t)
 	manager := newTestApprovalManager(t, st, &fakeApprovalSender{})
@@ -200,7 +220,7 @@ func TestApprovalManagerOnlyRequesterCanApprove(t *testing.T) {
 	}
 	pending := requestTestApproval(t, manager)
 
-	resp, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.ID, store.ToolApprovalDecisionApprove, "ou_other", "oc_chat", "om_card"))
+	resp, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.ID, approvalCardActionApproveOnce, "ou_other", "oc_chat", "om_card", ""))
 	if err != nil {
 		t.Fatalf("HandleCardAction returned error: %v", err)
 	}
@@ -233,7 +253,7 @@ func TestApprovalManagerApprovesExecutesAndNotifiesOnce(t *testing.T) {
 	}
 	pending := requestTestApproval(t, manager)
 
-	resp, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.ID, store.ToolApprovalDecisionApprove, "ou_requester", "oc_chat", "om_card"))
+	resp, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.ID, approvalCardActionApproveOnce, "ou_requester", "oc_chat", "om_card", ""))
 	if err != nil {
 		t.Fatalf("HandleCardAction returned error: %v", err)
 	}
@@ -267,7 +287,7 @@ func TestApprovalManagerApprovesExecutesAndNotifiesOnce(t *testing.T) {
 		t.Fatalf("messages = %#v, want created document notification", messages)
 	}
 
-	second, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.ID, store.ToolApprovalDecisionApprove, "ou_requester", "oc_chat", "om_card"))
+	second, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.ID, approvalCardActionApproveOnce, "ou_requester", "oc_chat", "om_card", ""))
 	if err != nil {
 		t.Fatalf("second HandleCardAction returned error: %v", err)
 	}
@@ -276,6 +296,106 @@ func TestApprovalManagerApprovesExecutesAndNotifiesOnce(t *testing.T) {
 	}
 	if calls, _ := executor.snapshot(); calls != 1 {
 		t.Fatalf("executor calls after duplicate click = %d, want 1", calls)
+	}
+	if active, err := manager.HasActiveGrant(approvalRequestContext(), "feishu_docs_create"); err != nil || active {
+		t.Fatalf("approve-once grant returned active=%v err=%v", active, err)
+	}
+}
+
+func TestApprovalManagerApproveAllCreates24HourScopedGrant(t *testing.T) {
+	st := openFeishuApprovalTestStore(t)
+	sender := &fakeApprovalSender{}
+	manager := newTestApprovalManager(t, st, sender)
+	executor := &fakeApprovalExecutor{
+		name:   "feishu_docs_create",
+		result: feishutools.ApprovalExecution{Message: "✅ 文档已创建"},
+		done:   make(chan struct{}),
+	}
+	if err := manager.registerExecutor(executor); err != nil {
+		t.Fatalf("registerExecutor returned error: %v", err)
+	}
+	pending := requestTestApproval(t, manager)
+	clickedAt := manager.currentTime()
+
+	resp, err := manager.HandleCardAction(t.Context(), approvalCardEvent(
+		pending.ID,
+		approvalCardActionApproveAll,
+		"ou_requester",
+		"oc_chat",
+		"om_card",
+		"后续同类操作无需重复询问",
+	))
+	if err != nil {
+		t.Fatalf("HandleCardAction returned error: %v", err)
+	}
+	if resp == nil || resp.Toast == nil || resp.Toast.Type != "success" || !strings.Contains(resp.Toast.Content, "免审批") {
+		t.Fatalf("response = %#v, want reusable-grant toast", resp)
+	}
+	select {
+	case <-executor.done:
+	case <-time.After(time.Second):
+		t.Fatal("approve-all executor was not called")
+	}
+	waitForApprovalState(t, st, pending.ID, store.ToolApprovalStateSucceeded)
+
+	scope, err := toolApprovalGrantScope("feishu:cli_test", "feishu_docs_create", "ou_requester", "u_requester", "oc_chat")
+	if err != nil {
+		t.Fatalf("toolApprovalGrantScope returned error: %v", err)
+	}
+	grant, active, err := st.ActiveToolApprovalGrant(scope, clickedAt)
+	if err != nil {
+		t.Fatalf("ActiveToolApprovalGrant returned error: %v", err)
+	}
+	if !active || grant.SourceApprovalID != pending.ID || !grant.CreatedAt.Equal(clickedAt) || !grant.ExpiresAt.Equal(clickedAt.Add(24*time.Hour)) {
+		t.Fatalf("grant = %#v active=%v, want 24 hours from click", grant, active)
+	}
+	if active, err := manager.HasActiveGrant(approvalRequestContext(), "feishu_docs_create"); err != nil || !active {
+		t.Fatalf("same scope returned active=%v err=%v", active, err)
+	}
+	otherChat := feishutools.WithActor(context.Background(), feishutools.Actor{OpenID: "ou_requester", UserID: "u_requester"})
+	otherChat = feishutools.WithChatContext(otherChat, feishutools.ChatContext{ChatID: "oc_other"})
+	if active, err := manager.HasActiveGrant(otherChat, "feishu_docs_create"); err != nil || active {
+		t.Fatalf("other chat returned active=%v err=%v", active, err)
+	}
+}
+
+func TestApprovalManagerApproveAllFallsBackToCurrentRequestWhenGrantSaveFails(t *testing.T) {
+	st := openFeishuApprovalTestStore(t)
+	sender := &fakeApprovalSender{}
+	manager := newTestApprovalManager(t, st, sender)
+	executor := &fakeApprovalExecutor{
+		name:   "feishu_docs_create",
+		result: feishutools.ApprovalExecution{Message: "✅ 文档已创建"},
+		done:   make(chan struct{}),
+	}
+	if err := manager.registerExecutor(executor); err != nil {
+		t.Fatalf("registerExecutor returned error: %v", err)
+	}
+	manager.store = failingGrantStore{toolApprovalStore: manager.store, err: errors.New("grant unavailable")}
+	pending := requestTestApproval(t, manager)
+
+	resp, err := manager.HandleCardAction(t.Context(), approvalCardEvent(
+		pending.ID,
+		approvalCardActionApproveAll,
+		"ou_requester",
+		"oc_chat",
+		"om_card",
+		"",
+	))
+	if err != nil {
+		t.Fatalf("HandleCardAction returned error: %v", err)
+	}
+	if resp == nil || resp.Toast == nil || resp.Toast.Type != "success" || !strings.Contains(resp.Toast.Content, "保存失败") || !strings.Contains(resp.Toast.Content, "后续调用仍需审批") {
+		t.Fatalf("response = %#v, want degraded one-time approval toast", resp)
+	}
+	select {
+	case <-executor.done:
+	case <-time.After(time.Second):
+		t.Fatal("executor was not called after grant save failure")
+	}
+	waitForApprovalState(t, st, pending.ID, store.ToolApprovalStateSucceeded)
+	if active, err := manager.HasActiveGrant(approvalRequestContext(), "feishu_docs_create"); err != nil || active {
+		t.Fatalf("failed grant returned active=%v err=%v", active, err)
 	}
 }
 
@@ -289,7 +409,7 @@ func TestApprovalManagerDenyDoesNotExecute(t *testing.T) {
 	}
 	pending := requestTestApproval(t, manager)
 
-	resp, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.ID, store.ToolApprovalDecisionDeny, "ou_requester", "oc_chat", "om_card"))
+	resp, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.ID, approvalCardActionReject, "ou_requester", "oc_chat", "om_card", "标题不够清楚"))
 	if err != nil {
 		t.Fatalf("HandleCardAction returned error: %v", err)
 	}
@@ -395,7 +515,7 @@ func requestTestApproval(t *testing.T, manager *approvalManager) feishutools.Pen
 	return pending
 }
 
-func approvalCardEvent(approvalID, decision, openID, chatID, messageID string) *callback.CardActionTriggerEvent {
+func approvalCardEvent(approvalID, action, openID, chatID, messageID, reason string) *callback.CardActionTriggerEvent {
 	userID := "u_requester"
 	if openID != "ou_requester" {
 		userID = "u_other"
@@ -405,11 +525,14 @@ func approvalCardEvent(approvalID, decision, openID, chatID, messageID string) *
 			Operator: &callback.Operator{OpenID: openID, UserID: &userID},
 			Token:    "c_callback",
 			Context:  &callback.Context{OpenChatID: chatID, OpenMessageID: messageID},
-			Action: &callback.CallBackAction{Value: map[string]interface{}{
-				"kind":        approvalCardActionKind,
-				"approval_id": approvalID,
-				"decision":    decision,
-			}},
+			Action: &callback.CallBackAction{
+				Value: map[string]interface{}{
+					"kind":        approvalCardActionKind,
+					"approval_id": approvalID,
+					"action":      action,
+				},
+				FormValue: map[string]interface{}{"reason": reason},
+			},
 		},
 	}
 }
@@ -439,38 +562,64 @@ func assertApprovalCardActions(t *testing.T, cardJSON, approvalID string) {
 	if config["update_multi"] != true {
 		t.Fatalf("card config = %#v, want shared Card V2 update_multi=true", config)
 	}
+	header, _ := card["header"].(map[string]interface{})
+	title, _ := header["title"].(map[string]interface{})
+	tags, _ := header["text_tag_list"].([]interface{})
+	if title["content"] != "权限申请审批" || header["template"] != "blue" || header["padding"] != "12px 8px 12px 8px" || len(tags) != 1 {
+		t.Fatalf("card header = %#v", header)
+	}
 	body, _ := card["body"].(map[string]interface{})
 	elements, _ := body["elements"].([]interface{})
-	if len(elements) != 2 {
-		t.Fatalf("card elements = %#v, want markdown and button columns", elements)
+	if len(elements) != 1 {
+		t.Fatalf("card elements = %#v, want one form", elements)
 	}
-	columnsElement, _ := elements[1].(map[string]interface{})
-	if columnsElement["tag"] != "column_set" || columnsElement["horizontal_spacing"] != "8px" {
-		t.Fatalf("button container = %#v, want official Card V2 column_set", columnsElement)
+	form, _ := elements[0].(map[string]interface{})
+	if form["tag"] != "form" || form["name"] != "Form_msa8n85x" || form["padding"] != "4px 0px 4px 0px" {
+		t.Fatalf("approval form = %#v", form)
 	}
-	columns, _ := columnsElement["columns"].([]interface{})
-	if len(columns) != 2 {
-		t.Fatalf("card columns = %#v, want approve/deny", columns)
+	formElements, _ := form["elements"].([]interface{})
+	if len(formElements) != 4 {
+		t.Fatalf("form elements = %#v, want markdown, two approvals, and reject row", formElements)
 	}
-	for i, wantDecision := range []string{store.ToolApprovalDecisionApprove, store.ToolApprovalDecisionDeny} {
-		column, _ := columns[i].(map[string]interface{})
-		if column["tag"] != "column" || column["width"] != "weighted" || column["weight"] != float64(1) {
-			t.Fatalf("button column %d = %#v, want weighted Card V2 column", i, column)
-		}
-		buttonElements, _ := column["elements"].([]interface{})
-		button, _ := buttonElements[0].(map[string]interface{})
-		if button["tag"] != "button" || button["width"] != "fill" {
-			t.Fatalf("button %d = %#v, want Card V2 button", i, button)
-		}
-		behaviors, _ := button["behaviors"].([]interface{})
-		behavior, _ := behaviors[0].(map[string]interface{})
-		if behavior["type"] != "callback" {
-			t.Fatalf("button %d behavior = %#v, want callback behavior", i, behavior)
-		}
-		value, _ := behavior["value"].(map[string]interface{})
-		if value["approval_id"] != approvalID || value["decision"] != wantDecision || value["kind"] != approvalCardActionKind {
-			t.Fatalf("button %d callback value = %#v", i, value)
-		}
+	markdown, _ := formElements[0].(map[string]interface{})
+	if markdown["tag"] != "markdown" || markdown["element_id"] != "SnLSJiYBwzi2qzhJsFPP" || !strings.Contains(markdown["content"].(string), "24 小时") {
+		t.Fatalf("approval markdown = %#v", markdown)
+	}
+	assertApprovalFormButton(t, formElements[1], approvalID, approvalCardActionApproveOnce, "同意一次", "primary_filled", "Button_ruivkstdali")
+	assertApprovalFormButton(t, formElements[2], approvalID, approvalCardActionApproveAll, "全部同意", "primary", "Button_zrwjazvut3f")
+
+	reasonRow, _ := formElements[3].(map[string]interface{})
+	columns, _ := reasonRow["columns"].([]interface{})
+	if reasonRow["tag"] != "column_set" || len(columns) != 2 {
+		t.Fatalf("reason row = %#v", reasonRow)
+	}
+	inputColumn, _ := columns[0].(map[string]interface{})
+	inputElements, _ := inputColumn["elements"].([]interface{})
+	input, _ := inputElements[0].(map[string]interface{})
+	placeholder, _ := input["placeholder"].(map[string]interface{})
+	if input["tag"] != "input" || input["name"] != "reason" || placeholder["content"] != "请输入建议" {
+		t.Fatalf("reason input = %#v", input)
+	}
+	rejectColumn, _ := columns[1].(map[string]interface{})
+	rejectElements, _ := rejectColumn["elements"].([]interface{})
+	assertApprovalFormButton(t, rejectElements[0], approvalID, approvalCardActionReject, "拒绝", "danger", "Button_k7l2449r9dj")
+}
+
+func assertApprovalFormButton(t *testing.T, raw interface{}, approvalID, action, text, buttonType, name string) {
+	t.Helper()
+	button, _ := raw.(map[string]interface{})
+	label, _ := button["text"].(map[string]interface{})
+	if button["tag"] != "button" || button["width"] != "default" || button["size"] != "medium" || button["type"] != buttonType || button["name"] != name || button["form_action_type"] != "submit" || label["content"] != text {
+		t.Fatalf("approval button = %#v", button)
+	}
+	behaviors, _ := button["behaviors"].([]interface{})
+	if len(behaviors) != 1 {
+		t.Fatalf("approval button behaviors = %#v", behaviors)
+	}
+	behavior, _ := behaviors[0].(map[string]interface{})
+	value, _ := behavior["value"].(map[string]interface{})
+	if behavior["type"] != "callback" || value["approval_id"] != approvalID || value["action"] != action || value["kind"] != approvalCardActionKind {
+		t.Fatalf("approval button callback = %#v", behavior)
 	}
 }
 

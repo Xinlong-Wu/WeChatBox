@@ -287,7 +287,7 @@ func (t docsTool) create(ctx context.Context, raw json.RawMessage) (string, erro
 		Status:     "pending_approval",
 		ApprovalID: pending.ID,
 		ExpiresAt:  pending.ExpiresAt.UTC().Format(time.RFC3339),
-		Message:    "已向本次请求的飞书用户发送一次性授权卡片；批准后会异步创建文档，请勿重复调用。",
+		Message:    "已向本次请求的飞书用户发送授权卡片；可同意本次，或为相同用户、机器人账号、对话和 feishu_docs_create 授权 24 小时。批准后会异步创建文档，请勿重复调用。",
 	})
 }
 
@@ -540,7 +540,7 @@ func docsReadSpec() tooltypes.Spec {
 func docsCreateSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        createToolName,
-		Description: "Create a docx document in an allowed Feishu folder. A matching reusable grant executes immediately; otherwise the tool returns pending_approval and creates asynchronously after the requester approves the Feishu card.",
+		Description: "Create a docx document in an allowed Feishu folder. A matching 24-hour grant for the same Feishu user, bot account, chat, and tool executes immediately; otherwise the tool returns pending_approval and creates asynchronously after card approval.",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"title":{"type":"string","minLength":1,"maxLength":800},"content":{"type":"string"},"folder_token":{"type":"string","description":"Must be listed in platforms.feishu.tools.allowed_folder_tokens."}},"required":["title","folder_token"],"additionalProperties":false}`),
 	}
 }
