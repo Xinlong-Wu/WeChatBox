@@ -86,7 +86,7 @@ func (f *fakeApprovalExecutor) ApprovalToolName() string {
 	return f.name
 }
 
-func (f *fakeApprovalExecutor) ExecuteApproved(_ context.Context, payload json.RawMessage) (feishutools.ApprovalExecution, error) {
+func (f *fakeApprovalExecutor) ExecuteApproved(_ context.Context, _ string, payload json.RawMessage) (feishutools.ApprovalExecution, error) {
 	f.mu.Lock()
 	f.calls++
 	f.payload = append(json.RawMessage(nil), payload...)

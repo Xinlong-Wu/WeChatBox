@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"net/url"
@@ -15,6 +16,7 @@ import (
 	larkdocx "github.com/larksuite/oapi-sdk-go/v3/service/docx/v1"
 	larksearch "github.com/larksuite/oapi-sdk-go/v3/service/search/v2"
 
+	"lingobridge/internal/store"
 	tooltypes "lingobridge/internal/tools"
 )
 
@@ -28,28 +30,32 @@ const (
 )
 
 type docsTool struct {
-	name     string
-	spec     tooltypes.Spec
-	client   *lark.Client
-	cfg      Config
-	approver ApprovalRequester
+	name      string
+	spec      tooltypes.Spec
+	client    *lark.Client
+	store     *store.Store
+	accountID string
+	cfg       Config
+	approver  ApprovalRequester
+	now       func() time.Time
 }
 
 // NewDocsTools returns Feishu document tools for tool-capable LLM providers.
-func NewDocsTools(client *lark.Client, cfg Config, approver ApprovalRequester) []tooltypes.Tool {
+func NewDocsTools(client *lark.Client, st *store.Store, accountID string, cfg Config, approver ApprovalRequester) []tooltypes.Tool {
 	cfg = NormalizeConfig(cfg)
-	if client == nil || !cfg.Docs.Enabled {
+	accountID = strings.TrimSpace(accountID)
+	if client == nil || st == nil || st.PlatformID() != store.PlatformFeishu || accountID == "" || !cfg.Docs.Enabled {
 		return nil
 	}
 	tools := []tooltypes.Tool{
-		docsTool{name: searchToolName, spec: docsSearchSpec(), client: client, cfg: cfg},
-		docsTool{name: readToolName, spec: docsReadSpec(), client: client, cfg: cfg},
+		docsTool{name: searchToolName, spec: docsSearchSpec(), client: client, store: st, accountID: accountID, cfg: cfg, now: time.Now},
+		docsTool{name: readToolName, spec: docsReadSpec(), client: client, store: st, accountID: accountID, cfg: cfg, now: time.Now},
 	}
-	if cfg.Docs.AllowWrite && len(cfg.AllowedFolderTokens) > 0 {
+	if cfg.Docs.AllowWrite {
 		if approver != nil {
-			tools = append(tools, docsTool{name: createToolName, spec: docsCreateSpec(), client: client, cfg: cfg, approver: approver})
+			tools = append(tools, docsTool{name: createToolName, spec: docsCreateSpec(), client: client, store: st, accountID: accountID, cfg: cfg, approver: approver, now: time.Now})
 		}
-		tools = append(tools, docsTool{name: appendToolName, spec: docsAppendSpec(), client: client, cfg: cfg})
+		tools = append(tools, docsTool{name: appendToolName, spec: docsAppendSpec(), client: client, store: st, accountID: accountID, cfg: cfg, now: time.Now})
 	}
 	return tools
 }
@@ -91,7 +97,6 @@ func contentOrError(content string, err error) string {
 type searchArgs struct {
 	Query    string `json:"query"`
 	MaxItems int    `json:"max_items,omitempty"`
-	SpaceID  string `json:"space_id,omitempty"`
 }
 
 type readArgs struct {
@@ -103,19 +108,27 @@ type readArgs struct {
 type createArgs struct {
 	Title       string `json:"title"`
 	Content     string `json:"content,omitempty"`
-	FolderToken string `json:"folder_token"`
+	FolderToken string `json:"folder_token,omitempty"`
+}
+
+type approvedCreatePayload struct {
+	createArgs
+	ChatID      string `json:"chat_id"`
+	ActorOpenID string `json:"actor_open_id,omitempty"`
+	ActorUserID string `json:"actor_user_id,omitempty"`
 }
 
 type appendArgs struct {
 	Token       string `json:"token,omitempty"`
 	URL         string `json:"url,omitempty"`
 	Content     string `json:"content"`
-	FolderToken string `json:"folder_token"`
+	FolderToken string `json:"folder_token,omitempty"`
 }
 
 type searchOutput struct {
-	Query   string         `json:"query"`
-	Results []searchResult `json:"results"`
+	Query    string         `json:"query"`
+	Results  []searchResult `json:"results"`
+	Warnings []string       `json:"warnings,omitempty"`
 }
 
 type searchResult struct {
@@ -135,6 +148,7 @@ type readOutput struct {
 }
 
 type writeOutput struct {
+	RequestID  string `json:"request_id,omitempty"`
 	DocumentID string `json:"document_id"`
 	Title      string `json:"title,omitempty"`
 	URL        string `json:"url,omitempty"`
@@ -149,6 +163,13 @@ type pendingApprovalOutput struct {
 	Message   string `json:"message"`
 }
 
+type folderRequiredOutput struct {
+	Status        string `json:"status"`
+	RequiredTool  string `json:"required_tool"`
+	Message       string `json:"message"`
+	CreateRequest string `json:"create_request_id,omitempty"`
+}
+
 func (t docsTool) search(ctx context.Context, raw json.RawMessage) (string, error) {
 	var args searchArgs
 	if err := json.Unmarshal(raw, &args); err != nil {
@@ -158,59 +179,125 @@ func (t docsTool) search(ctx context.Context, raw json.RawMessage) (string, erro
 	if args.Query == "" {
 		return "", fmt.Errorf("query is required")
 	}
+	_, chat, err := trustedDocsScope(ctx)
+	if err != nil {
+		return "", err
+	}
 	limit := args.MaxItems
 	if limit <= 0 || limit > t.cfg.MaxResults {
 		limit = t.cfg.MaxResults
 	}
-
-	bodyBuilder := larksearch.NewSearchDocWikiReqBodyBuilder().
-		Query(args.Query).
-		PageSize(limit)
-	if len(t.cfg.AllowedFolderTokens) > 0 {
-		bodyBuilder.DocFilter(larksearch.NewDocFilterBuilder().FolderTokens(t.cfg.AllowedFolderTokens).Build())
+	if limit > 20 {
+		limit = 20
 	}
-	spaceIDs := t.cfg.AllowedSpaceIDs
-	if args.SpaceID = strings.TrimSpace(args.SpaceID); args.SpaceID != "" {
-		if len(t.cfg.AllowedSpaceIDs) > 0 && !allowedValue(args.SpaceID, t.cfg.AllowedSpaceIDs) {
-			return "", fmt.Errorf("space_id %q is not allowed", args.SpaceID)
-		}
-		spaceIDs = []string{args.SpaceID}
-	}
-	if len(spaceIDs) > 0 {
-		bodyBuilder.WikiFilter(larksearch.NewWikiFilterBuilder().SpaceIds(spaceIDs).Build())
-	}
-	req := larksearch.NewSearchDocWikiReqBuilder().Body(bodyBuilder.Build()).Build()
-	resp, err := t.client.Search.DocWiki.Search(ctx, req)
+	folders, err := t.store.ListFeishuChatFolders(t.accountID, chat.ChatID)
 	if err != nil {
-		return "", fmt.Errorf("search feishu docs: %w", err)
+		return "", fmt.Errorf("list current feishu chat folders: %w", err)
 	}
-	if resp == nil || !resp.Success() {
-		return "", fmt.Errorf("search feishu docs code=%d msg=%s", resp.Code, resp.Msg)
+	available := availableFeishuFolders(folders)
+	if len(available) == 0 {
+		return marshalToolOutput(folderRequiredForFolders(folders))
 	}
 
-	out := searchOutput{Query: args.Query}
-	if resp.Data != nil {
-		for _, unit := range resp.Data.ResUnits {
-			if unit == nil {
+	started := time.Now()
+	out := searchOutput{Query: args.Query, Results: []searchResult{}}
+	seen := map[string]struct{}{}
+	succeeded := 0
+	var firstSearchErr error
+	for _, folder := range available {
+		results, searchErr := t.searchFolder(ctx, args.Query, limit, folder)
+		if searchErr != nil {
+			if firstSearchErr == nil {
+				firstSearchErr = searchErr
+			}
+			out.Warnings = append(out.Warnings, fmt.Sprintf("文件夹 %q 搜索失败。", folderDisplayName(folder)))
+			feishuToolsLog.Warn(ctx, "search feishu chat folder failed account=%s chat=%s folder_ref=%s: %v", t.accountID, chat.ChatID, hashString(folder.FolderToken), searchErr)
+			continue
+		}
+		succeeded++
+		mappingWarningAdded := false
+		for _, result := range results {
+			if isWikiSearchResult(result) {
 				continue
 			}
-			result := searchResult{
-				Title:   stripSearchHighlight(deref(unit.TitleHighlighted)),
-				Summary: stripSearchHighlight(deref(unit.SummaryHighlighted)),
-				Type:    deref(unit.EntityType),
-			}
-			if unit.ResultMeta != nil {
-				result.URL = deref(unit.ResultMeta.Url)
-				result.Token = deref(unit.ResultMeta.Token)
-				result.Owner = deref(unit.ResultMeta.OwnerName)
-				if result.Type == "" {
-					result.Type = deref(unit.ResultMeta.DocTypes)
+			if result.Token != "" {
+				if _, saveErr := t.store.SaveFeishuChatDocument(store.FeishuChatDocument{
+					AccountID:     t.accountID,
+					ChatID:        chat.ChatID,
+					DocumentToken: result.Token,
+					FolderToken:   folder.FolderToken,
+					Title:         result.Title,
+					URL:           result.URL,
+					CreatedAt:     t.currentTime(),
+				}); saveErr != nil {
+					if !mappingWarningAdded {
+						out.Warnings = append(out.Warnings, fmt.Sprintf("文件夹 %q 的部分搜索结果未能保存为当前对话可访问文档。", folderDisplayName(folder)))
+						mappingWarningAdded = true
+					}
+					feishuToolsLog.Warn(ctx, "persist feishu search result failed account=%s chat=%s folder_ref=%s document_ref=%s: %v", t.accountID, chat.ChatID, hashString(folder.FolderToken), hashString(result.Token), saveErr)
 				}
 			}
+			key := searchResultKey(result)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
 			out.Results = append(out.Results, result)
 		}
 	}
+	if succeeded == 0 {
+		return "", fmt.Errorf("search current Feishu chat folders: %w", firstSearchErr)
+	}
+	if len(out.Results) > limit {
+		out.Results = out.Results[:limit]
+	}
+	feishuToolsLog.Debug(ctx, "searched feishu chat documents account=%s chat=%s folders=%d succeeded=%d results=%d warnings=%d query_chars=%d duration_ms=%d",
+		t.accountID, chat.ChatID, len(available), succeeded, len(out.Results), len(out.Warnings), utf8.RuneCountInString(args.Query), time.Since(started).Milliseconds())
 	return marshalToolOutput(out)
+}
+
+func (t docsTool) searchFolder(ctx context.Context, query string, limit int, folder store.FeishuChatFolder) ([]searchResult, error) {
+	req := larksearch.NewSearchDocWikiReqBuilder().
+		Body(larksearch.NewSearchDocWikiReqBodyBuilder().
+			Query(query).
+			PageSize(limit).
+			DocFilter(larksearch.NewDocFilterBuilder().FolderTokens([]string{folder.FolderToken}).Build()).
+			Build()).
+		Build()
+	resp, err := t.client.Search.DocWiki.Search(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("search feishu docs: %w", err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("search feishu docs: empty response")
+	}
+	if !resp.Success() {
+		return nil, fmt.Errorf("search feishu docs code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	results := []searchResult{}
+	if resp.Data == nil {
+		return results, nil
+	}
+	for _, unit := range resp.Data.ResUnits {
+		if unit == nil {
+			continue
+		}
+		result := searchResult{
+			Title:   stripSearchHighlight(deref(unit.TitleHighlighted)),
+			Summary: stripSearchHighlight(deref(unit.SummaryHighlighted)),
+			Type:    strings.TrimSpace(deref(unit.EntityType)),
+		}
+		if unit.ResultMeta != nil {
+			result.URL = strings.TrimSpace(deref(unit.ResultMeta.Url))
+			result.Token = strings.TrimSpace(deref(unit.ResultMeta.Token))
+			result.Owner = strings.TrimSpace(deref(unit.ResultMeta.OwnerName))
+			if result.Type == "" {
+				result.Type = strings.TrimSpace(deref(unit.ResultMeta.DocTypes))
+			}
+		}
+		results = append(results, result)
+	}
+	return results, nil
 }
 
 func (t docsTool) read(ctx context.Context, raw json.RawMessage) (string, error) {
@@ -224,6 +311,16 @@ func (t docsTool) read(ctx context.Context, raw json.RawMessage) (string, error)
 	}
 	if ref.Kind != "docx" {
 		return "", fmt.Errorf("reading %s documents is not supported yet; provide a docx token or URL", ref.Kind)
+	}
+	_, chat, err := trustedDocsScope(ctx)
+	if err != nil {
+		return "", err
+	}
+	if _, err := t.store.GetFeishuChatDocument(t.accountID, chat.ChatID, ref.Token); err != nil {
+		if errors.Is(err, store.ErrFeishuChatDocumentNotFound) {
+			return "", fmt.Errorf("document is not available to the current Feishu chat; search it in a bound folder or request access first")
+		}
+		return "", fmt.Errorf("check current chat document: %w", err)
 	}
 	req := larkdocx.NewRawContentDocumentReqBuilder().
 		DocumentId(ref.Token).
@@ -245,7 +342,7 @@ func (t docsTool) read(ctx context.Context, raw json.RawMessage) (string, error)
 }
 
 func (t docsTool) create(ctx context.Context, raw json.RawMessage) (string, error) {
-	args, err := t.parseCreateArgs(raw)
+	payload, err := t.resolveCreatePayload(ctx, raw)
 	if err != nil {
 		return "", err
 	}
@@ -257,16 +354,29 @@ func (t docsTool) create(ctx context.Context, raw json.RawMessage) (string, erro
 		return "", fmt.Errorf("check feishu document creation approval: %w", err)
 	}
 	if granted {
-		out, createErr := t.createDocument(ctx, args)
+		request, requestErr := t.store.CreateWorkflowRequest(store.WorkflowRequest{
+			AccountID: t.accountID,
+			Kind:      store.WorkflowRequestKindFeishuDocsCreate,
+			State:     store.WorkflowRequestStateExecuting,
+			CreatedAt: t.currentTime(),
+		})
+		if requestErr != nil {
+			return "", fmt.Errorf("create feishu document workflow request: %w", requestErr)
+		}
+		out, createErr := t.createDocument(ctx, request.ID, payload)
 		if createErr != nil {
 			if out.DocumentID == "" {
+				t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStateFailed)
 				return "", createErr
 			}
-			out.Warning = fmt.Sprintf("文档已创建，但初始内容写入失败：%v。请勿重复创建，可稍后追加内容。", createErr)
+			t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStatePartial)
+			out.Warning = fmt.Sprintf("文档已创建，但初始内容写入或本地登记失败：%v。请勿重复创建，可稍后继续处理。", createErr)
+			return marshalToolOutput(out)
 		}
+		t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStateSucceeded)
 		return marshalToolOutput(out)
 	}
-	payload, err := json.Marshal(args)
+	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("marshal approved document request: %w", err)
 	}
@@ -274,11 +384,11 @@ func (t docsTool) create(ctx context.Context, raw json.RawMessage) (string, erro
 		ToolName: createToolName,
 		Action:   "创建飞书文档",
 		Fields: []ApprovalField{
-			{Label: "文档标题", Value: args.Title},
-			{Label: "目标文件夹", Value: args.FolderToken},
-			{Label: "初始内容", Value: fmt.Sprintf("%d 个字符", utf8.RuneCountInString(args.Content))},
+			{Label: "文档标题", Value: payload.Title},
+			{Label: "目标文件夹", Value: payload.FolderToken},
+			{Label: "初始内容", Value: fmt.Sprintf("%d 个字符", utf8.RuneCountInString(payload.Content))},
 		},
-		Payload: payload,
+		Payload: payloadJSON,
 	})
 	if err != nil {
 		return "", fmt.Errorf("request feishu document creation approval: %w", err)
@@ -300,15 +410,15 @@ func (t docsTool) ApprovalToolName() string {
 }
 
 // ExecuteApproved creates the exact document payload persisted before authorization.
-func (t docsTool) ExecuteApproved(ctx context.Context, payload json.RawMessage) (ApprovalExecution, error) {
+func (t docsTool) ExecuteApproved(ctx context.Context, requestID string, payload json.RawMessage) (ApprovalExecution, error) {
 	if t.name != createToolName {
 		return ApprovalExecution{}, fmt.Errorf("tool %q does not support approved execution", t.name)
 	}
-	args, err := t.parseCreateArgs(payload)
+	args, err := t.parseApprovedCreatePayload(payload)
 	if err != nil {
 		return ApprovalExecution{}, err
 	}
-	out, err := t.createDocument(ctx, args)
+	out, err := t.createDocument(ctx, requestID, args)
 	if err != nil {
 		if out.DocumentID != "" {
 			return ApprovalExecution{
@@ -337,13 +447,85 @@ func (t docsTool) parseCreateArgs(raw json.RawMessage) (createArgs, error) {
 	if utf8.RuneCountInString(args.Title) > maxDocxTitle {
 		return createArgs{}, fmt.Errorf("title must not exceed %d characters", maxDocxTitle)
 	}
-	if !allowedValue(args.FolderToken, t.cfg.AllowedFolderTokens) {
-		return createArgs{}, fmt.Errorf("folder_token %q is not allowed", args.FolderToken)
-	}
 	return args, nil
 }
 
-func (t docsTool) createDocument(ctx context.Context, args createArgs) (writeOutput, error) {
+func (t docsTool) resolveCreatePayload(ctx context.Context, raw json.RawMessage) (approvedCreatePayload, error) {
+	args, err := t.parseCreateArgs(raw)
+	if err != nil {
+		return approvedCreatePayload{}, err
+	}
+	actor, chat, err := trustedDocsScope(ctx)
+	if err != nil {
+		return approvedCreatePayload{}, err
+	}
+	folder, err := t.resolveChatFolder(chat.ChatID, args.FolderToken)
+	if err != nil {
+		return approvedCreatePayload{}, err
+	}
+	args.FolderToken = folder.FolderToken
+	return approvedCreatePayload{
+		createArgs:  args,
+		ChatID:      chat.ChatID,
+		ActorOpenID: actor.OpenID,
+		ActorUserID: actor.UserID,
+	}, nil
+}
+
+func (t docsTool) parseApprovedCreatePayload(raw json.RawMessage) (approvedCreatePayload, error) {
+	var payload approvedCreatePayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return approvedCreatePayload{}, fmt.Errorf("parse approved document request: %w", err)
+	}
+	argsJSON, err := json.Marshal(payload.createArgs)
+	if err != nil {
+		return approvedCreatePayload{}, fmt.Errorf("normalize approved document request: %w", err)
+	}
+	args, err := t.parseCreateArgs(argsJSON)
+	if err != nil {
+		return approvedCreatePayload{}, err
+	}
+	payload.createArgs = args
+	payload.ChatID = strings.TrimSpace(payload.ChatID)
+	payload.ActorOpenID = strings.TrimSpace(payload.ActorOpenID)
+	payload.ActorUserID = strings.TrimSpace(payload.ActorUserID)
+	if payload.ChatID == "" {
+		return approvedCreatePayload{}, fmt.Errorf("approved document request is missing chat_id")
+	}
+	folder, err := t.resolveChatFolder(payload.ChatID, payload.FolderToken)
+	if err != nil {
+		return approvedCreatePayload{}, err
+	}
+	payload.FolderToken = folder.FolderToken
+	return payload, nil
+}
+
+func (t docsTool) resolveChatFolder(chatID, folderToken string) (store.FeishuChatFolder, error) {
+	chatID = strings.TrimSpace(chatID)
+	folderToken = strings.TrimSpace(folderToken)
+	var (
+		folder store.FeishuChatFolder
+		err    error
+	)
+	if folderToken == "" {
+		folder, err = t.store.DefaultFeishuChatFolder(t.accountID, chatID)
+	} else {
+		folder, err = t.store.GetFeishuChatFolder(t.accountID, chatID, folderToken)
+	}
+	if err != nil {
+		if errors.Is(err, store.ErrFeishuChatFolderNotFound) {
+			return store.FeishuChatFolder{}, fmt.Errorf("folder_token is not a Bot-owned folder bound to the current Feishu chat; call %s first", folderCreateToolName)
+		}
+		return store.FeishuChatFolder{}, fmt.Errorf("resolve current chat folder: %w", err)
+	}
+	if folder.ShareState != store.FeishuFolderShareStateSucceeded {
+		return store.FeishuChatFolder{}, fmt.Errorf("folder sharing is incomplete; retry its create_request_id before using it")
+	}
+	return folder, nil
+}
+
+func (t docsTool) createDocument(ctx context.Context, requestID string, payload approvedCreatePayload) (writeOutput, error) {
+	args := payload.createArgs
 	req := larkdocx.NewCreateDocumentReqBuilder().
 		Body(larkdocx.NewCreateDocumentReqBodyBuilder().
 			Title(args.Title).
@@ -367,11 +549,23 @@ func (t docsTool) createDocument(ctx context.Context, args createArgs) (writeOut
 	if docID == "" {
 		return writeOutput{}, fmt.Errorf("create feishu document returned no document_id")
 	}
-	out := writeOutput{DocumentID: docID, Title: args.Title, URL: "https://docs.feishu.cn/docx/" + docID}
+	out := writeOutput{RequestID: requestID, DocumentID: docID, Title: args.Title, URL: "https://docs.feishu.cn/docx/" + docID}
 	if strings.TrimSpace(args.Content) != "" {
 		if err := t.appendTextBlocks(ctx, docID, args.Content); err != nil {
 			return out, err
 		}
+	}
+	if _, err := t.store.SaveFeishuChatDocument(store.FeishuChatDocument{
+		AccountID:       t.accountID,
+		ChatID:          payload.ChatID,
+		DocumentToken:   docID,
+		FolderToken:     args.FolderToken,
+		Title:           args.Title,
+		URL:             out.URL,
+		SourceRequestID: requestID,
+		CreatedAt:       t.currentTime(),
+	}); err != nil {
+		return out, fmt.Errorf("record created Feishu document: %w", err)
 	}
 	return out, nil
 }
@@ -384,15 +578,26 @@ func (t docsTool) append(ctx context.Context, raw json.RawMessage) (string, erro
 	if strings.TrimSpace(args.Content) == "" {
 		return "", fmt.Errorf("content is required")
 	}
-	if !allowedValue(strings.TrimSpace(args.FolderToken), t.cfg.AllowedFolderTokens) {
-		return "", fmt.Errorf("folder_token %q is not allowed", args.FolderToken)
-	}
 	ref, err := parseDocRef(args.Token, args.URL, "docx")
 	if err != nil {
 		return "", err
 	}
 	if ref.Kind != "docx" {
 		return "", fmt.Errorf("append supports docx documents only")
+	}
+	_, chat, err := trustedDocsScope(ctx)
+	if err != nil {
+		return "", err
+	}
+	document, err := t.store.GetFeishuChatDocument(t.accountID, chat.ChatID, ref.Token)
+	if err != nil {
+		if errors.Is(err, store.ErrFeishuChatDocumentNotFound) {
+			return "", fmt.Errorf("document is not available to the current Feishu chat")
+		}
+		return "", fmt.Errorf("check current chat document: %w", err)
+	}
+	if folderToken := strings.TrimSpace(args.FolderToken); folderToken != "" && folderToken != document.FolderToken {
+		return "", fmt.Errorf("folder_token does not match the document binding in the current Feishu chat")
 	}
 	if err := t.appendTextBlocks(ctx, ref.Token, args.Content); err != nil {
 		return "", err
@@ -524,15 +729,15 @@ func normalizeDocKind(kind string) string {
 func docsSearchSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        searchToolName,
-		Description: "Search Feishu Docs and Wiki visible to the configured Feishu app. Returns titles, summaries, URLs, and tokens.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"query":{"type":"string","description":"Search keywords."},"max_items":{"type":"integer","minimum":1,"maximum":20},"space_id":{"type":"string","description":"Optional Wiki space ID; must be allowed by configuration."}},"required":["query"],"additionalProperties":false}`),
+		Description: "Search docx documents only inside Bot-owned folders bound to the current trusted Feishu chat. Returns titles, summaries, URLs, and tokens.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"query":{"type":"string","description":"Search keywords."},"max_items":{"type":"integer","minimum":1,"maximum":20}},"required":["query"],"additionalProperties":false}`),
 	}
 }
 
 func docsReadSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        readToolName,
-		Description: "Read plain text from a Feishu docx document by token or URL. The result may be truncated by configuration.",
+		Description: "Read plain text from a Feishu docx document already bound to the current trusted Feishu chat. The result may be truncated by configuration.",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"token":{"type":"string","description":"Feishu docx document token."},"url":{"type":"string","description":"Feishu document URL."},"type":{"type":"string","enum":["docx","wiki","file"],"description":"Document type hint."}},"additionalProperties":false}`),
 	}
 }
@@ -540,8 +745,8 @@ func docsReadSpec() tooltypes.Spec {
 func docsCreateSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        createToolName,
-		Description: "Create a docx document in an allowed Feishu folder. A matching 24-hour grant for the same Feishu user, bot account, chat, and tool executes immediately; otherwise the tool returns pending_approval and creates asynchronously after card approval.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"title":{"type":"string","minLength":1,"maxLength":800},"content":{"type":"string"},"folder_token":{"type":"string","description":"Must be listed in platforms.feishu.tools.allowed_folder_tokens."}},"required":["title","folder_token"],"additionalProperties":false}`),
+		Description: "Create a Feishu docx document only in a Bot-owned folder bound to the current trusted chat. Omit folder_token to use that chat's default Bot folder. A matching 24-hour operation grant executes immediately; otherwise creation starts after the requester approves the operation card.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"title":{"type":"string","minLength":1,"maxLength":800},"content":{"type":"string"},"folder_token":{"type":"string","description":"Optional Bot-owned folder token already bound to this exact Feishu chat."}},"required":["title"],"additionalProperties":false}`),
 	}
 }
 
@@ -560,22 +765,69 @@ func escapeFeishuLinkText(value string) string {
 func docsAppendSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        appendToolName,
-		Description: "Append plain text paragraphs to an existing Feishu docx document. Requires an allowed folder token guard.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"token":{"type":"string"},"url":{"type":"string"},"content":{"type":"string"},"folder_token":{"type":"string","description":"Must be listed in platforms.feishu.tools.allowed_folder_tokens."}},"required":["content","folder_token"],"additionalProperties":false}`),
+		Description: "Append plain text paragraphs to an existing Feishu docx document already bound to the current trusted chat.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"token":{"type":"string"},"url":{"type":"string"},"content":{"type":"string"},"folder_token":{"type":"string","description":"Optional consistency check against the current chat document binding."}},"required":["content"],"additionalProperties":false}`),
 	}
 }
 
-func allowedValue(value string, allowed []string) bool {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return false
-	}
-	for _, item := range allowed {
-		if value == item {
-			return true
+func availableFeishuFolders(folders []store.FeishuChatFolder) []store.FeishuChatFolder {
+	available := make([]store.FeishuChatFolder, 0, len(folders))
+	for _, folder := range folders {
+		if folder.ShareState == store.FeishuFolderShareStateSucceeded {
+			available = append(available, folder)
 		}
 	}
-	return false
+	return available
+}
+
+func folderRequiredForFolders(folders []store.FeishuChatFolder) folderRequiredOutput {
+	out := folderRequiredOutput{
+		Status:       "folder_required",
+		RequiredTool: folderCreateToolName,
+		Message:      "当前飞书对话没有可用的 Bot 自有目录，请先创建目录。",
+	}
+	for _, folder := range folders {
+		if folder.ShareState != store.FeishuFolderShareStateSucceeded && folder.CreateRequestID != "" {
+			out.Message = "当前飞书对话的目录创建尚未完整结束，请先重试该目录请求。"
+			out.CreateRequest = folder.CreateRequestID
+			break
+		}
+	}
+	return out
+}
+
+func folderDisplayName(folder store.FeishuChatFolder) string {
+	if name := strings.TrimSpace(folder.Name); name != "" {
+		return name
+	}
+	return "未命名目录"
+}
+
+func isWikiSearchResult(result searchResult) bool {
+	return strings.EqualFold(strings.TrimSpace(result.Type), "wiki")
+}
+
+func searchResultKey(result searchResult) string {
+	if token := strings.TrimSpace(result.Token); token != "" {
+		return "token:" + token
+	}
+	if resultURL := strings.TrimSpace(result.URL); resultURL != "" {
+		return "url:" + resultURL
+	}
+	return "title:" + strings.TrimSpace(result.Title) + "\x00" + strings.TrimSpace(result.Summary)
+}
+
+func (t docsTool) updateWorkflowBestEffort(ctx context.Context, requestID, state string) {
+	if err := t.store.UpdateWorkflowRequestState(requestID, t.accountID, state, t.currentTime()); err != nil {
+		feishuToolsLog.Warn(ctx, "update feishu document workflow failed request=%s account=%s state=%s: %v", shortToolRequestID(requestID), t.accountID, state, err)
+	}
+}
+
+func (t docsTool) currentTime() time.Time {
+	if t.now == nil {
+		return time.Now().UTC()
+	}
+	return t.now().UTC()
 }
 
 func stripSearchHighlight(text string) string {

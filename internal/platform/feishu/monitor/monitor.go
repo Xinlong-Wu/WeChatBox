@@ -146,7 +146,7 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 
 func newFeishuTools(client *lark.Client, st *store.Store, accountID string, cfg feishutools.Config, approver feishutools.ApprovalRequester) []tooltypes.Tool {
 	tools := feishutools.NewChatHistoryTools(client, cfg)
-	tools = append(tools, feishutools.NewDocsTools(client, cfg, approver)...)
+	tools = append(tools, feishutools.NewDocsTools(client, st, accountID, cfg, approver)...)
 	tools = append(tools, feishutools.NewDocsFolderTools(client, st, accountID, cfg)...)
 	tools = append(tools, feishutools.NewLiteLLMAccountTools(client, cfg)...)
 	return tools
@@ -154,7 +154,7 @@ func newFeishuTools(client *lark.Client, st *store.Store, accountID string, cfg 
 
 func docsCreateApprovalRequired(cfg feishutools.Config) bool {
 	cfg = feishutools.NormalizeConfig(cfg)
-	return cfg.Docs.Enabled && cfg.Docs.AllowWrite && len(cfg.AllowedFolderTokens) > 0
+	return cfg.Docs.Enabled && cfg.Docs.AllowWrite
 }
 
 func registerApprovalExecutors(approvals *approvalManager, tools []tooltypes.Tool) error {

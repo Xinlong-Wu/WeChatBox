@@ -216,12 +216,6 @@ func TestLoadConfigParsesSharedToolsConfig(t *testing.T) {
 	if err := yaml.Unmarshal([]byte(`tools:
   max_results: 3
   max_chars: 2048
-  allowed_folder_tokens:
-    - " fld_token "
-    - fld_token
-    - ""
-  allowed_space_ids:
-    - spc_token
   chat_history:
     enabled: true
   docs:
@@ -252,12 +246,6 @@ func TestLoadConfigParsesSharedToolsConfig(t *testing.T) {
 	tools := feishuConfig.Tools
 	if tools.MaxResults != 3 || tools.MaxChars != 2048 {
 		t.Fatalf("tools limits = max_results:%d max_chars:%d, want 3/2048", tools.MaxResults, tools.MaxChars)
-	}
-	if got := tools.AllowedFolderTokens; len(got) != 1 || got[0] != "fld_token" {
-		t.Fatalf("allowed_folder_tokens = %#v, want normalized single token", got)
-	}
-	if got := tools.AllowedSpaceIDs; len(got) != 1 || got[0] != "spc_token" {
-		t.Fatalf("allowed_space_ids = %#v, want spc_token", got)
 	}
 	if !tools.ChatHistory.Enabled {
 		t.Fatalf("chat history config = %#v, want enabled", tools.ChatHistory)

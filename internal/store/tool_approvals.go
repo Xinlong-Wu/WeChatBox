@@ -26,6 +26,7 @@ const (
 	ToolApprovalStateExecuting = WorkflowRequestStateExecuting
 	ToolApprovalStateDenied    = WorkflowRequestStateDenied
 	ToolApprovalStateSucceeded = WorkflowRequestStateSucceeded
+	ToolApprovalStatePartial   = WorkflowRequestStatePartial
 	ToolApprovalStateFailed    = WorkflowRequestStateFailed
 	ToolApprovalStateExpired   = WorkflowRequestStateExpired
 
@@ -231,7 +232,7 @@ func (s *Store) CompleteToolApproval(id, accountID, state string, now time.Time)
 	id = strings.TrimSpace(id)
 	accountID = strings.TrimSpace(accountID)
 	state = strings.TrimSpace(state)
-	if state != ToolApprovalStateSucceeded && state != ToolApprovalStateFailed {
+	if state != ToolApprovalStateSucceeded && state != ToolApprovalStatePartial && state != ToolApprovalStateFailed {
 		return fmt.Errorf("unsupported completed tool approval state %q", state)
 	}
 	now = normalizedApprovalTime(now)

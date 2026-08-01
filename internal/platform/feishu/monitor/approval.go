@@ -336,7 +336,7 @@ func (m *approvalManager) handleApprovalDecisionError(ctx context.Context, appro
 
 func (m *approvalManager) executeApproved(approval store.ToolApproval, executor feishutools.ApprovalExecutor, callbackToken string) {
 	ctx, cancel := context.WithTimeout(m.baseContext(), m.approvedExecutionTimeout())
-	result, err := executor.ExecuteApproved(ctx, json.RawMessage(approval.Payload))
+	result, err := executor.ExecuteApproved(ctx, approval.ID, json.RawMessage(approval.Payload))
 	cancel()
 	completedAt := m.currentTime()
 	if err != nil {
@@ -348,8 +348,12 @@ func (m *approvalManager) executeApproved(approval store.ToolApproval, executor 
 		m.notifyApprovalResult(approval, callbackToken, statusCard{title: "执行失败", template: "red", message: "授权已确认，但操作执行失败。请稍后重新发起。"}, "❌ 已授权，但操作执行失败。请稍后重试。")
 		return
 	}
-	if err := m.store.CompleteToolApproval(approval.ID, approval.AccountID, store.ToolApprovalStateSucceeded, completedAt); err != nil {
-		feishuLog.Error(m.baseContext(), "mark feishu tool approval succeeded request=%s account=%s: %v", shortRequestID(approval.ID), approval.AccountID, err)
+	completedState := store.ToolApprovalStateSucceeded
+	if result.Warning {
+		completedState = store.ToolApprovalStatePartial
+	}
+	if err := m.store.CompleteToolApproval(approval.ID, approval.AccountID, completedState, completedAt); err != nil {
+		feishuLog.Error(m.baseContext(), "mark feishu tool approval completed request=%s account=%s state=%s: %v", shortRequestID(approval.ID), approval.AccountID, completedState, err)
 	}
 	message := strings.TrimSpace(result.Message)
 	if message == "" {

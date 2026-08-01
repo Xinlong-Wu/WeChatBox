@@ -43,5 +43,5 @@ type ApprovalRequester interface {
 // ApprovalExecutor executes a previously validated payload after the requesting user approves it.
 type ApprovalExecutor interface {
 	ApprovalToolName() string
-	ExecuteApproved(ctx context.Context, payload json.RawMessage) (ApprovalExecution, error)
+	ExecuteApproved(ctx context.Context, requestID string, payload json.RawMessage) (ApprovalExecution, error)
 }

@@ -965,8 +965,7 @@ func TestNewFeishuToolsRegistersEnabledChatHistory(t *testing.T) {
 func TestNewFeishuToolsRegistersApprovalGatedDocumentCreate(t *testing.T) {
 	st := openFeishuApprovalTestStore(t)
 	cfg := feishutools.Config{
-		AllowedFolderTokens: []string{"fld_token"},
-		Docs:                feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true},
+		Docs: feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true},
 	}
 	withoutApproval := toolNames(newFeishuTools(&lark.Client{}, st, "feishu:cli_test", cfg, nil))
 	if strings.Contains(strings.Join(withoutApproval, ","), "feishu_docs_create") {
@@ -2002,8 +2001,7 @@ func TestPlatformRunRequiresStoreForDocumentApproval(t *testing.T) {
 			"fsbot": {AppID: "cli_xxx", AppSecret: "secret", BaseURL: server.URL},
 		},
 		Tools: feishutools.Config{
-			AllowedFolderTokens: []string{"fld_token"},
-			Docs:                feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true},
+			Docs: feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true},
 		},
 	}, logging.Info).Run(context.Background(), &fakeProcessor{})
 	if err == nil || !strings.Contains(err.Error(), "tool approval store is required") {
