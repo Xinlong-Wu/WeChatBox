@@ -18,6 +18,7 @@ const (
 
 	feishuMessageReceiveEvent      = "im.message.receive_v1"
 	feishuBotP2PChatEnteredV2Event = "im.chat.access_event.bot_p2p_chat_entered_v1"
+	feishuCardActionEvent          = "card.action.trigger"
 )
 
 type feishuV2EventRegistrar func(*bot, *dispatcher.EventDispatcher) *dispatcher.EventDispatcher
@@ -50,6 +51,11 @@ func (b *bot) configureEventHandlers(d *dispatcher.EventDispatcher, events []fei
 		registeredHandlers[feishuEventVersionV2+":"+name] = true
 		registered = append(registered, name)
 	}
+	if b.approvals != nil {
+		d = d.OnP2CardActionTrigger(b.approvals.HandleCardAction)
+		registeredHandlers[feishuEventVersionV2+":"+feishuCardActionEvent] = true
+		registered = append(registered, feishuCardActionEvent)
+	}
 	for i, event := range events {
 		name := strings.TrimSpace(event.Name)
 		version := strings.TrimSpace(event.Version)
@@ -57,7 +63,7 @@ func (b *bot) configureEventHandlers(d *dispatcher.EventDispatcher, events []fei
 		if name == "" {
 			return nil, nil, fmt.Errorf("platforms.feishu.events[%d].name is required", i)
 		}
-		if name == feishuMessageReceiveEvent {
+		if name == feishuMessageReceiveEvent || name == feishuCardActionEvent {
 			return nil, nil, fmt.Errorf("platforms.feishu.events[%d].name %q is built in and cannot be configured", i, name)
 		}
 		if version == "" {

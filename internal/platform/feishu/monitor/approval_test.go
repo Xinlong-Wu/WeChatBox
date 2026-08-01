@@ -1,0 +1,429 @@
+package monitor
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
+	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
+
+	feishutools "lingobridge/internal/platform/feishu/tools"
+	"lingobridge/internal/store"
+)
+
+type fakeApprovalSender struct {
+	mu        sync.Mutex
+	cards     []sentText
+	updates   []updatedText
+	messages  []sentText
+	createErr error
+	updateErr error
+	sendErr   error
+}
+
+func (f *fakeApprovalSender) SendText(_ context.Context, chatID, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.messages = append(f.messages, sentText{chatID: chatID, text: text})
+	return f.sendErr
+}
+
+func (f *fakeApprovalSender) CreateCard(_ context.Context, chatID, cardJSON string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cards = append(f.cards, sentText{chatID: chatID, text: cardJSON})
+	if f.createErr != nil {
+		return "", f.createErr
+	}
+	return "om_card", nil
+}
+
+func (f *fakeApprovalSender) UpdateCard(_ context.Context, messageID, cardJSON string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.updates = append(f.updates, updatedText{messageID: messageID, text: cardJSON})
+	return f.updateErr
+}
+
+func (f *fakeApprovalSender) snapshot() (cards []sentText, updates []updatedText, messages []sentText) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]sentText(nil), f.cards...), append([]updatedText(nil), f.updates...), append([]sentText(nil), f.messages...)
+}
+
+type fakeApprovalExecutor struct {
+	mu      sync.Mutex
+	name    string
+	result  feishutools.ApprovalExecution
+	err     error
+	payload json.RawMessage
+	calls   int
+	done    chan struct{}
+}
+
+func (f *fakeApprovalExecutor) ApprovalToolName() string {
+	return f.name
+}
+
+func (f *fakeApprovalExecutor) ExecuteApproved(_ context.Context, payload json.RawMessage) (feishutools.ApprovalExecution, error) {
+	f.mu.Lock()
+	f.calls++
+	f.payload = append(json.RawMessage(nil), payload...)
+	done := f.done
+	result := f.result
+	err := f.err
+	f.mu.Unlock()
+	if done != nil {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	}
+	return result, err
+}
+
+func (f *fakeApprovalExecutor) snapshot() (int, json.RawMessage) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls, append(json.RawMessage(nil), f.payload...)
+}
+
+func TestApprovalManagerRequestsBoundCardWithoutDisplayingPayload(t *testing.T) {
+	st := openFeishuApprovalTestStore(t)
+	sender := &fakeApprovalSender{}
+	manager := newTestApprovalManager(t, st, sender)
+	executor := &fakeApprovalExecutor{name: "feishu_docs_create"}
+	if err := manager.registerExecutor(executor); err != nil {
+		t.Fatalf("registerExecutor returned error: %v", err)
+	}
+
+	payload := json.RawMessage(`{"title":"Quarterly plan","content":"private document body"}`)
+	pending, err := manager.RequestApproval(approvalRequestContext(), feishutools.ApprovalRequest{
+		ToolName: "feishu_docs_create",
+		Action:   "创建飞书文档",
+		Fields: []feishutools.ApprovalField{
+			{Label: "文档标题", Value: "Quarterly plan"},
+			{Label: "目标文件夹", Value: "fld_token"},
+		},
+		Payload: payload,
+	})
+	if err != nil {
+		t.Fatalf("RequestApproval returned error: %v", err)
+	}
+	if pending.ID == "" || !pending.ExpiresAt.Equal(manager.currentTime().Add(manager.ttl)) {
+		t.Fatalf("pending = %#v, want generated ID and configured expiry", pending)
+	}
+	cards, _, _ := sender.snapshot()
+	if len(cards) != 1 || cards[0].chatID != "oc_chat" {
+		t.Fatalf("cards = %#v, want one card in trusted chat", cards)
+	}
+	if !strings.Contains(cards[0].text, "Quarterly plan") || !strings.Contains(cards[0].text, `fld\\_token`) {
+		t.Fatalf("approval card = %s, want displayed approval fields", cards[0].text)
+	}
+	if strings.Contains(cards[0].text, "private document body") {
+		t.Fatalf("approval card leaked payload content: %s", cards[0].text)
+	}
+	assertApprovalCardActions(t, cards[0].text, pending.ID)
+
+	record, err := st.GetToolApproval(pending.ID, "feishu:cli_test")
+	if err != nil {
+		t.Fatalf("GetToolApproval returned error: %v", err)
+	}
+	if record.State != store.ToolApprovalStatePending || record.ActorOpenID != "ou_requester" || record.ChatID != "oc_chat" || record.CardMessageID != "om_card" || record.Payload != string(payload) {
+		t.Fatalf("stored approval = %#v, want actor/chat/card-bound pending record", record)
+	}
+}
+
+func TestApprovalManagerOnlyRequesterCanApprove(t *testing.T) {
+	st := openFeishuApprovalTestStore(t)
+	sender := &fakeApprovalSender{}
+	manager := newTestApprovalManager(t, st, sender)
+	executor := &fakeApprovalExecutor{name: "feishu_docs_create"}
+	if err := manager.registerExecutor(executor); err != nil {
+		t.Fatalf("registerExecutor returned error: %v", err)
+	}
+	pending := requestTestApproval(t, manager)
+
+	resp, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.ID, store.ToolApprovalDecisionApprove, "ou_other", "oc_chat", "om_card"))
+	if err != nil {
+		t.Fatalf("HandleCardAction returned error: %v", err)
+	}
+	if resp == nil || resp.Toast == nil || resp.Toast.Type != "error" || !strings.Contains(resp.Toast.Content, "发起请求的用户") {
+		t.Fatalf("response = %#v, want requester-only error toast", resp)
+	}
+	if calls, _ := executor.snapshot(); calls != 0 {
+		t.Fatalf("executor calls = %d, want 0", calls)
+	}
+	record, err := st.GetToolApproval(pending.ID, "feishu:cli_test")
+	if err != nil {
+		t.Fatalf("GetToolApproval returned error: %v", err)
+	}
+	if record.State != store.ToolApprovalStatePending || record.Payload == "" {
+		t.Fatalf("approval = %#v, want unchanged pending record", record)
+	}
+}
+
+func TestApprovalManagerApprovesExecutesAndNotifiesOnce(t *testing.T) {
+	st := openFeishuApprovalTestStore(t)
+	sender := &fakeApprovalSender{}
+	manager := newTestApprovalManager(t, st, sender)
+	executor := &fakeApprovalExecutor{
+		name:   "feishu_docs_create",
+		result: feishutools.ApprovalExecution{Message: "✅ 文档已创建：[Quarterly plan](https://docs.feishu.cn/docx/doc123)"},
+		done:   make(chan struct{}),
+	}
+	if err := manager.registerExecutor(executor); err != nil {
+		t.Fatalf("registerExecutor returned error: %v", err)
+	}
+	pending := requestTestApproval(t, manager)
+
+	resp, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.ID, store.ToolApprovalDecisionApprove, "ou_requester", "oc_chat", "om_card"))
+	if err != nil {
+		t.Fatalf("HandleCardAction returned error: %v", err)
+	}
+	if resp == nil || resp.Toast == nil || resp.Toast.Type != "success" {
+		t.Fatalf("response = %#v, want success toast", resp)
+	}
+	select {
+	case <-executor.done:
+	case <-time.After(time.Second):
+		t.Fatal("approved executor was not called")
+	}
+	waitForApprovalState(t, st, pending.ID, store.ToolApprovalStateSucceeded)
+	waitForApprovalNotifications(t, sender, 2, 1)
+
+	calls, payload := executor.snapshot()
+	if calls != 1 || !strings.Contains(string(payload), "Quarterly plan") {
+		t.Fatalf("executor calls/payload = %d/%s, want one approved payload", calls, payload)
+	}
+	record, err := st.GetToolApproval(pending.ID, "feishu:cli_test")
+	if err != nil {
+		t.Fatalf("GetToolApproval returned error: %v", err)
+	}
+	if record.Payload != "" {
+		t.Fatalf("completed approval retained payload: %#v", record)
+	}
+	_, updates, messages := sender.snapshot()
+	if len(updates) < 2 || !strings.Contains(updates[0].text, "正在执行") || !strings.Contains(updates[len(updates)-1].text, "执行完成") {
+		t.Fatalf("card updates = %#v, want processing then completed", updates)
+	}
+	if len(messages) != 1 || !strings.Contains(messages[0].text, "docs.feishu.cn/docx/doc123") {
+		t.Fatalf("messages = %#v, want created document notification", messages)
+	}
+
+	second, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.ID, store.ToolApprovalDecisionApprove, "ou_requester", "oc_chat", "om_card"))
+	if err != nil {
+		t.Fatalf("second HandleCardAction returned error: %v", err)
+	}
+	if second == nil || second.Toast == nil || !strings.Contains(second.Toast.Content, "已经处理") {
+		t.Fatalf("second response = %#v, want already handled toast", second)
+	}
+	if calls, _ := executor.snapshot(); calls != 1 {
+		t.Fatalf("executor calls after duplicate click = %d, want 1", calls)
+	}
+}
+
+func TestApprovalManagerDenyDoesNotExecute(t *testing.T) {
+	st := openFeishuApprovalTestStore(t)
+	sender := &fakeApprovalSender{}
+	manager := newTestApprovalManager(t, st, sender)
+	executor := &fakeApprovalExecutor{name: "feishu_docs_create"}
+	if err := manager.registerExecutor(executor); err != nil {
+		t.Fatalf("registerExecutor returned error: %v", err)
+	}
+	pending := requestTestApproval(t, manager)
+
+	resp, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.ID, store.ToolApprovalDecisionDeny, "ou_requester", "oc_chat", "om_card"))
+	if err != nil {
+		t.Fatalf("HandleCardAction returned error: %v", err)
+	}
+	if resp == nil || resp.Toast == nil || resp.Toast.Type != "success" || !strings.Contains(resp.Toast.Content, "不会执行") {
+		t.Fatalf("response = %#v, want denied toast", resp)
+	}
+	waitForApprovalState(t, st, pending.ID, store.ToolApprovalStateDenied)
+	waitForApprovalNotifications(t, sender, 1, 0)
+	if calls, _ := executor.snapshot(); calls != 0 {
+		t.Fatalf("executor calls = %d, want 0", calls)
+	}
+	record, err := st.GetToolApproval(pending.ID, "feishu:cli_test")
+	if err != nil {
+		t.Fatalf("GetToolApproval returned error: %v", err)
+	}
+	if record.Payload != "" {
+		t.Fatalf("denied approval retained payload: %#v", record)
+	}
+}
+
+func TestApprovalManagerFailsRequestWhenCardCannotBeSent(t *testing.T) {
+	st := openFeishuApprovalTestStore(t)
+	sender := &fakeApprovalSender{createErr: errors.New("send failed")}
+	manager := newTestApprovalManager(t, st, sender)
+	if err := manager.registerExecutor(&fakeApprovalExecutor{name: "feishu_docs_create"}); err != nil {
+		t.Fatalf("registerExecutor returned error: %v", err)
+	}
+
+	_, err := manager.RequestApproval(approvalRequestContext(), feishutools.ApprovalRequest{
+		ToolName: "feishu_docs_create",
+		Action:   "创建飞书文档",
+		Payload:  json.RawMessage(`{"title":"Quarterly plan"}`),
+	})
+	if err == nil || !strings.Contains(err.Error(), "send feishu tool approval card") {
+		t.Fatalf("RequestApproval error = %v, want card send error", err)
+	}
+}
+
+func TestConfigureEventHandlersRegistersCardApprovalCallback(t *testing.T) {
+	st := openFeishuApprovalTestStore(t)
+	sender := &fakeApprovalSender{}
+	manager := newTestApprovalManager(t, st, sender)
+	b := &bot{approvals: manager, eventCommands: map[string][]string{}}
+
+	_, registered, err := b.configureEventHandlers(dispatcher.NewEventDispatcher("", ""), nil)
+	if err != nil {
+		t.Fatalf("configureEventHandlers returned error: %v", err)
+	}
+	if got, want := strings.Join(registered, ", "), "im.message.receive_v1, card.action.trigger"; got != want {
+		t.Fatalf("registered events = %q, want %q", got, want)
+	}
+}
+
+func openFeishuApprovalTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	st, err := store.Open(store.PlatformFeishu)
+	if err != nil {
+		t.Fatalf("store.Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Fatalf("store.Close returned error: %v", err)
+		}
+	})
+	return st
+}
+
+func newTestApprovalManager(t *testing.T, st *store.Store, sender *fakeApprovalSender) *approvalManager {
+	t.Helper()
+	manager, err := newApprovalManager(context.Background(), st, store.Account{
+		ID:       "feishu:cli_test",
+		Name:     "fsbot",
+		Platform: store.PlatformFeishu,
+	}, sender)
+	if err != nil {
+		t.Fatalf("newApprovalManager returned error: %v", err)
+	}
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	return manager
+}
+
+func approvalRequestContext() context.Context {
+	ctx := feishutools.WithActor(context.Background(), feishutools.Actor{OpenID: "ou_requester", UserID: "u_requester"})
+	return feishutools.WithChatContext(ctx, feishutools.ChatContext{ChatID: "oc_chat", MessageID: "om_source", IsGroup: true})
+}
+
+func requestTestApproval(t *testing.T, manager *approvalManager) feishutools.PendingApproval {
+	t.Helper()
+	pending, err := manager.RequestApproval(approvalRequestContext(), feishutools.ApprovalRequest{
+		ToolName: "feishu_docs_create",
+		Action:   "创建飞书文档",
+		Fields:   []feishutools.ApprovalField{{Label: "文档标题", Value: "Quarterly plan"}},
+		Payload:  json.RawMessage(`{"title":"Quarterly plan"}`),
+	})
+	if err != nil {
+		t.Fatalf("RequestApproval returned error: %v", err)
+	}
+	return pending
+}
+
+func approvalCardEvent(approvalID, decision, openID, chatID, messageID string) *callback.CardActionTriggerEvent {
+	userID := "u_requester"
+	if openID != "ou_requester" {
+		userID = "u_other"
+	}
+	return &callback.CardActionTriggerEvent{
+		Event: &callback.CardActionTriggerRequest{
+			Operator: &callback.Operator{OpenID: openID, UserID: &userID},
+			Context:  &callback.Context{OpenChatID: chatID, OpenMessageID: messageID},
+			Action: &callback.CallBackAction{Value: map[string]interface{}{
+				"kind":        approvalCardActionKind,
+				"approval_id": approvalID,
+				"decision":    decision,
+			}},
+		},
+	}
+}
+
+func assertApprovalCardActions(t *testing.T, cardJSON, approvalID string) {
+	t.Helper()
+	var card map[string]interface{}
+	if err := json.Unmarshal([]byte(cardJSON), &card); err != nil {
+		t.Fatalf("unmarshal approval card: %v", err)
+	}
+	if card["schema"] != "2.0" {
+		t.Fatalf("card schema = %#v, want 2.0", card["schema"])
+	}
+	body, _ := card["body"].(map[string]interface{})
+	elements, _ := body["elements"].([]interface{})
+	if len(elements) != 2 {
+		t.Fatalf("card elements = %#v, want markdown and button columns", elements)
+	}
+	columnsElement, _ := elements[1].(map[string]interface{})
+	columns, _ := columnsElement["columns"].([]interface{})
+	if len(columns) != 2 {
+		t.Fatalf("card columns = %#v, want approve/deny", columns)
+	}
+	for i, wantDecision := range []string{store.ToolApprovalDecisionApprove, store.ToolApprovalDecisionDeny} {
+		column, _ := columns[i].(map[string]interface{})
+		buttonElements, _ := column["elements"].([]interface{})
+		button, _ := buttonElements[0].(map[string]interface{})
+		behaviors, _ := button["behaviors"].([]interface{})
+		behavior, _ := behaviors[0].(map[string]interface{})
+		value, _ := behavior["value"].(map[string]interface{})
+		if value["approval_id"] != approvalID || value["decision"] != wantDecision || value["kind"] != approvalCardActionKind {
+			t.Fatalf("button %d callback value = %#v", i, value)
+		}
+	}
+}
+
+func waitForApprovalState(t *testing.T, st *store.Store, approvalID, want string) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		record, err := st.GetToolApproval(approvalID, "feishu:cli_test")
+		if err == nil && record.State == want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("approval state = %#v error=%v, want %s", record, err, want)
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForApprovalNotifications(t *testing.T, sender *fakeApprovalSender, updateCount, messageCount int) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		_, updates, messages := sender.snapshot()
+		if len(updates) >= updateCount && len(messages) >= messageCount {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("approval notifications updates/messages = %d/%d, want at least %d/%d", len(updates), len(messages), updateCount, messageCount)
+		case <-ticker.C:
+		}
+	}
+}

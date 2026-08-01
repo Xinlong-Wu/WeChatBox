@@ -31,6 +31,7 @@ type bot struct {
 	account       store.Account
 	botOpenID     string
 	eventCommands map[string][]string
+	approvals     *approvalManager
 	deduper       *eventDeduper
 	runCtx        context.Context
 	reactionDelay time.Duration

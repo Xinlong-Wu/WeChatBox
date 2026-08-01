@@ -76,6 +76,35 @@ func (s *sdkSender) CreateReplyText(ctx context.Context, replyToMessageID, text 
 	return "", fmt.Errorf("reply feishu message missing message_id")
 }
 
+func (s *sdkSender) CreateCard(ctx context.Context, chatID, cardJSON string) (string, error) {
+	cardJSON = strings.TrimSpace(cardJSON)
+	if cardJSON == "" || !json.Valid([]byte(cardJSON)) {
+		return "", fmt.Errorf("feishu interactive card must be valid JSON")
+	}
+	req := larkim.NewCreateMessageReqBuilder().
+		ReceiveIdType("chat_id").
+		Body(larkim.NewCreateMessageReqBodyBuilder().
+			ReceiveId(chatID).
+			MsgType(larkim.MsgTypeInteractive).
+			Content(cardJSON).
+			Build()).
+		Build()
+	resp, err := s.client.Im.Message.Create(ctx, req)
+	if err != nil {
+		return "", fmt.Errorf("send feishu interactive card: %w", err)
+	}
+	if resp == nil || !resp.Success() {
+		if resp == nil {
+			return "", fmt.Errorf("send feishu interactive card: empty response")
+		}
+		return "", fmt.Errorf("send feishu interactive card code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	if resp.Data == nil || resp.Data.MessageId == nil || *resp.Data.MessageId == "" {
+		return "", fmt.Errorf("send feishu interactive card missing message_id")
+	}
+	return *resp.Data.MessageId, nil
+}
+
 func (s *sdkSender) createText(ctx context.Context, chatID, text string, requireMessageID bool) (string, error) {
 	body, err := marshalRichTextContent(text)
 	if err != nil {
@@ -126,6 +155,34 @@ func (s *sdkSender) UpdateText(ctx context.Context, messageID, text string) erro
 			return fmt.Errorf("%w: code=%d msg=%s", ErrFeishuMessageEditLimit, resp.Code, resp.Msg)
 		}
 		return fmt.Errorf("update feishu message code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	return nil
+}
+
+func (s *sdkSender) UpdateCard(ctx context.Context, messageID, cardJSON string) error {
+	cardJSON = strings.TrimSpace(cardJSON)
+	if cardJSON == "" || !json.Valid([]byte(cardJSON)) {
+		return fmt.Errorf("feishu interactive card must be valid JSON")
+	}
+	req := larkim.NewUpdateMessageReqBuilder().
+		MessageId(messageID).
+		Body(larkim.NewUpdateMessageReqBodyBuilder().
+			MsgType(larkim.MsgTypeInteractive).
+			Content(cardJSON).
+			Build()).
+		Build()
+	resp, err := s.client.Im.Message.Update(ctx, req)
+	if err != nil {
+		return fmt.Errorf("update feishu interactive card: %w", err)
+	}
+	if resp == nil || !resp.Success() {
+		if resp == nil {
+			return fmt.Errorf("update feishu interactive card: empty response")
+		}
+		if resp.Code == 230072 {
+			return fmt.Errorf("%w: code=%d msg=%s", ErrFeishuMessageEditLimit, resp.Code, resp.Msg)
+		}
+		return fmt.Errorf("update feishu interactive card code=%d msg=%s", resp.Code, resp.Msg)
 	}
 	return nil
 }
