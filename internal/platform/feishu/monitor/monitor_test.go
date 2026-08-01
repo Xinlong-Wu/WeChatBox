@@ -113,6 +113,12 @@ func (fakeCoreTool) Execute(ctx context.Context, call tooltypes.Call) tooltypes.
 	return tooltypes.Result{CallID: call.ID, Name: call.Name, Content: "ok"}
 }
 
+type fakeToolApprovalRequester struct{}
+
+func (fakeToolApprovalRequester) RequestApproval(context.Context, feishutools.ApprovalRequest) (feishutools.PendingApproval, error) {
+	return feishutools.PendingApproval{ID: "approval"}, nil
+}
+
 type sentText struct {
 	chatID string
 	text   string
@@ -946,9 +952,24 @@ func TestHandleGroupTextMessageRepliesToOriginal(t *testing.T) {
 
 func TestNewFeishuToolsRegistersEnabledChatHistory(t *testing.T) {
 	cfg := feishutools.Config{ChatHistory: feishutools.ChatHistoryConfig{Enabled: true}}
-	names := toolNames(newFeishuTools(&lark.Client{}, cfg))
+	names := toolNames(newFeishuTools(&lark.Client{}, cfg, nil))
 	if len(names) != 1 || names[0] != "feishu_chat_history_get" {
 		t.Fatalf("tool names = %#v, want chat history", names)
+	}
+}
+
+func TestNewFeishuToolsRegistersApprovalGatedDocumentCreate(t *testing.T) {
+	cfg := feishutools.Config{
+		AllowedFolderTokens: []string{"fld_token"},
+		Docs:                feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true},
+	}
+	withoutApproval := toolNames(newFeishuTools(&lark.Client{}, cfg, nil))
+	if strings.Contains(strings.Join(withoutApproval, ","), "feishu_docs_create") {
+		t.Fatalf("tools without approval workflow = %#v, create must fail closed", withoutApproval)
+	}
+	withApproval := toolNames(newFeishuTools(&lark.Client{}, cfg, fakeToolApprovalRequester{}))
+	if got, want := strings.Join(withApproval, ","), "feishu_docs_search,feishu_docs_read,feishu_docs_create,feishu_docs_append"; got != want {
+		t.Fatalf("tools with approval workflow = %q, want %q", got, want)
 	}
 }
 
@@ -1906,7 +1927,7 @@ func TestPlatformRunFailsWhenBotOpenIDMissing(t *testing.T) {
 		CredentialsJSON: `{}`,
 	}
 
-	err := NewPlatform(acc, feishu.Config{
+	err := NewPlatform(nil, acc, feishu.Config{
 		Accounts: map[string]feishu.AccountConfig{
 			"fsbot": {AppID: "cli_xxx", AppSecret: "secret", BaseURL: server.URL},
 		},
@@ -1924,7 +1945,7 @@ func TestPlatformRunRequiresAccountCredentials(t *testing.T) {
 		CredentialsJSON: `{}`,
 	}
 
-	err := NewPlatform(acc, feishu.Config{
+	err := NewPlatform(nil, acc, feishu.Config{
 		Accounts: map[string]feishu.AccountConfig{
 			"fsbot": {},
 		},
@@ -1942,9 +1963,46 @@ func TestPlatformRunRequiresConfiguredAccount(t *testing.T) {
 		CredentialsJSON: `{}`,
 	}
 
-	err := NewPlatform(acc, feishu.Config{}, logging.Info).Run(context.Background(), &fakeProcessor{})
+	err := NewPlatform(nil, acc, feishu.Config{}, logging.Info).Run(context.Background(), &fakeProcessor{})
 	if err == nil || !strings.Contains(err.Error(), "platforms.feishu.accounts.fsbot is required") {
 		t.Fatalf("Run error = %v, want missing account config error", err)
+	}
+}
+
+func TestPlatformRunRequiresStoreForDocumentApproval(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/v3/token", "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "ok",
+				"tenant_access_token": "tenant-token",
+				"expire":              7200,
+			})
+		case "/open-apis/bot/v3/info":
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"bot":  map[string]any{"open_id": "ou_bot"},
+			})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	acc := store.Account{ID: "feishu:cli_xxx", Name: "fsbot", Platform: store.PlatformFeishu}
+	err := NewPlatform(nil, acc, feishu.Config{
+		Accounts: map[string]feishu.AccountConfig{
+			"fsbot": {AppID: "cli_xxx", AppSecret: "secret", BaseURL: server.URL},
+		},
+		Tools: feishutools.Config{
+			AllowedFolderTokens: []string{"fld_token"},
+			Docs:                feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true},
+		},
+	}, logging.Info).Run(context.Background(), &fakeProcessor{})
+	if err == nil || !strings.Contains(err.Error(), "tool approval store is required") {
+		t.Fatalf("Run error = %v, want missing approval store", err)
 	}
 }
 

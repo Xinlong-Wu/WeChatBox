@@ -81,6 +81,9 @@ func Definition() platform.Definition {
 			if err := st.DeleteSyncBuf(ctx.Account.ID); err != nil {
 				return fmt.Errorf("delete sync cursor: %w", err)
 			}
+			if err := st.DeleteToolApprovals(ctx.Account.ID); err != nil {
+				return fmt.Errorf("delete tool approvals: %w", err)
+			}
 			return nil
 		},
 		NewRuntimePlatform: func(ctx platform.RuntimeContext) (core.Platform, error) {
@@ -88,7 +91,7 @@ func Definition() platform.Definition {
 			if err != nil {
 				return nil, err
 			}
-			return feishumonitor.NewPlatform(ctx.Account, feishuConfig, ctx.LogLevel), nil
+			return feishumonitor.NewPlatform(ctx.Store, ctx.Account, feishuConfig, ctx.LogLevel), nil
 		},
 		CommandPolicy:       commands.DefaultPolicy(),
 		TextChunkLimit:      feishu.TextChunkLimit,

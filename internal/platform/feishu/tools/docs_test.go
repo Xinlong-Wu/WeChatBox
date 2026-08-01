@@ -1,10 +1,29 @@
 package tools
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
+
+	tooltypes "lingobridge/internal/tools"
 )
+
+type fakeApprovalRequester struct {
+	request ApprovalRequest
+	pending PendingApproval
+	err     error
+}
+
+func (f *fakeApprovalRequester) RequestApproval(_ context.Context, request ApprovalRequest) (PendingApproval, error) {
+	f.request = request
+	return f.pending, f.err
+}
 
 func TestDocsToolConfigDefaultsAndRegistration(t *testing.T) {
 	cfg := NormalizeConfig(Config{})
@@ -19,20 +38,165 @@ func TestDocsToolConfigDefaultsAndRegistration(t *testing.T) {
 	}
 
 	client := &lark.Client{}
-	if got := NewDocsTools(client, cfg); len(got) != 0 {
+	if got := NewDocsTools(client, cfg, nil); len(got) != 0 {
 		t.Fatalf("disabled tools = %d, want 0", len(got))
 	}
 	cfg.Docs.Enabled = true
-	if got := NewDocsTools(client, cfg); len(got) != 2 {
+	if got := NewDocsTools(client, cfg, nil); len(got) != 2 {
 		t.Fatalf("read-only tools = %d, want search/read", len(got))
 	}
 	cfg.Docs.AllowWrite = true
-	if got := NewDocsTools(client, cfg); len(got) != 2 {
+	if got := NewDocsTools(client, cfg, nil); len(got) != 2 {
 		t.Fatalf("write tools without folder allowlist = %d, want read-only", len(got))
 	}
 	cfg.AllowedFolderTokens = []string{"fld_token"}
-	if got := NewDocsTools(client, cfg); len(got) != 4 {
+	if got := NewDocsTools(client, cfg, nil); len(got) != 3 {
+		t.Fatalf("write tools without approval workflow = %d, want search/read/append", len(got))
+	}
+	if got := NewDocsTools(client, cfg, &fakeApprovalRequester{}); len(got) != 4 {
 		t.Fatalf("write tools with folder allowlist = %d, want four tools", len(got))
+	}
+}
+
+func TestDocsCreateToolReturnsPendingApprovalWithoutCallingFeishuDocs(t *testing.T) {
+	expiresAt := time.Date(2026, time.August, 1, 12, 10, 0, 0, time.UTC)
+	approver := &fakeApprovalRequester{pending: PendingApproval{ID: "approval_123", ExpiresAt: expiresAt}}
+	cfg := Config{
+		AllowedFolderTokens: []string{"fld_token"},
+		Docs:                DocsToolsConfig{Enabled: true, AllowWrite: true},
+	}
+	tool := findDocsTool(t, NewDocsTools(&lark.Client{}, cfg, approver), createToolName)
+	result := tool.Execute(context.Background(), tooltypes.Call{
+		ID:        "call_1",
+		Name:      createToolName,
+		Arguments: json.RawMessage(`{"title":" Quarterly plan ","content":"private body","folder_token":" fld_token "}`),
+	})
+	if result.IsError {
+		t.Fatalf("Execute result = %#v, want pending approval success", result)
+	}
+	var output pendingApprovalOutput
+	if err := json.Unmarshal([]byte(result.Content), &output); err != nil {
+		t.Fatalf("unmarshal pending output: %v", err)
+	}
+	if output.Status != "pending_approval" || output.ApprovalID != "approval_123" || output.ExpiresAt != expiresAt.Format(time.RFC3339) || !strings.Contains(output.Message, "请勿重复调用") {
+		t.Fatalf("pending output = %#v", output)
+	}
+	if approver.request.ToolName != createToolName || approver.request.Action != "创建飞书文档" {
+		t.Fatalf("approval request = %#v", approver.request)
+	}
+	var approvedArgs createArgs
+	if err := json.Unmarshal(approver.request.Payload, &approvedArgs); err != nil {
+		t.Fatalf("unmarshal approval payload: %v", err)
+	}
+	if approvedArgs.Title != "Quarterly plan" || approvedArgs.FolderToken != "fld_token" || approvedArgs.Content != "private body" {
+		t.Fatalf("approved args = %#v, want normalized exact payload", approvedArgs)
+	}
+	for _, field := range approver.request.Fields {
+		if strings.Contains(field.Value, "private body") {
+			t.Fatalf("approval field leaked document content: %#v", field)
+		}
+	}
+}
+
+func TestDocsCreateApprovedExecutionCreatesDocument(t *testing.T) {
+	var createRequest struct {
+		Title       string `json:"title"`
+		FolderToken string `json:"folder_token"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/v3/token", "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "ok",
+				"tenant_access_token": "tenant-token",
+				"expire":              7200,
+			})
+		case "/open-apis/docx/v1/documents":
+			if r.Method != http.MethodPost {
+				t.Fatalf("method = %s, want POST", r.Method)
+			}
+			if err := json.NewDecoder(r.Body).Decode(&createRequest); err != nil {
+				t.Fatalf("decode create document request: %v", err)
+			}
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{"document": map[string]any{"document_id": "doxcn12345678"}},
+			})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	cfg := Config{
+		AllowedFolderTokens: []string{"fld_token"},
+		Docs:                DocsToolsConfig{Enabled: true, AllowWrite: true},
+	}
+	tool := findDocsTool(t, NewDocsTools(client, cfg, &fakeApprovalRequester{}), createToolName)
+	executor, ok := tool.(ApprovalExecutor)
+	if !ok {
+		t.Fatalf("create tool %T does not implement ApprovalExecutor", tool)
+	}
+	result, err := executor.ExecuteApproved(context.Background(), json.RawMessage(`{"title":"Quarterly plan","folder_token":"fld_token"}`))
+	if err != nil {
+		t.Fatalf("ExecuteApproved returned error: %v", err)
+	}
+	if result.Warning || !strings.Contains(result.Message, "https://docs.feishu.cn/docx/doxcn12345678") {
+		t.Fatalf("approved result = %#v, want created document link", result)
+	}
+	if createRequest.Title != "Quarterly plan" || createRequest.FolderToken != "fld_token" {
+		t.Fatalf("create request = %#v", createRequest)
+	}
+}
+
+func TestDocsCreateApprovedExecutionReportsPartialSuccessWithoutRetryingCreate(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/oauth/v3/token" || r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "ok",
+				"tenant_access_token": "tenant-token",
+				"expire":              7200,
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents":
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{"document": map[string]any{"document_id": "doxcn12345678"}},
+			})
+		case strings.Contains(r.URL.Path, "/open-apis/docx/v1/documents/doxcn12345678/blocks/"):
+			writeJSON(t, w, map[string]any{"code": 99991672, "msg": "append denied"})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	cfg := Config{
+		AllowedFolderTokens: []string{"fld_token"},
+		Docs:                DocsToolsConfig{Enabled: true, AllowWrite: true},
+	}
+	tool := findDocsTool(t, NewDocsTools(client, cfg, &fakeApprovalRequester{}), createToolName)
+	executor := tool.(ApprovalExecutor)
+	result, err := executor.ExecuteApproved(context.Background(), json.RawMessage(`{"title":"Quarterly plan","content":"body","folder_token":"fld_token"}`))
+	if err != nil {
+		t.Fatalf("ExecuteApproved returned error after document creation: %v", err)
+	}
+	if !result.Warning || !strings.Contains(result.WarningReason, "append denied") || !strings.Contains(result.Message, "请勿重复创建") || !strings.Contains(result.Message, "doxcn12345678") {
+		t.Fatalf("partial result = %#v, want warning with existing document link", result)
 	}
 }
 
@@ -72,4 +236,15 @@ func TestTruncateRunes(t *testing.T) {
 	if got != "hello" || truncated {
 		t.Fatalf("truncateRunes = %q %v, want hello false", got, truncated)
 	}
+}
+
+func findDocsTool(t *testing.T, tools []tooltypes.Tool, name string) tooltypes.Tool {
+	t.Helper()
+	for _, tool := range tools {
+		if tool != nil && tool.Spec().Name == name {
+			return tool
+		}
+	}
+	t.Fatalf("tool %q not found", name)
+	return nil
 }

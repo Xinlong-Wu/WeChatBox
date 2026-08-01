@@ -40,6 +40,7 @@ func RunContext(ctx context.Context, st *store.Store, sm *session.Manager, cfg c
 }
 
 type Platform struct {
+	store   *store.Store
 	account store.Account
 	config  feishu.Config
 	level   logging.Level
@@ -47,9 +48,9 @@ type Platform struct {
 
 var _ core.Platform = (*Platform)(nil)
 
-func NewPlatform(acc store.Account, cfg feishu.Config, level logging.Level) *Platform {
+func NewPlatform(st *store.Store, acc store.Account, cfg feishu.Config, level logging.Level) *Platform {
 	cfg.ApplyDefaults()
-	return &Platform{account: acc, config: cfg, level: level}
+	return &Platform{store: st, account: acc, config: cfg, level: level}
 }
 
 func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
@@ -74,7 +75,25 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 	if err != nil {
 		return fmt.Errorf("resolve feishu bot identity for account %s: %w", acc.Name, err)
 	}
-	tools := newFeishuTools(restClient, p.config.Tools)
+	sender := &sdkSender{client: restClient}
+	var approvals *approvalManager
+	var approver feishutools.ApprovalRequester
+	if docsCreateApprovalRequired(p.config.Tools) {
+		approvals, err = newApprovalManager(ctx, p.store, acc, sender)
+		if err != nil {
+			return fmt.Errorf("initialize feishu tool approvals for account %s: %w", acc.Name, err)
+		}
+		if err := approvals.recoverPersistedApprovals(ctx); err != nil {
+			return fmt.Errorf("recover feishu tool approvals for account %s: %w", acc.Name, err)
+		}
+		approver = approvals
+	}
+	tools := newFeishuTools(restClient, p.config.Tools, approver)
+	if approvals != nil {
+		if err := registerApprovalExecutors(approvals, tools); err != nil {
+			return fmt.Errorf("register feishu tool approval executors for account %s: %w", acc.Name, err)
+		}
+	}
 	if names := toolNames(tools); len(names) > 0 {
 		feishuLog.Info(ctx, "registered tools for account %s (%s): %s", acc.Name, acc.ID, strings.Join(names, ", "))
 	} else {
@@ -82,11 +101,12 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 	}
 	b := &bot{
 		handler:       handler,
-		sender:        &sdkSender{client: restClient},
+		sender:        sender,
 		tools:         tools,
 		account:       acc,
 		botOpenID:     botOpenID,
 		eventCommands: map[string][]string{},
+		approvals:     approvals,
 		deduper:       newEventDeduper(defaultFeishuDedupeTTL),
 		runCtx:        ctx,
 		reactionDelay: feishuReactionClearDelay,
@@ -118,11 +138,34 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 	return runClient(ctx, wsClient)
 }
 
-func newFeishuTools(client *lark.Client, cfg feishutools.Config) []tooltypes.Tool {
+func newFeishuTools(client *lark.Client, cfg feishutools.Config, approver feishutools.ApprovalRequester) []tooltypes.Tool {
 	tools := feishutools.NewChatHistoryTools(client, cfg)
-	tools = append(tools, feishutools.NewDocsTools(client, cfg)...)
+	tools = append(tools, feishutools.NewDocsTools(client, cfg, approver)...)
 	tools = append(tools, feishutools.NewLiteLLMAccountTools(client, cfg)...)
 	return tools
+}
+
+func docsCreateApprovalRequired(cfg feishutools.Config) bool {
+	cfg = feishutools.NormalizeConfig(cfg)
+	return cfg.Docs.Enabled && cfg.Docs.AllowWrite && len(cfg.AllowedFolderTokens) > 0
+}
+
+func registerApprovalExecutors(approvals *approvalManager, tools []tooltypes.Tool) error {
+	registered := 0
+	for _, tool := range tools {
+		executor, ok := tool.(feishutools.ApprovalExecutor)
+		if !ok || strings.TrimSpace(executor.ApprovalToolName()) == "" {
+			continue
+		}
+		if err := approvals.registerExecutor(executor); err != nil {
+			return err
+		}
+		registered++
+	}
+	if registered == 0 {
+		return fmt.Errorf("no approval-gated tools were registered")
+	}
+	return nil
 }
 
 func toolNames(tools []tooltypes.Tool) []string {
