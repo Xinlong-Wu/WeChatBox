@@ -93,7 +93,7 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 		}
 		approver = approvals
 	}
-	tools := newFeishuTools(restClient, p.config.Tools, approver)
+	tools := newFeishuTools(restClient, p.store, acc.ID, p.config.Tools, approver)
 	if approvals != nil {
 		if err := registerApprovalExecutors(approvals, tools); err != nil {
 			return fmt.Errorf("register feishu tool approval executors for account %s: %w", acc.Name, err)
@@ -144,9 +144,10 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 	return runClient(ctx, wsClient)
 }
 
-func newFeishuTools(client *lark.Client, cfg feishutools.Config, approver feishutools.ApprovalRequester) []tooltypes.Tool {
+func newFeishuTools(client *lark.Client, st *store.Store, accountID string, cfg feishutools.Config, approver feishutools.ApprovalRequester) []tooltypes.Tool {
 	tools := feishutools.NewChatHistoryTools(client, cfg)
 	tools = append(tools, feishutools.NewDocsTools(client, cfg, approver)...)
+	tools = append(tools, feishutools.NewDocsFolderTools(client, st, accountID, cfg)...)
 	tools = append(tools, feishutools.NewLiteLLMAccountTools(client, cfg)...)
 	return tools
 }

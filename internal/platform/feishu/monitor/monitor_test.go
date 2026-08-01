@@ -956,23 +956,24 @@ func TestHandleGroupTextMessageRepliesToOriginal(t *testing.T) {
 
 func TestNewFeishuToolsRegistersEnabledChatHistory(t *testing.T) {
 	cfg := feishutools.Config{ChatHistory: feishutools.ChatHistoryConfig{Enabled: true}}
-	names := toolNames(newFeishuTools(&lark.Client{}, cfg, nil))
+	names := toolNames(newFeishuTools(&lark.Client{}, nil, "", cfg, nil))
 	if len(names) != 1 || names[0] != "feishu_chat_history_get" {
 		t.Fatalf("tool names = %#v, want chat history", names)
 	}
 }
 
 func TestNewFeishuToolsRegistersApprovalGatedDocumentCreate(t *testing.T) {
+	st := openFeishuApprovalTestStore(t)
 	cfg := feishutools.Config{
 		AllowedFolderTokens: []string{"fld_token"},
 		Docs:                feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true},
 	}
-	withoutApproval := toolNames(newFeishuTools(&lark.Client{}, cfg, nil))
+	withoutApproval := toolNames(newFeishuTools(&lark.Client{}, st, "feishu:cli_test", cfg, nil))
 	if strings.Contains(strings.Join(withoutApproval, ","), "feishu_docs_create") {
 		t.Fatalf("tools without approval workflow = %#v, create must fail closed", withoutApproval)
 	}
-	withApproval := toolNames(newFeishuTools(&lark.Client{}, cfg, fakeToolApprovalRequester{}))
-	if got, want := strings.Join(withApproval, ","), "feishu_docs_search,feishu_docs_read,feishu_docs_create,feishu_docs_append"; got != want {
+	withApproval := toolNames(newFeishuTools(&lark.Client{}, st, "feishu:cli_test", cfg, fakeToolApprovalRequester{}))
+	if got, want := strings.Join(withApproval, ","), "feishu_docs_search,feishu_docs_read,feishu_docs_create,feishu_docs_append,feishu_docs_folder_create,feishu_docs_folder_list"; got != want {
 		t.Fatalf("tools with approval workflow = %q, want %q", got, want)
 	}
 }
