@@ -123,6 +123,16 @@ func (fakeToolApprovalRequester) RequestApproval(context.Context, feishutools.Ap
 	return feishutools.PendingApproval{RequestID: "req_approval"}, nil
 }
 
+type fakeResourceAccessController struct{}
+
+func (fakeResourceAccessController) RequestAccess(context.Context, feishutools.ResourceAccessRequest) (feishutools.ResourceAccessResult, error) {
+	return feishutools.ResourceAccessResult{RequestID: "req_access", Status: feishutools.ResourceAccessStatusGranted}, nil
+}
+
+func (fakeResourceAccessController) ValidateAccess(context.Context, feishutools.ResourceAccessValidation) (feishutools.ResourceAccessResult, error) {
+	return feishutools.ResourceAccessResult{RequestID: "req_access", Status: feishutools.ResourceAccessStatusGranted}, nil
+}
+
 type sentText struct {
 	chatID string
 	text   string
@@ -956,7 +966,7 @@ func TestHandleGroupTextMessageRepliesToOriginal(t *testing.T) {
 
 func TestNewFeishuToolsRegistersEnabledChatHistory(t *testing.T) {
 	cfg := feishutools.Config{ChatHistory: feishutools.ChatHistoryConfig{Enabled: true}}
-	names := toolNames(newFeishuTools(&lark.Client{}, nil, "", cfg, nil))
+	names := toolNames(newFeishuTools(&lark.Client{}, nil, "", cfg, nil, nil))
 	if len(names) != 1 || names[0] != "feishu_chat_history_get" {
 		t.Fatalf("tool names = %#v, want chat history", names)
 	}
@@ -967,12 +977,12 @@ func TestNewFeishuToolsRegistersApprovalGatedDocumentCreate(t *testing.T) {
 	cfg := feishutools.Config{
 		Docs: feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true},
 	}
-	withoutApproval := toolNames(newFeishuTools(&lark.Client{}, st, "feishu:cli_test", cfg, nil))
+	withoutApproval := toolNames(newFeishuTools(&lark.Client{}, st, "feishu:cli_test", cfg, nil, nil))
 	if strings.Contains(strings.Join(withoutApproval, ","), "feishu_docs_create") {
 		t.Fatalf("tools without approval workflow = %#v, create must fail closed", withoutApproval)
 	}
-	withApproval := toolNames(newFeishuTools(&lark.Client{}, st, "feishu:cli_test", cfg, fakeToolApprovalRequester{}))
-	if got, want := strings.Join(withApproval, ","), "feishu_docs_search,feishu_docs_read,feishu_docs_create,feishu_docs_append,feishu_docs_folder_create,feishu_docs_folder_list"; got != want {
+	withApproval := toolNames(newFeishuTools(&lark.Client{}, st, "feishu:cli_test", cfg, fakeToolApprovalRequester{}, fakeResourceAccessController{}))
+	if got, want := strings.Join(withApproval, ","), "feishu_docs_request_access,feishu_docs_search,feishu_docs_read,feishu_docs_create,feishu_docs_append,feishu_docs_folder_create,feishu_docs_folder_list"; got != want {
 		t.Fatalf("tools with approval workflow = %q, want %q", got, want)
 	}
 }
@@ -1973,7 +1983,7 @@ func TestPlatformRunRequiresConfiguredAccount(t *testing.T) {
 	}
 }
 
-func TestPlatformRunRequiresStoreForDocumentApproval(t *testing.T) {
+func TestPlatformRunRequiresStoreForDocumentResources(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/oauth/v3/token", "/open-apis/auth/v3/tenant_access_token/internal":
@@ -2004,8 +2014,8 @@ func TestPlatformRunRequiresStoreForDocumentApproval(t *testing.T) {
 			Docs: feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true},
 		},
 	}, logging.Info).Run(context.Background(), &fakeProcessor{})
-	if err == nil || !strings.Contains(err.Error(), "tool approval store is required") {
-		t.Fatalf("Run error = %v, want missing approval store", err)
+	if err == nil || !strings.Contains(err.Error(), "resource access requires a Feishu store") {
+		t.Fatalf("Run error = %v, want missing Feishu resource store", err)
 	}
 }
 
@@ -2053,7 +2063,7 @@ func TestRunClientClosesOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- runClient(ctx, client)
+		done <- runClient(ctx, client, nil)
 	}()
 
 	cancel()

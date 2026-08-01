@@ -70,20 +70,35 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 
 	sdkLogLevel := feishuSDKLogLevel(p.level)
 	sdkLog := newSDKLevelLogger(sdkLogLevel, feishuSDKLog)
-	restClient := newRESTClient(creds, baseURL, sdkLogLevel, sdkLog)
+	restClient := newRESTClient(creds, baseURL, accountConfig.OAuthBaseURL, sdkLogLevel, sdkLog)
 	botOpenID, err := fetchBotOpenID(ctx, restClient)
 	if err != nil {
 		return fmt.Errorf("resolve feishu bot identity for account %s: %w", acc.Name, err)
 	}
 	sender := &sdkSender{client: restClient}
 	var approvals *approvalManager
+	var resourceAccess *resourceAccessManager
 	var cards CardService
 	var approver feishutools.ApprovalRequester
-	if docsCreateApprovalRequired(p.config.Tools) {
+	if docsToolsEnabled(p.config.Tools) {
 		cards, err = newCardService(sender)
 		if err != nil {
 			return fmt.Errorf("initialize feishu cards for account %s: %w", acc.Name, err)
 		}
+		resourceAccess, err = newResourceAccessManager(ctx, p.store, restClient, acc, botOpenID, cards, sender, resourceAccessOAuthConfig{
+			ClientID:      creds.AppID,
+			BaseURL:       accountConfig.OAuthBaseURL,
+			RedirectURI:   accountConfig.OAuthRedirectURI,
+			ListenAddress: accountConfig.OAuthListenAddress,
+		})
+		if err != nil {
+			return fmt.Errorf("initialize feishu resource access for account %s: %w", acc.Name, err)
+		}
+		if err := resourceAccess.recoverPersistedRequests(ctx); err != nil {
+			return fmt.Errorf("recover feishu resource access for account %s: %w", acc.Name, err)
+		}
+	}
+	if docsCreateApprovalRequired(p.config.Tools) {
 		approvals, err = newApprovalManager(ctx, p.store, acc, cards, sender)
 		if err != nil {
 			return fmt.Errorf("initialize feishu tool approvals for account %s: %w", acc.Name, err)
@@ -93,7 +108,7 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 		}
 		approver = approvals
 	}
-	tools := newFeishuTools(restClient, p.store, acc.ID, p.config.Tools, approver)
+	tools := newFeishuTools(restClient, p.store, acc.ID, p.config.Tools, approver, resourceAccess)
 	if approvals != nil {
 		if err := registerApprovalExecutors(approvals, tools); err != nil {
 			return fmt.Errorf("register feishu tool approval executors for account %s: %w", acc.Name, err)
@@ -139,17 +154,34 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 		opts = append(opts, larkws.WithDomain(domain))
 	}
 	wsClient := larkws.NewClient(creds.AppID, creds.AppSecret, opts...)
+	oauthServer, err := startResourceAccessOAuthServer(ctx, resourceAccess)
+	if err != nil {
+		return fmt.Errorf("start feishu OAuth callback server for account %s: %w", acc.Name, err)
+	}
+	if oauthServer != nil {
+		defer func() {
+			if closeErr := oauthServer.Close(); closeErr != nil {
+				feishuLog.Warn(context.Background(), "close feishu OAuth callback server account=%s: %v", acc.ID, closeErr)
+			}
+		}()
+	}
 	feishuLog.Info(ctx, "registered events for account %s (%s): %s", acc.Name, acc.ID, strings.Join(registeredEvents, ", "))
 	feishuLog.Info(ctx, "starting for account %s (%s)", acc.Name, acc.ID)
-	return runClient(ctx, wsClient)
+	return runClient(ctx, wsClient, oauthServer)
 }
 
-func newFeishuTools(client *lark.Client, st *store.Store, accountID string, cfg feishutools.Config, approver feishutools.ApprovalRequester) []tooltypes.Tool {
+func newFeishuTools(client *lark.Client, st *store.Store, accountID string, cfg feishutools.Config, approver feishutools.ApprovalRequester, resourceAccess feishutools.ResourceAccessController) []tooltypes.Tool {
 	tools := feishutools.NewChatHistoryTools(client, cfg)
+	tools = append(tools, feishutools.NewDocsResourceAccessTools(resourceAccess, cfg)...)
 	tools = append(tools, feishutools.NewDocsTools(client, st, accountID, cfg, approver)...)
 	tools = append(tools, feishutools.NewDocsFolderTools(client, st, accountID, cfg)...)
 	tools = append(tools, feishutools.NewLiteLLMAccountTools(client, cfg)...)
 	return tools
+}
+
+func docsToolsEnabled(cfg feishutools.Config) bool {
+	cfg = feishutools.NormalizeConfig(cfg)
+	return cfg.Docs.Enabled
 }
 
 func docsCreateApprovalRequired(cfg feishutools.Config) bool {
@@ -192,28 +224,45 @@ func toolNames(tools []tooltypes.Tool) []string {
 func runClient(ctx context.Context, client interface {
 	starter
 	closer
-}) error {
+}, oauthServer *oauthCallbackServer) error {
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- client.Start(ctx)
 	}()
-	select {
-	case err := <-errCh:
-		return err
-	case <-ctx.Done():
-		client.Close()
-		return nil
+	oauthErrCh := (<-chan error)(nil)
+	if oauthServer != nil {
+		oauthErrCh = oauthServer.Errors()
+	}
+	for {
+		select {
+		case err := <-errCh:
+			return err
+		case err, ok := <-oauthErrCh:
+			client.Close()
+			if !ok || err == nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return fmt.Errorf("feishu OAuth callback server stopped unexpectedly")
+			}
+			return fmt.Errorf("feishu OAuth callback server: %w", err)
+		case <-ctx.Done():
+			client.Close()
+			return nil
+		}
 	}
 }
 
-func newRESTClient(creds feishu.Credentials, baseURL string, level larkcore.LogLevel, logger larkcore.Logger) *lark.Client {
+func newRESTClient(creds feishu.Credentials, baseURL, oauthBaseURL string, level larkcore.LogLevel, logger larkcore.Logger) *lark.Client {
 	opts := []lark.ClientOptionFunc{
 		lark.WithLogger(logger),
 		lark.WithLogLevel(level),
 	}
 	if baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/"); baseURL != "" {
 		opts = append(opts, lark.WithOpenBaseUrl(baseURL))
-		opts = append(opts, lark.WithOAuthBaseUrl(baseURL))
+	}
+	if oauthBaseURL = strings.TrimRight(strings.TrimSpace(oauthBaseURL), "/"); oauthBaseURL != "" {
+		opts = append(opts, lark.WithOAuthBaseUrl(oauthBaseURL))
 	}
 	return lark.NewClient(creds.AppID, creds.AppSecret, opts...)
 }

@@ -433,6 +433,8 @@ func (s *Store) CompleteFeishuResourceAccessRequest(id, accountID, source, verif
 	}
 	now = normalizedWorkflowTime(now)
 	var normalizedGrant FeishuResourceGrant
+	subjectType := ""
+	subjectID := ""
 	if grant != nil {
 		normalizedGrant = normalizeFeishuResourceGrant(*grant)
 		if err := validateFeishuResourceGrant(normalizedGrant); err != nil {
@@ -441,6 +443,8 @@ func (s *Store) CompleteFeishuResourceAccessRequest(id, accountID, source, verif
 		if normalizedGrant.AccountID != accountID || normalizedGrant.SourceRequestID != id {
 			return fmt.Errorf("feishu resource grant account and source request must match the access request")
 		}
+		subjectType = normalizedGrant.SubjectType
+		subjectID = normalizedGrant.SubjectID
 	}
 
 	s.mu.Lock()
@@ -452,9 +456,13 @@ func (s *Store) CompleteFeishuResourceAccessRequest(id, accountID, source, verif
 	defer tx.Rollback()
 	result, err := tx.Exec(
 		`UPDATE feishu_resource_access_requests
-		 SET state=?, grant_source=?, verified_permission=?, oauth_state_hash='', pkce_verifier='', updated_at_ms=?
+		 SET state=?, grant_source=?, verified_permission=?,
+		 subject_type=CASE WHEN ?='' THEN subject_type ELSE ? END,
+		 subject_id=CASE WHEN ?='' THEN subject_id ELSE ? END,
+		 oauth_state_hash='', pkce_verifier='', updated_at_ms=?
 		 WHERE id=? AND account_id=? AND state IN (?, ?)`,
-		FeishuResourceAccessStateSucceeded, source, verifiedPermission, now.UnixMilli(),
+		FeishuResourceAccessStateSucceeded, source, verifiedPermission,
+		subjectType, subjectType, subjectID, subjectID, now.UnixMilli(),
 		id, accountID, FeishuResourceAccessStatePending, FeishuResourceAccessStateExecuting,
 	)
 	if err != nil {
@@ -933,7 +941,8 @@ func upsertFeishuResourceGrant(execer feishuResourceGrantExecer, grant FeishuRes
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(account_id, chat_id, resource_type, resource_token) DO UPDATE SET
 			permission=CASE
-				WHEN feishu_resource_grants.permission='write' OR excluded.permission='write' THEN 'write'
+				WHEN (feishu_resource_grants.state='active' AND feishu_resource_grants.permission='write')
+					OR excluded.permission='write' THEN 'write'
 				ELSE 'read'
 			END,
 			subject_type=excluded.subject_type,

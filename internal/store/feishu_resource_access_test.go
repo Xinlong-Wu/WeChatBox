@@ -198,6 +198,15 @@ func TestFeishuResourceGrantUpgradesButDoesNotDowngrade(t *testing.T) {
 	if _, active, err := st.ActiveFeishuResourceGrant(base.AccountID, base.ChatID, base.ResourceType, base.ResourceToken, FeishuResourcePermissionRead); err != nil || active {
 		t.Fatalf("revoked grant active=%t err=%v, want false", active, err)
 	}
+	base.Permission = FeishuResourcePermissionRead
+	base.SourceRequestID = "req_after_revoke"
+	base.VerifiedAt = now.Add(3 * time.Minute)
+	if _, err := st.UpsertFeishuResourceGrant(base); err != nil {
+		t.Fatalf("read after revoke UpsertFeishuResourceGrant returned error: %v", err)
+	}
+	if _, active, err := st.ActiveFeishuResourceGrant(base.AccountID, base.ChatID, base.ResourceType, base.ResourceToken, FeishuResourcePermissionWrite); err != nil || active {
+		t.Fatalf("revoked write incorrectly survived read regrant active=%t err=%v", active, err)
+	}
 }
 
 func TestFeishuResourceAccessRecoveryClearsOneTimeSecrets(t *testing.T) {
