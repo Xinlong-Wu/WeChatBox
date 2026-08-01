@@ -63,11 +63,21 @@ func Definition() platform.Definition {
 			if err != nil {
 				return err
 			}
-			if err := feishu.UpsertAccountConfig(ctx.Platform, opts.Name, feishu.AccountConfig{
+			accountConfig := feishu.AccountConfig{
 				AppID:     values.AppID,
 				AppSecret: values.AppSecret,
 				BaseURL:   values.BaseURL,
-			}); err != nil {
+			}
+			existing, ok, err := feishu.ResolveAccountConfig(ctx.Platform, opts.Name)
+			if err != nil {
+				return fmt.Errorf("load existing feishu account config: %w", err)
+			}
+			if ok {
+				accountConfig.OAuthBaseURL = existing.OAuthBaseURL
+				accountConfig.OAuthRedirectURI = existing.OAuthRedirectURI
+				accountConfig.OAuthListenAddress = existing.OAuthListenAddress
+			}
+			if err := feishu.UpsertAccountConfig(ctx.Platform, opts.Name, accountConfig); err != nil {
 				return err
 			}
 			fmt.Printf("✅ 已添加飞书账户: %s (%s)\n", acc.Name, acc.ID)

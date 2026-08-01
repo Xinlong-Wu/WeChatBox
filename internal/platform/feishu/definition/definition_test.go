@@ -12,6 +12,59 @@ import (
 	"lingobridge/internal/store"
 )
 
+func TestCreateOrUpdateAccountPreservesOAuthConfig(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := store.Open(store.PlatformFeishu)
+	if err != nil {
+		t.Fatalf("store.Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Fatalf("store.Close returned error: %v", err)
+		}
+	})
+
+	cfg := config.DefaultConfig()
+	platformCtx, err := core.NewPlatformContext(store.PlatformFeishu, &cfg, st, nil)
+	if err != nil {
+		t.Fatalf("NewPlatformContext returned error: %v", err)
+	}
+	if err := feishu.UpsertAccountConfig(platformCtx, "fsbot", feishu.AccountConfig{
+		AppID:              "cli_old",
+		AppSecret:          "old-secret",
+		BaseURL:            "https://open.feishu.cn",
+		OAuthBaseURL:       "https://accounts.example.com",
+		OAuthRedirectURI:   "https://bridge.example.com/feishu/oauth/callback",
+		OAuthListenAddress: "127.0.0.1:8080",
+	}); err != nil {
+		t.Fatalf("seed account config: %v", err)
+	}
+
+	def := Definition()
+	if err := def.CreateOrUpdateAccount(platform.AccountNewContext{Platform: platformCtx}, platform.AccountNewOptions{
+		Name: "fsbot",
+		Values: feishu.AccountNewOptions{
+			AppID:     "cli_new",
+			AppSecret: "new-secret",
+			BaseURL:   "https://open.example.com",
+		},
+	}); err != nil {
+		t.Fatalf("CreateOrUpdateAccount returned error: %v", err)
+	}
+	account, ok, err := feishu.ResolveAccountConfig(platformCtx, "fsbot")
+	if err != nil || !ok {
+		t.Fatalf("ResolveAccountConfig account=%#v ok=%t err=%v", account, ok, err)
+	}
+	if account.AppID != "cli_new" || account.AppSecret != "new-secret" || account.BaseURL != "https://open.example.com" {
+		t.Fatalf("updated account credentials = %#v", account)
+	}
+	if account.OAuthBaseURL != "https://accounts.example.com" ||
+		account.OAuthRedirectURI != "https://bridge.example.com/feishu/oauth/callback" ||
+		account.OAuthListenAddress != "127.0.0.1:8080" {
+		t.Fatalf("updated account lost OAuth config = %#v", account)
+	}
+}
+
 func TestDeleteAccountClearsPendingToolApprovalsAndDocsBindings(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	st, err := store.Open(store.PlatformFeishu)
