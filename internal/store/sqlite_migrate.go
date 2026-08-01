@@ -67,6 +67,36 @@ func (s *Store) migrate() error {
 			updated_at_ms INTEGER NOT NULL,
 			PRIMARY KEY (account_id, tool_name, actor_type, actor_id, chat_id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS feishu_chat_folders (
+			account_id TEXT NOT NULL,
+			chat_id TEXT NOT NULL,
+			folder_token TEXT NOT NULL,
+			name TEXT NOT NULL,
+			url TEXT NOT NULL DEFAULT '',
+			parent_folder_token TEXT NOT NULL DEFAULT '',
+			is_default INTEGER NOT NULL DEFAULT 0,
+			share_member_type TEXT NOT NULL,
+			share_member_id TEXT NOT NULL,
+			share_state TEXT NOT NULL,
+			create_request_id TEXT NOT NULL UNIQUE,
+			created_by_open_id TEXT NOT NULL DEFAULT '',
+			created_by_user_id TEXT NOT NULL DEFAULT '',
+			created_at_ms INTEGER NOT NULL,
+			updated_at_ms INTEGER NOT NULL,
+			PRIMARY KEY (account_id, chat_id, folder_token)
+		)`,
+		`CREATE TABLE IF NOT EXISTS feishu_chat_documents (
+			account_id TEXT NOT NULL,
+			chat_id TEXT NOT NULL,
+			document_token TEXT NOT NULL,
+			folder_token TEXT NOT NULL,
+			title TEXT NOT NULL DEFAULT '',
+			url TEXT NOT NULL DEFAULT '',
+			source_request_id TEXT NOT NULL DEFAULT '',
+			created_at_ms INTEGER NOT NULL,
+			updated_at_ms INTEGER NOT NULL,
+			PRIMARY KEY (account_id, chat_id, document_token)
+		)`,
 	}
 
 	for _, q := range queries {
@@ -93,6 +123,12 @@ func (s *Store) migrate() error {
 			 ON tool_approval_grants(account_id, expires_at_ms)`,
 		`CREATE INDEX IF NOT EXISTS idx_workflow_requests_account_kind_state
 			 ON workflow_requests(account_id, kind, state, updated_at_ms)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_feishu_chat_folders_one_default
+			 ON feishu_chat_folders(account_id, chat_id) WHERE is_default=1`,
+		`CREATE INDEX IF NOT EXISTS idx_feishu_chat_folders_account_chat
+			 ON feishu_chat_folders(account_id, chat_id, created_at_ms)`,
+		`CREATE INDEX IF NOT EXISTS idx_feishu_chat_documents_folder
+			 ON feishu_chat_documents(account_id, chat_id, folder_token)`,
 	}
 	for _, q := range indexes {
 		if _, err := s.db.Exec(q); err != nil {

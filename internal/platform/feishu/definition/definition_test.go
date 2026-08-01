@@ -12,7 +12,7 @@ import (
 	"lingobridge/internal/store"
 )
 
-func TestDeleteAccountClearsPendingToolApprovals(t *testing.T) {
+func TestDeleteAccountClearsPendingToolApprovalsAndDocsBindings(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	st, err := store.Open(store.PlatformFeishu)
 	if err != nil {
@@ -46,6 +46,28 @@ func TestDeleteAccountClearsPendingToolApprovals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateToolApproval returned error: %v", err)
 	}
+	folderRequest, err := st.CreateWorkflowRequest(store.WorkflowRequest{
+		AccountID: account.ID,
+		Kind:      store.WorkflowRequestKindFeishuFolderCreate,
+		State:     store.WorkflowRequestStateSucceeded,
+		CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorkflowRequest returned error: %v", err)
+	}
+	if _, err := st.SaveFeishuChatFolder(store.FeishuChatFolder{
+		AccountID:       account.ID,
+		ChatID:          "oc_chat",
+		FolderToken:     "fld_token",
+		Name:            "Docs",
+		ShareMemberType: "openchat",
+		ShareMemberID:   "oc_chat",
+		ShareState:      store.FeishuFolderShareStateSucceeded,
+		CreateRequestID: folderRequest.ID,
+		CreatedAt:       now,
+	}); err != nil {
+		t.Fatalf("SaveFeishuChatFolder returned error: %v", err)
+	}
 
 	def := Definition()
 	if err := def.DeleteAccount(platform.AccountDeleteContext{Platform: platformCtx, Account: account}); err != nil {
@@ -53,6 +75,9 @@ func TestDeleteAccountClearsPendingToolApprovals(t *testing.T) {
 	}
 	if _, err := st.GetToolApproval(approval.ID, account.ID); !errors.Is(err, store.ErrToolApprovalNotFound) {
 		t.Fatalf("GetToolApproval error = %v, want ErrToolApprovalNotFound", err)
+	}
+	if folders, err := st.ListFeishuChatFolders(account.ID, "oc_chat"); err != nil || len(folders) != 0 {
+		t.Fatalf("deleted account folders = %#v err=%v", folders, err)
 	}
 	loaded, err := feishu.LoadConfig(platformCtx)
 	if err != nil {

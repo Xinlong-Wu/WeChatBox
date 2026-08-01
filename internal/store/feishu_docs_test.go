@@ -1,0 +1,193 @@
+package store
+
+import (
+	"errors"
+	"testing"
+	"time"
+)
+
+func TestFeishuChatFoldersAreChatScopedWithOneDefault(t *testing.T) {
+	st := openFeishuDocsTestStore(t)
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	first, err := st.SaveFeishuChatFolder(FeishuChatFolder{
+		AccountID:       "feishu:cli_test",
+		ChatID:          "oc_chat",
+		FolderToken:     "fld_first",
+		Name:            "First",
+		ShareMemberType: "openchat",
+		ShareMemberID:   "oc_chat",
+		ShareState:      FeishuFolderShareStatePending,
+		CreateRequestID: "req_first",
+		CreatedByOpenID: "ou_requester",
+		CreatedAt:       now,
+	})
+	if err != nil {
+		t.Fatalf("SaveFeishuChatFolder first returned error: %v", err)
+	}
+	if !first.Default {
+		t.Fatalf("first folder = %#v, want automatic default", first)
+	}
+	second, err := st.SaveFeishuChatFolder(FeishuChatFolder{
+		AccountID:         first.AccountID,
+		ChatID:            first.ChatID,
+		FolderToken:       "fld_second",
+		Name:              "Second",
+		ParentFolderToken: first.FolderToken,
+		ShareMemberType:   first.ShareMemberType,
+		ShareMemberID:     first.ShareMemberID,
+		ShareState:        FeishuFolderShareStateSucceeded,
+		CreateRequestID:   "req_second",
+		CreatedByOpenID:   first.CreatedByOpenID,
+		CreatedAt:         now.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatalf("SaveFeishuChatFolder second returned error: %v", err)
+	}
+	if second.Default {
+		t.Fatalf("second folder = %#v, want existing default retained", second)
+	}
+	third, err := st.SaveFeishuChatFolder(FeishuChatFolder{
+		AccountID:       first.AccountID,
+		ChatID:          first.ChatID,
+		FolderToken:     "fld_third",
+		Name:            "Third",
+		Default:         true,
+		ShareMemberType: first.ShareMemberType,
+		ShareMemberID:   first.ShareMemberID,
+		ShareState:      FeishuFolderShareStateSucceeded,
+		CreateRequestID: "req_third",
+		CreatedByOpenID: first.CreatedByOpenID,
+		CreatedAt:       now.Add(2 * time.Second),
+	})
+	if err != nil {
+		t.Fatalf("SaveFeishuChatFolder third returned error: %v", err)
+	}
+	defaultFolder, err := st.DefaultFeishuChatFolder(first.AccountID, first.ChatID)
+	if err != nil || defaultFolder.FolderToken != third.FolderToken {
+		t.Fatalf("default folder = %#v err=%v", defaultFolder, err)
+	}
+	folders, err := st.ListFeishuChatFolders(first.AccountID, first.ChatID)
+	if err != nil {
+		t.Fatalf("ListFeishuChatFolders returned error: %v", err)
+	}
+	if len(folders) != 3 || folders[0].FolderToken != third.FolderToken || !folders[0].Default {
+		t.Fatalf("folders = %#v, want default first", folders)
+	}
+	if _, err := st.GetFeishuChatFolder(first.AccountID, "oc_other", first.FolderToken); !errors.Is(err, ErrFeishuChatFolderNotFound) {
+		t.Fatalf("cross-chat folder error = %v, want ErrFeishuChatFolderNotFound", err)
+	}
+	byRequest, err := st.GetFeishuChatFolderByRequest(first.AccountID, first.ChatID, second.CreateRequestID)
+	if err != nil || byRequest.FolderToken != second.FolderToken {
+		t.Fatalf("folder by request = %#v err=%v", byRequest, err)
+	}
+}
+
+func TestFeishuFolderShareStateAndDocumentsAreDurableAndScoped(t *testing.T) {
+	st := openFeishuDocsTestStore(t)
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	folder, err := st.SaveFeishuChatFolder(FeishuChatFolder{
+		AccountID:       "feishu:cli_test",
+		ChatID:          "oc_chat",
+		FolderToken:     "fld_token",
+		Name:            "Docs",
+		ShareMemberType: "openid",
+		ShareMemberID:   "ou_requester",
+		ShareState:      FeishuFolderShareStatePending,
+		CreateRequestID: "req_folder",
+		CreatedByOpenID: "ou_requester",
+		CreatedAt:       now,
+	})
+	if err != nil {
+		t.Fatalf("SaveFeishuChatFolder returned error: %v", err)
+	}
+	if err := st.UpdateFeishuChatFolderShareState(folder.AccountID, folder.ChatID, folder.FolderToken, FeishuFolderShareStateFailed, now.Add(time.Second)); err != nil {
+		t.Fatalf("UpdateFeishuChatFolderShareState returned error: %v", err)
+	}
+	updated, err := st.GetFeishuChatFolder(folder.AccountID, folder.ChatID, folder.FolderToken)
+	if err != nil || updated.ShareState != FeishuFolderShareStateFailed || !updated.UpdatedAt.Equal(now.Add(time.Second)) {
+		t.Fatalf("updated folder = %#v err=%v", updated, err)
+	}
+	document, err := st.SaveFeishuChatDocument(FeishuChatDocument{
+		AccountID:       folder.AccountID,
+		ChatID:          folder.ChatID,
+		DocumentToken:   "doxcn_document",
+		FolderToken:     folder.FolderToken,
+		Title:           "Plan",
+		URL:             "https://docs.feishu.cn/docx/doxcn_document",
+		SourceRequestID: "req_document",
+		CreatedAt:       now,
+	})
+	if err != nil {
+		t.Fatalf("SaveFeishuChatDocument returned error: %v", err)
+	}
+	got, err := st.GetFeishuChatDocument(document.AccountID, document.ChatID, document.DocumentToken)
+	if err != nil || got.FolderToken != folder.FolderToken || got.SourceRequestID != document.SourceRequestID {
+		t.Fatalf("document = %#v err=%v", got, err)
+	}
+	if _, err := st.GetFeishuChatDocument(document.AccountID, "oc_other", document.DocumentToken); !errors.Is(err, ErrFeishuChatDocumentNotFound) {
+		t.Fatalf("cross-chat document error = %v, want ErrFeishuChatDocumentNotFound", err)
+	}
+}
+
+func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
+	st := openFeishuDocsTestStore(t)
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	for _, accountID := range []string{"feishu:first", "feishu:second"} {
+		request, err := st.CreateWorkflowRequest(WorkflowRequest{
+			AccountID: accountID,
+			Kind:      WorkflowRequestKindFeishuFolderCreate,
+			State:     WorkflowRequestStateSucceeded,
+			CreatedAt: now,
+		})
+		if err != nil {
+			t.Fatalf("CreateWorkflowRequest returned error: %v", err)
+		}
+		folder, err := st.SaveFeishuChatFolder(FeishuChatFolder{
+			AccountID:       accountID,
+			ChatID:          "oc_chat",
+			FolderToken:     "fld_" + accountID,
+			Name:            "Docs",
+			ShareMemberType: "openchat",
+			ShareMemberID:   "oc_chat",
+			ShareState:      FeishuFolderShareStateSucceeded,
+			CreateRequestID: request.ID,
+			CreatedAt:       now,
+		})
+		if err != nil {
+			t.Fatalf("SaveFeishuChatFolder returned error: %v", err)
+		}
+		if _, err := st.SaveFeishuChatDocument(FeishuChatDocument{
+			AccountID:     accountID,
+			ChatID:        folder.ChatID,
+			DocumentToken: "doc_" + accountID,
+			FolderToken:   folder.FolderToken,
+			CreatedAt:     now,
+		}); err != nil {
+			t.Fatalf("SaveFeishuChatDocument returned error: %v", err)
+		}
+	}
+	if err := st.DeleteFeishuDocsData("feishu:first"); err != nil {
+		t.Fatalf("DeleteFeishuDocsData returned error: %v", err)
+	}
+	if folders, err := st.ListFeishuChatFolders("feishu:first", "oc_chat"); err != nil || len(folders) != 0 {
+		t.Fatalf("deleted account folders = %#v err=%v", folders, err)
+	}
+	if folders, err := st.ListFeishuChatFolders("feishu:second", "oc_chat"); err != nil || len(folders) != 1 {
+		t.Fatalf("other account folders = %#v err=%v", folders, err)
+	}
+}
+
+func openFeishuDocsTestStore(t *testing.T) *Store {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	st, err := Open(PlatformFeishu)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+	})
+	return st
+}

@@ -16,7 +16,8 @@ var (
 )
 
 const (
-	WorkflowRequestKindToolApproval = "tool_approval"
+	WorkflowRequestKindToolApproval       = "tool_approval"
+	WorkflowRequestKindFeishuFolderCreate = "feishu_docs_folder_create"
 
 	WorkflowRequestStatePending   = "pending"
 	WorkflowRequestStateExecuting = "executing"

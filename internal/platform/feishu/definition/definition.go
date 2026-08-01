@@ -84,6 +84,9 @@ func Definition() platform.Definition {
 			if err := st.DeleteToolApprovals(ctx.Account.ID); err != nil {
 				return fmt.Errorf("delete tool approvals: %w", err)
 			}
+			if err := st.DeleteFeishuDocsData(ctx.Account.ID); err != nil {
+				return fmt.Errorf("delete feishu docs data: %w", err)
+			}
 			return nil
 		},
 		NewRuntimePlatform: func(ctx platform.RuntimeContext) (core.Platform, error) {
