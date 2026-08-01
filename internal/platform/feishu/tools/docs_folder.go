@@ -250,8 +250,8 @@ func (t docsFolderTool) createFolder(ctx context.Context, raw json.RawMessage) (
 	})
 	if saveErr != nil {
 		t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStatePartial)
-		feishuToolsLog.Error(ctx, "persist created feishu folder failed request=%s account=%s chat=%s folder=%s: %v",
-			shortToolRequestID(request.ID), t.accountID, chat.ChatID, created.FolderToken, saveErr)
+		feishuToolsLog.Error(ctx, "persist created feishu folder failed request=%s account=%s chat=%s folder_ref=%s: %v",
+			shortToolRequestID(request.ID), t.accountID, chat.ChatID, hashString(created.FolderToken), saveErr)
 		return marshalToolOutput(folderCreateOutput{
 			Status:            "partial",
 			RequestID:         request.ID,
@@ -266,8 +266,8 @@ func (t docsFolderTool) createFolder(ctx context.Context, raw json.RawMessage) (
 	if err := t.ensureFolderFullAccess(ctx, folder, false); err != nil {
 		t.updateFolderShareBestEffort(ctx, folder, store.FeishuFolderShareStateFailed)
 		t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStatePartial)
-		feishuToolsLog.Warn(ctx, "share feishu folder failed request=%s account=%s chat=%s folder=%s target_type=%s: %v",
-			shortToolRequestID(request.ID), t.accountID, chat.ChatID, folder.FolderToken, folder.ShareMemberType, err)
+		feishuToolsLog.Warn(ctx, "share feishu folder failed request=%s account=%s chat=%s folder_ref=%s target_type=%s: %v",
+			shortToolRequestID(request.ID), t.accountID, chat.ChatID, hashString(folder.FolderToken), folder.ShareMemberType, err)
 		return marshalToolOutput(folderCreateOutput{
 			Status:            "partial",
 			RequestID:         request.ID,
@@ -283,8 +283,8 @@ func (t docsFolderTool) createFolder(ctx context.Context, raw json.RawMessage) (
 	}
 	if err := t.store.UpdateFeishuChatFolderShareState(folder.AccountID, folder.ChatID, folder.FolderToken, store.FeishuFolderShareStateSucceeded, t.currentTime()); err != nil {
 		t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStatePartial)
-		feishuToolsLog.Warn(ctx, "record feishu folder share success failed request=%s account=%s chat=%s folder=%s: %v",
-			shortToolRequestID(request.ID), t.accountID, chat.ChatID, folder.FolderToken, err)
+		feishuToolsLog.Warn(ctx, "record feishu folder share success failed request=%s account=%s chat=%s folder_ref=%s: %v",
+			shortToolRequestID(request.ID), t.accountID, chat.ChatID, hashString(folder.FolderToken), err)
 		return marshalToolOutput(folderCreateOutput{
 			Status:            "partial",
 			RequestID:         request.ID,
@@ -310,8 +310,8 @@ func (t docsFolderTool) createFolder(ctx context.Context, raw json.RawMessage) (
 		))
 	}
 	folder.ShareState = store.FeishuFolderShareStateSucceeded
-	feishuToolsLog.Info(ctx, "created and shared feishu application folder request=%s account=%s chat=%s folder=%s target_type=%s default=%t",
-		shortToolRequestID(request.ID), t.accountID, chat.ChatID, folder.FolderToken, folder.ShareMemberType, folder.Default)
+	feishuToolsLog.Info(ctx, "created and shared feishu application folder request=%s account=%s chat=%s folder_ref=%s target_type=%s default=%t",
+		shortToolRequestID(request.ID), t.accountID, chat.ChatID, hashString(folder.FolderToken), folder.ShareMemberType, folder.Default)
 	return marshalToolOutput(folderOutput(folder, "created", true, "", ""))
 }
 
@@ -332,8 +332,8 @@ func (t docsFolderTool) retryFolderShare(ctx context.Context, actor Actor, chat 
 		}
 		return marshalToolOutput(folderOutput(folder, "created", true, "", ""))
 	}
-	feishuToolsLog.Info(ctx, "retrying feishu folder share request=%s account=%s chat=%s folder=%s target_type=%s",
-		shortToolRequestID(requestID), t.accountID, chat.ChatID, folder.FolderToken, folder.ShareMemberType)
+	feishuToolsLog.Info(ctx, "retrying feishu folder share request=%s account=%s chat=%s folder_ref=%s target_type=%s",
+		shortToolRequestID(requestID), t.accountID, chat.ChatID, hashString(folder.FolderToken), folder.ShareMemberType)
 	if err := t.ensureFolderFullAccess(ctx, folder, folder.ShareState == store.FeishuFolderShareStatePending); err != nil {
 		t.updateFolderShareBestEffort(ctx, folder, store.FeishuFolderShareStateFailed)
 		t.updateWorkflowBestEffort(ctx, requestID, store.WorkflowRequestStatePartial)
@@ -353,8 +353,8 @@ func (t docsFolderTool) retryFolderShare(ctx context.Context, actor Actor, chat 
 		return "", fmt.Errorf("complete feishu folder workflow retry: %w", err)
 	}
 	folder.ShareState = store.FeishuFolderShareStateSucceeded
-	feishuToolsLog.Info(ctx, "completed feishu folder share retry request=%s account=%s chat=%s folder=%s",
-		shortToolRequestID(requestID), t.accountID, chat.ChatID, folder.FolderToken)
+	feishuToolsLog.Info(ctx, "completed feishu folder share retry request=%s account=%s chat=%s folder_ref=%s",
+		shortToolRequestID(requestID), t.accountID, chat.ChatID, hashString(folder.FolderToken))
 	return marshalToolOutput(folderOutput(folder, "created", true, "", ""))
 }
 
@@ -501,7 +501,7 @@ func (t docsFolderTool) ensureFolderFullAccess(ctx context.Context, folder store
 		// the local success update failed. In that exact retry case, the official
 		// "invalid operation" response is treated as already granted.
 		if acceptExisting && createResp.Code == 1063003 {
-			feishuToolsLog.Debug(ctx, "feishu folder collaborator already exists during retry request=%s folder=%s", shortToolRequestID(folder.CreateRequestID), folder.FolderToken)
+			feishuToolsLog.Debug(ctx, "feishu folder collaborator already exists during retry request=%s folder_ref=%s", shortToolRequestID(folder.CreateRequestID), hashString(folder.FolderToken))
 			return nil
 		}
 		return fmt.Errorf("grant feishu folder full access code=%d msg=%s", createResp.Code, createResp.Msg)
@@ -511,8 +511,8 @@ func (t docsFolderTool) ensureFolderFullAccess(ctx context.Context, folder store
 
 func (t docsFolderTool) updateFolderShareBestEffort(ctx context.Context, folder store.FeishuChatFolder, state string) {
 	if err := t.store.UpdateFeishuChatFolderShareState(folder.AccountID, folder.ChatID, folder.FolderToken, state, t.currentTime()); err != nil {
-		feishuToolsLog.Warn(ctx, "update feishu folder share state failed request=%s account=%s chat=%s folder=%s state=%s: %v",
-			shortToolRequestID(folder.CreateRequestID), folder.AccountID, folder.ChatID, folder.FolderToken, state, err)
+		feishuToolsLog.Warn(ctx, "update feishu folder share state failed request=%s account=%s chat=%s folder_ref=%s state=%s: %v",
+			shortToolRequestID(folder.CreateRequestID), folder.AccountID, folder.ChatID, hashString(folder.FolderToken), state, err)
 	}
 }
 

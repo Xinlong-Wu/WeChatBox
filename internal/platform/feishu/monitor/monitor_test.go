@@ -2056,9 +2056,12 @@ func TestSDKLevelLoggerFiltersBeforeSharedLogger(t *testing.T) {
 	next = &fakeSDKLogger{}
 	logger = newSDKLevelLogger(larkcore.LogLevelDebug, next)
 	logger.Debug(context.Background(), "visible")
+	logger.Debug(context.Background(), "receive message, payload: {sensitive}")
+	logger.Debug(context.Background(), "event request: header:map[],body:{sensitive}")
+	logger.Debug(context.Background(), "card request: header:map[],body:{sensitive}")
 
 	if next.debugs != 1 {
-		t.Fatalf("debug sdk logger debug count = %d, want 1", next.debugs)
+		t.Fatalf("debug sdk logger debug count = %d, want one non-payload message", next.debugs)
 	}
 }
 

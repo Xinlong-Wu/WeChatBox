@@ -313,9 +313,16 @@ func newSDKLevelLogger(level larkcore.LogLevel, next larkcore.Logger) larkcore.L
 }
 
 func (l sdkLevelLogger) Debug(ctx context.Context, args ...interface{}) {
-	if l.next != nil && l.level <= larkcore.LogLevelDebug {
+	if l.next != nil && l.level <= larkcore.LogLevelDebug && !sdkDebugContainsRawPayload(args) {
 		l.next.Debug(ctx, args...)
 	}
+}
+
+func sdkDebugContainsRawPayload(args []interface{}) bool {
+	message := strings.ToLower(fmt.Sprint(args...))
+	return strings.Contains(message, "payload:") ||
+		strings.Contains(message, "event request:") ||
+		strings.Contains(message, "card request:")
 }
 
 func (l sdkLevelLogger) Info(ctx context.Context, args ...interface{}) {
