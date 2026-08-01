@@ -320,18 +320,35 @@ default and read-only when enabled. The first version registers
 `feishu_docs_append` are registered only when `allow_write: true` and
 `allowed_folder_tokens` is non-empty.
 
-`feishu_docs_create` is protected by a durable, one-time approval workflow. A
-tool call validates and stores the exact request, sends a Feishu Card V2
-authorization card to the current chat, and immediately returns
-`pending_approval` to the model. Only the Feishu user who triggered that LLM
-turn can approve it. The callback is also bound to the original account, chat,
-and card message; approval expires after 10 minutes and can be consumed only
-once. Approval executes document creation asynchronously and posts the result
-link back to Feishu. The approval callback responds within three seconds;
-terminal denial/expiry states can replace the card in that response, while an
-approved asynchronous operation uses the callback token and Feishu's delayed
-card-update API for its final state. Denial or expiry performs no document API
-call. The model is instructed not to retry a pending request.
+`feishu_docs_create` is protected by a durable approval workflow. A tool call
+without an active grant validates and stores the exact request, sends the
+built-in raw Feishu Card V2 form to the current chat, and immediately returns
+`pending_approval` to the model. The form offers **同意一次**, **全部同意**, and
+**拒绝**, plus an optional suggestion field. Callback values carry LingoBridge's
+approval kind, approval ID, and action; the suggestion text is not persisted or
+written to logs (only whether it was present and its character count may be
+logged). No card ID or `template_id` configuration is required.
+
+Only the Feishu user who triggered that LLM turn can act on the card. The
+callback is also bound to the original bot account, chat, and card message; the
+pending card expires after 10 minutes and can be consumed only once. **同意一次**
+executes only that stored request. **全部同意** also creates or renews a
+24-hour grant keyed by the same Feishu user (preferring `open_id`), bot account,
+`chat_id`, and `feishu_docs_create` tool. The 24 hours start when the user clicks
+the button. A later call matching every scope field bypasses the card and
+creates the document directly; a different user, bot, chat, or tool, or an
+expired grant, requires a new card. If the reusable grant cannot be saved, the
+current request still runs as a one-time approval and the Toast states that
+later calls still need approval. If the document is created but initial content
+append fails, the direct result reports partial success and tells the model not
+to create a duplicate.
+
+Card-approved document creation runs asynchronously and posts the result link
+back to Feishu. The approval callback responds within three seconds; terminal
+denial/expiry states can replace the card in that response, while an approved
+asynchronous operation uses the callback token and Feishu's delayed card-update
+API for its final state. Denial or expiry performs no document API call. The
+model is instructed not to retry a pending request.
 `feishu_docs_append` remains an immediate write tool guarded by the configured
 folder allowlist.
 
@@ -339,7 +356,9 @@ Pending requests survive process restarts in the Feishu platform SQLite
 database. The document payload is retained only while authorization is
 pending/executing and is cleared on denial, expiry, success, or failure.
 Operations interrupted while already executing are marked failed rather than
-retried automatically, avoiding duplicate document creation.
+retried automatically, avoiding duplicate document creation. Reusable grants
+contain only scope/audit timestamps and the source approval ID; matching
+expired grants are removed lazily during lookup.
 
 The app needs a message permission that can both send and update bot cards;
 `im:message:send_as_bot` is the recommended narrow permission, while
@@ -520,7 +539,7 @@ guarded tools exposed for the current PR.
 | `platforms.feishu.tools.allowed_space_ids` | `[]` | Shared Wiki space ID allowlist for Feishu tools; currently used for Docs search narrowing |
 | `platforms.feishu.tools.chat_history.enabled` | `false` | Enable `feishu_chat_history_get` for the current trusted Feishu `chat_id`; each call returns at most 100 messages |
 | `platforms.feishu.tools.docs.enabled` | `false` | Enable Feishu Docs tools for tool-capable LLM profiles |
-| `platforms.feishu.tools.docs.allow_write` | `false` | Register Feishu Docs create/append tools when enabled and the folder allowlist is configured. Create always requires requester-only, one-time card approval; append executes immediately |
+| `platforms.feishu.tools.docs.allow_write` | `false` | Register Feishu Docs create/append tools when enabled and the folder allowlist is configured. Create requires requester-only card approval unless the same user, bot account, chat, and tool have an active 24-hour grant; append executes immediately |
 | `platforms.feishu.tools.litellm.enabled` | `false` | Enable the Feishu natural-language LiteLLM account invitation tool |
 | `platforms.feishu.tools.litellm.base_url` | — | LiteLLM proxy base URL used for API calls and invitation link construction |
 | `platforms.feishu.tools.litellm.api_key` | — | LiteLLM admin/master API key used for `/user/new` and `/invitation/new` |
@@ -572,7 +591,7 @@ saved per-user model preference that no longer exists back to
         media/{safeUserId}/{safeSessionId}/
     feishu/
       data/
-        lingobridge.db                   # Feishu sessions, preferences, cursors, and durable one-time tool approvals
+        lingobridge.db                   # Feishu sessions, preferences, cursors, one-time tool approvals, and scoped 24-hour grants
         sessions/{userId}/{sessionId}.jsonl # Conversation snapshots; may include compact provider_contexts and tool_traces
     github/
       data/
@@ -588,9 +607,9 @@ specific: WeChat accounts live in SQLite because QR login returns upstream
 session state, while Feishu and GitHub accounts live only under
 `platforms.<platform>.accounts.<name>` in config. Deleting a Feishu or GitHub
 account removes the config entry and clears that account's sync cursor. Feishu
-account deletion also removes its pending/completed tool-approval metadata;
-sessions and media are left intact because current history records are not
-account-id scoped.
+account deletion also removes its pending/completed tool approvals and reusable
+approval grants. Sessions and media are left intact because current history
+records are not account-id scoped.
 
 ## Internal Architecture
 
@@ -612,7 +631,7 @@ internal/platform/github/   # GitHub account/runtime definition, App auth, PR po
 internal/core/              # Middle layer: scoped platform config/data APIs, tool orchestration, commands, sessions, LLM orchestration
 internal/tools/             # Shared tool domain interfaces and provider-neutral spec/call/result/options types
 internal/mcp/               # Global MCP host/client sessions and MCP tool adapters exposed through tools.Provider
-internal/store/             # Platform-scoped SQLite accounts/sessions/preferences/cursors/tool approvals, JSONL history, media persistence
+internal/store/             # Platform-scoped SQLite accounts/sessions/preferences/cursors/tool approvals and grants, JSONL history, media persistence
 internal/llm/               # Backend provider adapters: OpenAI-compatible and Anthropic APIs
 internal/session/           # Session manager backed by the scoped store
 internal/commands/          # Shared in-chat slash commands
