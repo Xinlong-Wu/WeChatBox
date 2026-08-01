@@ -89,16 +89,18 @@ explicitly set `platforms.github.accounts.<name>.mcp.command` and `.mcp.args`
 to point at your GitHub MCP server. LingoBridge does not write or assume
 default GitHub MCP command arguments.
 
-For Feishu, enable bot capability and long-connection event subscription for
-`im.message.receive_v1` in the Feishu Open Platform app console. Add any
-extra event subscriptions, such as `p2p_chat_create` or
+For Feishu, enable bot capability and configure long-connection delivery in
+the Feishu Open Platform app console. Subscribe to the
+`im.message.receive_v1` event. Add any extra event subscriptions, such as
+`p2p_chat_create` or
 `im.chat.access_event.bot_p2p_chat_entered_v1`, only when they are listed under
 `platforms.feishu.events` with an explicit `version`. The first version
 supports text messages in 1:1 chats and group messages that mention the bot.
-When `feishu_docs_create` is enabled, also subscribe to the built-in
-`card.action.trigger` event so the long connection can receive approval-card
-button clicks. Do not add that callback under `platforms.feishu.events`;
-LingoBridge registers its handler automatically.
+When `feishu_docs_create` is enabled, open **Events & Callbacks > Callback
+Configuration** and add the Card action trigger callback
+(`card.action.trigger`) so the same long connection can receive approval-card
+button clicks. This is a callback, not an event: do not add it under
+`platforms.feishu.events`; LingoBridge registers its SDK handler automatically.
 
 ### 4. Run
 
@@ -325,9 +327,13 @@ authorization card to the current chat, and immediately returns
 turn can approve it. The callback is also bound to the original account, chat,
 and card message; approval expires after 10 minutes and can be consumed only
 once. Approval executes document creation asynchronously and posts the result
-link back to Feishu. Denial or expiry performs no document API call. The model
-is instructed not to retry a pending request. `feishu_docs_append` remains an
-immediate write tool guarded by the configured folder allowlist.
+link back to Feishu. The approval callback responds within three seconds;
+terminal denial/expiry states can replace the card in that response, while an
+approved asynchronous operation uses the callback token and Feishu's delayed
+card-update API for its final state. Denial or expiry performs no document API
+call. The model is instructed not to retry a pending request.
+`feishu_docs_append` remains an immediate write tool guarded by the configured
+folder allowlist.
 
 Pending requests survive process restarts in the Feishu platform SQLite
 database. The document payload is retained only while authorization is
@@ -335,11 +341,27 @@ pending/executing and is cleared on denial, expiry, success, or failure.
 Operations interrupted while already executing are marked failed rather than
 retried automatically, avoiding duplicate document creation.
 
+The app needs a message permission that can both send and update bot cards;
+`im:message:send_as_bot` is the recommended narrow permission, while
+`im:message` is the broader alternative. The Card action trigger callback
+itself has no API-scope requirement. Document creation with optional initial
+content needs either the broad `docx:document` permission, or both
+`docx:document:create` and `docx:document:write_only`. Because these tools use a
+`tenant_access_token`, every configured `allowed_folder_tokens` entry used for
+creation must identify a folder created by the app, as required by the Feishu
+Create document API.
+
 The Docs tools still use the Feishu self-built app tenant token, so access
 follows the app's document permissions rather than the asking user's personal
 permissions. The card records explicit consent for that operation; it is not a
 Feishu OAuth grant. Strict per-user document access requires a separate Feishu
 OAuth flow.
+
+The card and document integration is aligned with Feishu's official
+[AI-friendly documentation index](https://open.feishu.cn/llms.txt), including
+[Card action callbacks](https://open.feishu.cn/document/feishu-cards/card-callback-communication.md),
+[delayed card updates](https://open.feishu.cn/document/server-docs/im-v1/message-card/delay-update-message-card.md),
+and [Create document](https://open.feishu.cn/document/server-docs/docs/docs/docx-v1/document/create.md).
 
 Feishu can also expose `feishu_chat_history_get` to read recent messages from
 the Feishu chat that triggered the current LLM turn. Enable it under
