@@ -455,7 +455,7 @@ func TestConfigureEventHandlersRegistersCardApprovalCallback(t *testing.T) {
 	st := openFeishuApprovalTestStore(t)
 	sender := &fakeApprovalSender{}
 	manager := newTestApprovalManager(t, st, sender)
-	b := &bot{approvals: manager, eventCommands: map[string][]string{}}
+	b := &bot{approvals: manager, cards: manager.cards, eventCommands: map[string][]string{}}
 
 	_, registered, err := b.configureEventHandlers(dispatcher.NewEventDispatcher("", ""), nil)
 	if err != nil {
@@ -483,11 +483,15 @@ func openFeishuApprovalTestStore(t *testing.T) *store.Store {
 
 func newTestApprovalManager(t *testing.T, st *store.Store, sender *fakeApprovalSender) *approvalManager {
 	t.Helper()
+	cards, err := newCardService(sender)
+	if err != nil {
+		t.Fatalf("newCardService returned error: %v", err)
+	}
 	manager, err := newApprovalManager(context.Background(), st, store.Account{
 		ID:       "feishu:cli_test",
 		Name:     "fsbot",
 		Platform: store.PlatformFeishu,
-	}, sender)
+	}, cards, sender)
 	if err != nil {
 		t.Fatalf("newApprovalManager returned error: %v", err)
 	}

@@ -77,9 +77,14 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 	}
 	sender := &sdkSender{client: restClient}
 	var approvals *approvalManager
+	var cards CardService
 	var approver feishutools.ApprovalRequester
 	if docsCreateApprovalRequired(p.config.Tools) {
-		approvals, err = newApprovalManager(ctx, p.store, acc, sender)
+		cards, err = newCardService(sender)
+		if err != nil {
+			return fmt.Errorf("initialize feishu cards for account %s: %w", acc.Name, err)
+		}
+		approvals, err = newApprovalManager(ctx, p.store, acc, cards, sender)
 		if err != nil {
 			return fmt.Errorf("initialize feishu tool approvals for account %s: %w", acc.Name, err)
 		}
@@ -107,6 +112,7 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 		botOpenID:     botOpenID,
 		eventCommands: map[string][]string{},
 		approvals:     approvals,
+		cards:         cards,
 		deduper:       newEventDeduper(defaultFeishuDedupeTTL),
 		runCtx:        ctx,
 		reactionDelay: feishuReactionClearDelay,

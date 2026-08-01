@@ -32,6 +32,7 @@ type bot struct {
 	botOpenID     string
 	eventCommands map[string][]string
 	approvals     *approvalManager
+	cards         CardService
 	deduper       *eventDeduper
 	runCtx        context.Context
 	reactionDelay time.Duration

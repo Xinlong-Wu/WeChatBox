@@ -21,13 +21,6 @@ const (
 	defaultToolApprovalGrantTTL         = 24 * time.Hour
 	defaultApprovedToolExecutionTimeout = 30 * time.Second
 	approvalNotificationTimeout         = 10 * time.Second
-	approvalCardActionKind              = "lingobridge_tool_approval"
-	approvalCardActionApproveOnce       = "approve_once"
-	approvalCardActionApproveAll        = "approve_all"
-	approvalCardActionReject            = "reject"
-	approvalCardMaxFields               = 8
-	approvalCardMaxLabelRunes           = 32
-	approvalCardMaxValueRunes           = 256
 )
 
 type toolApprovalStore interface {
@@ -62,16 +55,14 @@ func (m *approvalManager) recoverPersistedApprovals(ctx context.Context) error {
 	return nil
 }
 
-type approvalCardSender interface {
+type approvalNotifier interface {
 	SendText(ctx context.Context, chatID, text string) error
-	CreateCard(ctx context.Context, chatID, cardJSON string) (string, error)
-	UpdateCard(ctx context.Context, messageID, cardJSON string) error
-	UpdateCardAfterInteraction(ctx context.Context, callbackToken, cardJSON string) error
 }
 
 type approvalManager struct {
 	store            toolApprovalStore
-	sender           approvalCardSender
+	cards            CardService
+	notifier         approvalNotifier
 	account          store.Account
 	runCtx           context.Context
 	ttl              time.Duration
@@ -83,7 +74,7 @@ type approvalManager struct {
 	executors map[string]feishutools.ApprovalExecutor
 }
 
-func newApprovalManager(runCtx context.Context, st *store.Store, account store.Account, sender approvalCardSender) (*approvalManager, error) {
+func newApprovalManager(runCtx context.Context, st *store.Store, account store.Account, cards CardService, notifier approvalNotifier) (*approvalManager, error) {
 	if st == nil {
 		return nil, fmt.Errorf("feishu tool approval store is required")
 	}
@@ -93,15 +84,19 @@ func newApprovalManager(runCtx context.Context, st *store.Store, account store.A
 	if strings.TrimSpace(account.ID) == "" {
 		return nil, fmt.Errorf("feishu tool approval account id is required")
 	}
-	if sender == nil {
-		return nil, fmt.Errorf("feishu tool approval card sender is required")
+	if cards == nil {
+		return nil, fmt.Errorf("feishu tool approval card service is required")
+	}
+	if notifier == nil {
+		return nil, fmt.Errorf("feishu tool approval notifier is required")
 	}
 	if runCtx == nil {
 		runCtx = context.Background()
 	}
-	return &approvalManager{
+	manager := &approvalManager{
 		store:            st,
-		sender:           sender,
+		cards:            cards,
+		notifier:         notifier,
 		account:          account,
 		runCtx:           runCtx,
 		ttl:              defaultToolApprovalTTL,
@@ -109,7 +104,11 @@ func newApprovalManager(runCtx context.Context, st *store.Store, account store.A
 		executionTimeout: defaultApprovedToolExecutionTimeout,
 		now:              time.Now,
 		executors:        map[string]feishutools.ApprovalExecutor{},
-	}, nil
+	}
+	if err := cards.RegisterAction(approvalCardActionKind, manager.HandleCardAction); err != nil {
+		return nil, fmt.Errorf("register feishu tool approval card action: %w", err)
+	}
+	return manager, nil
 }
 
 func (m *approvalManager) registerExecutor(executor feishutools.ApprovalExecutor) error {
@@ -196,19 +195,14 @@ func (m *approvalManager) RequestApproval(ctx context.Context, request feishutoo
 	if err != nil {
 		return feishutools.PendingApproval{}, fmt.Errorf("persist feishu tool approval: %w", err)
 	}
-	cardJSON, err := buildPendingApprovalCard(request, approval)
-	if err != nil {
-		m.failApprovalBestEffort(ctx, approval.ID)
-		return feishutools.PendingApproval{}, fmt.Errorf("build feishu tool approval card: %w", err)
-	}
-	cardMessageID, err := m.sender.CreateCard(ctx, approval.ChatID, cardJSON)
+	cardMessageID, err := m.cards.Send(ctx, approval.ChatID, pendingApprovalCard{request: request, approval: approval})
 	if err != nil {
 		m.failApprovalBestEffort(ctx, approval.ID)
 		return feishutools.PendingApproval{}, fmt.Errorf("send feishu tool approval card: %w", err)
 	}
 	if err := m.store.SetToolApprovalCardMessageID(approval.ID, approval.AccountID, cardMessageID, m.currentTime()); err != nil {
 		m.failApprovalBestEffort(ctx, approval.ID)
-		m.updateCardBestEffort(ctx, cardMessageID, buildStatusApprovalCard("授权请求失败", "red", "授权请求未能保存，请重新发起操作。"))
+		m.updateCardBestEffort(ctx, cardMessageID, statusCard{title: "授权请求失败", template: "red", message: "授权请求未能保存，请重新发起操作。"})
 		return feishutools.PendingApproval{}, fmt.Errorf("bind feishu tool approval card: %w", err)
 	}
 	approval.CardMessageID = cardMessageID
@@ -230,7 +224,7 @@ func (m *approvalManager) HandleCardAction(ctx context.Context, event *callback.
 	}
 	if event == nil || event.Event == nil || event.Event.Operator == nil || event.Event.Context == nil {
 		feishuLog.Warn(ctx, "ignored malformed feishu tool approval callback id=%s", shortApprovalID(approvalID))
-		return approvalToast("error", "授权回调信息不完整，请重新发起操作。"), nil
+		return cardToast("error", "授权回调信息不完整，请重新发起操作。"), nil
 	}
 	operator := event.Event.Operator
 	match := store.ToolApprovalMatch{
@@ -255,7 +249,7 @@ func (m *approvalManager) HandleCardAction(ctx context.Context, event *callback.
 		return approvalCallbackResponse(
 			"success",
 			"已拒绝，本次操作不会执行。",
-			buildStatusApprovalCard("已拒绝授权", "grey", "请求已取消，未执行任何操作。"),
+			statusCard{title: "已拒绝授权", template: "grey", message: "请求已取消，未执行任何操作。"},
 		), nil
 	case approvalCardActionApproveOnce, approvalCardActionApproveAll:
 		executor := m.executor(approval.ToolName)
@@ -265,7 +259,7 @@ func (m *approvalManager) HandleCardAction(ctx context.Context, event *callback.
 			return approvalCallbackResponse(
 				"error",
 				"授权已确认，但当前服务无法执行该操作。",
-				buildStatusApprovalCard("执行失败", "red", "授权已确认，但当前服务无法执行该操作。"),
+				statusCard{title: "执行失败", template: "red", message: "授权已确认，但当前服务无法执行该操作。"},
 			), nil
 		}
 		toast := "已同意本次操作，正在执行；完成后机器人会发送结果。"
@@ -282,9 +276,9 @@ func (m *approvalManager) HandleCardAction(ctx context.Context, event *callback.
 		// using its token, so approval returns only a Toast and updates the final
 		// card state after the asynchronous operation completes.
 		go m.executeApproved(approval, executor, event.Event.Token)
-		return approvalToast("success", toast), nil
+		return cardToast("success", toast), nil
 	default:
-		return approvalToast("error", "不支持的授权操作。"), nil
+		return cardToast("error", "不支持的授权操作。"), nil
 	}
 }
 
@@ -317,26 +311,26 @@ func (m *approvalManager) handleApprovalDecisionError(ctx context.Context, appro
 	case errors.Is(err, store.ErrToolApprovalForbidden):
 		feishuLog.Warn(ctx, "rejected feishu tool approval actor mismatch id=%s account=%s callback_user=%s",
 			shortApprovalID(approvalID), m.account.ID, approvalMatchActorID(match))
-		return approvalToast("error", "只有发起请求的用户可以授权。")
+		return cardToast("error", "只有发起请求的用户可以授权。")
 	case errors.Is(err, store.ErrToolApprovalContextMismatch):
 		feishuLog.Warn(ctx, "rejected feishu tool approval context mismatch id=%s account=%s", shortApprovalID(approvalID), m.account.ID)
-		return approvalToast("error", "授权卡片与原请求不匹配。")
+		return cardToast("error", "授权卡片与原请求不匹配。")
 	case errors.Is(err, store.ErrToolApprovalExpired):
 		feishuLog.Info(ctx, "expired feishu tool approval callback id=%s account=%s tool=%s", shortApprovalID(approvalID), m.account.ID, approval.ToolName)
 		return approvalCallbackResponse(
 			"error",
 			"授权已过期，请重新发起操作。",
-			buildStatusApprovalCard("授权已过期", "grey", "该请求已超过有效期，请重新发起操作。"),
+			statusCard{title: "授权已过期", template: "grey", message: "该请求已超过有效期，请重新发起操作。"},
 		)
 	case errors.Is(err, store.ErrToolApprovalResolved):
 		feishuLog.Debug(ctx, "ignored resolved feishu tool approval callback id=%s account=%s state=%s", shortApprovalID(approvalID), m.account.ID, approval.State)
-		return approvalToast("info", "该授权请求已经处理。")
+		return cardToast("info", "该授权请求已经处理。")
 	case errors.Is(err, store.ErrToolApprovalNotFound):
 		feishuLog.Warn(ctx, "unknown feishu tool approval callback id=%s account=%s", shortApprovalID(approvalID), m.account.ID)
-		return approvalToast("error", "授权请求不存在或已失效。")
+		return cardToast("error", "授权请求不存在或已失效。")
 	default:
 		feishuLog.Error(ctx, "handle feishu tool approval callback failed id=%s account=%s: %v", shortApprovalID(approvalID), m.account.ID, err)
-		return approvalToast("error", "处理授权失败，请稍后重试。")
+		return cardToast("error", "处理授权失败，请稍后重试。")
 	}
 }
 
@@ -351,7 +345,7 @@ func (m *approvalManager) executeApproved(approval store.ToolApproval, executor 
 		}
 		feishuLog.Error(m.baseContext(), "execute approved feishu tool failed id=%s account=%s tool=%s user=%s chat=%s: %v",
 			shortApprovalID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID, err)
-		m.notifyApprovalResult(approval, callbackToken, buildStatusApprovalCard("执行失败", "red", "授权已确认，但操作执行失败。请稍后重新发起。"), "❌ 已授权，但操作执行失败。请稍后重试。")
+		m.notifyApprovalResult(approval, callbackToken, statusCard{title: "执行失败", template: "red", message: "授权已确认，但操作执行失败。请稍后重新发起。"}, "❌ 已授权，但操作执行失败。请稍后重试。")
 		return
 	}
 	if err := m.store.CompleteToolApproval(approval.ID, approval.AccountID, store.ToolApprovalStateSucceeded, completedAt); err != nil {
@@ -365,38 +359,38 @@ func (m *approvalManager) executeApproved(approval store.ToolApproval, executor 
 		feishuLog.Warn(m.baseContext(), "completed approved feishu tool with warning id=%s account=%s tool=%s user=%s chat=%s warning=%s",
 			shortApprovalID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID,
 			truncateApprovalRunes(strings.TrimSpace(result.WarningReason), approvalCardMaxValueRunes))
-		m.notifyApprovalResult(approval, callbackToken, buildStatusApprovalCard("执行完成（有警告）", "orange", message), message)
+		m.notifyApprovalResult(approval, callbackToken, statusCard{title: "执行完成（有警告）", template: "orange", message: message}, message)
 		return
 	}
 	feishuLog.Info(m.baseContext(), "completed approved feishu tool id=%s account=%s tool=%s user=%s chat=%s",
 		shortApprovalID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID)
-	m.notifyApprovalResult(approval, callbackToken, buildStatusApprovalCard("执行完成", "green", message), message)
+	m.notifyApprovalResult(approval, callbackToken, statusCard{title: "执行完成", template: "green", message: message}, message)
 }
 
-func (m *approvalManager) notifyApprovalResult(approval store.ToolApproval, callbackToken, cardJSON, message string) {
+func (m *approvalManager) notifyApprovalResult(approval store.ToolApproval, callbackToken string, card Card, message string) {
 	ctx, cancel := context.WithTimeout(m.baseContext(), approvalNotificationTimeout)
 	defer cancel()
-	m.updateCardAfterInteractionBestEffort(ctx, approval, callbackToken, cardJSON)
-	if err := m.sender.SendText(ctx, approval.ChatID, message); err != nil {
+	m.updateCardAfterInteractionBestEffort(ctx, approval, callbackToken, card)
+	if err := m.notifier.SendText(ctx, approval.ChatID, message); err != nil {
 		feishuLog.Warn(ctx, "send feishu tool approval result failed id=%s account=%s chat=%s: %v", shortApprovalID(approval.ID), approval.AccountID, approval.ChatID, err)
 	}
 }
 
-func (m *approvalManager) updateCardBestEffort(ctx context.Context, messageID, cardJSON string) {
-	if strings.TrimSpace(messageID) == "" || strings.TrimSpace(cardJSON) == "" {
+func (m *approvalManager) updateCardBestEffort(ctx context.Context, messageID string, card Card) {
+	if strings.TrimSpace(messageID) == "" || card == nil {
 		return
 	}
-	if err := m.sender.UpdateCard(ctx, messageID, cardJSON); err != nil {
+	if err := m.cards.UpdateByMessageID(ctx, messageID, card); err != nil {
 		feishuLog.Warn(ctx, "update feishu tool approval card failed message=%s: %v", messageID, err)
 	}
 }
 
-func (m *approvalManager) updateCardAfterInteractionBestEffort(ctx context.Context, approval store.ToolApproval, callbackToken, cardJSON string) {
-	if strings.TrimSpace(callbackToken) == "" || strings.TrimSpace(cardJSON) == "" {
+func (m *approvalManager) updateCardAfterInteractionBestEffort(ctx context.Context, approval store.ToolApproval, callbackToken string, card Card) {
+	if strings.TrimSpace(callbackToken) == "" || card == nil {
 		feishuLog.Warn(ctx, "skip delayed feishu tool approval card update id=%s account=%s: callback token unavailable", shortApprovalID(approval.ID), approval.AccountID)
 		return
 	}
-	if err := m.sender.UpdateCardAfterInteraction(ctx, callbackToken, cardJSON); err != nil {
+	if err := m.cards.UpdateByCallbackToken(ctx, callbackToken, card); err != nil {
 		feishuLog.Warn(ctx, "delay-update feishu tool approval card failed id=%s account=%s: %v", shortApprovalID(approval.ID), approval.AccountID, err)
 	}
 }
@@ -474,237 +468,11 @@ func normalizeApprovalRequest(request feishutools.ApprovalRequest) (feishutools.
 	return request, nil
 }
 
-func parseApprovalCardAction(event *callback.CardActionTriggerEvent) (string, string, bool) {
-	if event == nil || event.Event == nil || event.Event.Action == nil {
-		return "", "", false
-	}
-	value := event.Event.Action.Value
-	if stringApprovalValue(value, "kind") != approvalCardActionKind {
-		return "", "", false
-	}
-	approvalID := strings.TrimSpace(stringApprovalValue(value, "approval_id"))
-	action := strings.TrimSpace(stringApprovalValue(value, "action"))
-	if approvalID == "" || (action != approvalCardActionApproveOnce && action != approvalCardActionApproveAll && action != approvalCardActionReject) {
-		return approvalID, action, false
-	}
-	return approvalID, action, true
-}
-
 func approvalDecision(action string) string {
 	if action == approvalCardActionReject {
 		return store.ToolApprovalDecisionDeny
 	}
 	return store.ToolApprovalDecisionApprove
-}
-
-func approvalCardReason(event *callback.CardActionTriggerEvent) string {
-	if event == nil || event.Event == nil || event.Event.Action == nil {
-		return ""
-	}
-	return strings.TrimSpace(stringApprovalValue(event.Event.Action.FormValue, "reason"))
-}
-
-func stringApprovalValue(values map[string]interface{}, key string) string {
-	if values == nil {
-		return ""
-	}
-	value, _ := values[key].(string)
-	return value
-}
-
-func buildPendingApprovalCard(request feishutools.ApprovalRequest, approval store.ToolApproval) (string, error) {
-	lines := []string{
-		"机器人请求执行以下操作：",
-		"",
-		"**操作**：" + escapeApprovalMarkdown(request.Action),
-		"**工具**：" + escapeApprovalMarkdown(request.ToolName),
-	}
-	for _, field := range request.Fields {
-		lines = append(lines, "**"+escapeApprovalMarkdown(field.Label)+"**："+escapeApprovalMarkdown(field.Value))
-	}
-	lines = append(lines,
-		"",
-		"- **同意一次**：仅执行当前请求。",
-		"- **全部同意**：从点击起 24 小时内，同一飞书用户、机器人账号、当前对话和该工具的后续请求免审批。",
-		fmt.Sprintf("本卡片将于 %s 过期。", approval.ExpiresAt.UTC().Format("2006-01-02 15:04 UTC")),
-	)
-	value := func(action string) map[string]interface{} {
-		return map[string]interface{}{
-			"kind":        approvalCardActionKind,
-			"approval_id": approval.ID,
-			"action":      action,
-		}
-	}
-	card := map[string]interface{}{
-		"schema": "2.0",
-		"config": map[string]interface{}{"update_multi": true},
-		"header": map[string]interface{}{
-			"title":    map[string]interface{}{"tag": "plain_text", "content": "权限申请审批"},
-			"subtitle": map[string]interface{}{"tag": "plain_text", "content": request.Action},
-			"text_tag_list": []interface{}{
-				map[string]interface{}{
-					"tag":   "text_tag",
-					"text":  map[string]interface{}{"tag": "plain_text", "content": "待审批"},
-					"color": "orange",
-				},
-			},
-			"template": "blue",
-			"padding":  "12px 8px 12px 8px",
-		},
-		"body": map[string]interface{}{
-			"direction":          "vertical",
-			"horizontal_spacing": "8px",
-			"vertical_spacing":   "8px",
-			"horizontal_align":   "left",
-			"vertical_align":     "top",
-			"elements": []interface{}{
-				map[string]interface{}{
-					"tag": "form",
-					"elements": []interface{}{
-						map[string]interface{}{
-							"tag":        "markdown",
-							"content":    strings.Join(lines, "\n"),
-							"text_align": "left",
-							"text_size":  "normal",
-							"margin":     "0px 0px 0px 0px",
-							"element_id": "SnLSJiYBwzi2qzhJsFPP",
-						},
-						approvalFormButton("同意一次", "primary_filled", "Button_ruivkstdali", value(approvalCardActionApproveOnce)),
-						approvalFormButton("全部同意", "primary", "Button_zrwjazvut3f", value(approvalCardActionApproveAll)),
-						approvalReasonRow(value(approvalCardActionReject)),
-					},
-					"direction":        "vertical",
-					"horizontal_align": "left",
-					"vertical_align":   "top",
-					"padding":          "4px 0px 4px 0px",
-					"margin":           "0px 0px 0px 0px",
-					"name":             "Form_msa8n85x",
-				},
-			},
-		},
-	}
-	data, err := json.Marshal(card)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
-}
-
-func approvalFormButton(text, buttonType, name string, value map[string]interface{}) map[string]interface{} {
-	return map[string]interface{}{
-		"tag":   "button",
-		"text":  map[string]interface{}{"tag": "plain_text", "content": text},
-		"type":  buttonType,
-		"width": "default",
-		"size":  "medium",
-		"behaviors": []interface{}{
-			map[string]interface{}{"type": "callback", "value": value},
-		},
-		"form_action_type": "submit",
-		"name":             name,
-		"margin":           "4px 0px 4px 0px",
-	}
-}
-
-func approvalReasonRow(rejectValue map[string]interface{}) map[string]interface{} {
-	return map[string]interface{}{
-		"tag":                "column_set",
-		"horizontal_spacing": "8px",
-		"horizontal_align":   "left",
-		"columns": []interface{}{
-			map[string]interface{}{
-				"tag":   "column",
-				"width": "auto",
-				"elements": []interface{}{
-					map[string]interface{}{
-						"tag": "input",
-						"placeholder": map[string]interface{}{
-							"tag":     "plain_text",
-							"content": "请输入建议",
-						},
-						"default_value": "",
-						"width":         "default",
-						"name":          "reason",
-						"margin":        "0px 0px 0px 0px",
-					},
-				},
-				"direction":          "vertical",
-				"horizontal_spacing": "8px",
-				"vertical_spacing":   "8px",
-				"horizontal_align":   "left",
-				"vertical_align":     "center",
-			},
-			map[string]interface{}{
-				"tag":              "column",
-				"width":            "auto",
-				"elements":         []interface{}{approvalFormButton("拒绝", "danger", "Button_k7l2449r9dj", rejectValue)},
-				"vertical_spacing": "8px",
-				"horizontal_align": "left",
-				"vertical_align":   "top",
-			},
-		},
-		"margin": "0px 0px 0px 0px",
-	}
-}
-
-func buildStatusApprovalCard(title, template, message string) string {
-	card := map[string]interface{}{
-		"schema": "2.0",
-		"config": map[string]interface{}{"update_multi": true},
-		"header": map[string]interface{}{
-			"title":    map[string]interface{}{"tag": "plain_text", "content": title},
-			"template": template,
-		},
-		"body": map[string]interface{}{
-			"direction": "vertical",
-			"elements": []interface{}{
-				map[string]interface{}{"tag": "markdown", "content": message},
-			},
-		},
-	}
-	data, err := json.Marshal(card)
-	if err != nil {
-		return ""
-	}
-	return string(data)
-}
-
-func approvalToast(toastType, content string) *callback.CardActionTriggerResponse {
-	return &callback.CardActionTriggerResponse{
-		Toast: &callback.Toast{Type: toastType, Content: content},
-	}
-}
-
-func approvalCallbackResponse(toastType, content, cardJSON string) *callback.CardActionTriggerResponse {
-	response := approvalToast(toastType, content)
-	var cardData map[string]interface{}
-	if err := json.Unmarshal([]byte(cardJSON), &cardData); err == nil && cardData != nil {
-		response.Card = &callback.Card{Type: "raw", Data: cardData}
-	}
-	return response
-}
-
-func escapeApprovalMarkdown(value string) string {
-	replacer := strings.NewReplacer(
-		"\\", "\\\\",
-		"*", "\\*",
-		"_", "\\_",
-		"~", "\\~",
-		"`", "\\`",
-		"[", "\\[",
-		"]", "\\]",
-		"<", "\\<",
-		">", "\\>",
-	)
-	return replacer.Replace(value)
-}
-
-func truncateApprovalRunes(value string, limit int) string {
-	if limit <= 0 || utf8.RuneCountInString(value) <= limit {
-		return value
-	}
-	runes := []rune(value)
-	return string(runes[:limit-1]) + "…"
 }
 
 func approvalActorID(approval store.ToolApproval) string {

@@ -51,8 +51,8 @@ func (b *bot) configureEventHandlers(d *dispatcher.EventDispatcher, events []fei
 		registeredHandlers[feishuEventVersionV2+":"+name] = true
 		registered = append(registered, name)
 	}
-	if b.approvals != nil {
-		d = d.OnP2CardActionTrigger(b.approvals.HandleCardAction)
+	if b.cards != nil {
+		d = d.OnP2CardActionTrigger(b.cards.HandleAction)
 		registeredHandlers[feishuEventVersionV2+":"+feishuCardActionEvent] = true
 		registered = append(registered, feishuCardActionEvent)
 	}
