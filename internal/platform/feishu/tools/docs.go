@@ -24,6 +24,7 @@ const (
 	createToolName = "feishu_docs_create"
 	appendToolName = "feishu_docs_append"
 	docxTextBlock  = 2
+	maxDocxTitle   = 800
 )
 
 type docsTool struct {
@@ -318,6 +319,9 @@ func (t docsTool) parseCreateArgs(raw json.RawMessage) (createArgs, error) {
 	if args.Title == "" {
 		return createArgs{}, fmt.Errorf("title is required")
 	}
+	if utf8.RuneCountInString(args.Title) > maxDocxTitle {
+		return createArgs{}, fmt.Errorf("title must not exceed %d characters", maxDocxTitle)
+	}
 	if !allowedValue(args.FolderToken, t.cfg.AllowedFolderTokens) {
 		return createArgs{}, fmt.Errorf("folder_token %q is not allowed", args.FolderToken)
 	}
@@ -522,7 +526,7 @@ func docsCreateSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        createToolName,
 		Description: "Request one-time authorization from the current Feishu user to create a docx document in an allowed folder. Returns pending_approval immediately; the document is created asynchronously only after the requester approves the Feishu card.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"title":{"type":"string"},"content":{"type":"string"},"folder_token":{"type":"string","description":"Must be listed in platforms.feishu.tools.allowed_folder_tokens."}},"required":["title","folder_token"],"additionalProperties":false}`),
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"title":{"type":"string","minLength":1,"maxLength":800},"content":{"type":"string"},"folder_token":{"type":"string","description":"Must be listed in platforms.feishu.tools.allowed_folder_tokens."}},"required":["title","folder_token"],"additionalProperties":false}`),
 	}
 }
 

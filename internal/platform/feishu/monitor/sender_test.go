@@ -218,6 +218,9 @@ func TestSDKSenderRejectsInvalidInteractiveCard(t *testing.T) {
 	if _, err := sender.CreateCard(t.Context(), "oc_chat", "not-json"); err == nil {
 		t.Fatal("CreateCard returned nil error for invalid JSON")
 	}
+	if _, err := sender.CreateCard(t.Context(), "oc_chat", "[]"); err == nil {
+		t.Fatal("CreateCard returned nil error for a non-object card")
+	}
 	if err := sender.UpdateCard(t.Context(), "om_card", ""); err == nil {
 		t.Fatal("UpdateCard returned nil error for empty JSON")
 	}
@@ -389,7 +392,6 @@ func TestSDKSenderUpdatesPostRichTextMessage(t *testing.T) {
 
 func TestSDKSenderUpdatesInteractiveCard(t *testing.T) {
 	var updateRequest struct {
-		MsgType string `json:"msg_type"`
 		Content string `json:"content"`
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -402,8 +404,8 @@ func TestSDKSenderUpdatesInteractiveCard(t *testing.T) {
 				"expire":              7200,
 			})
 		case "/open-apis/im/v1/messages/om_card":
-			if r.Method != http.MethodPut {
-				t.Fatalf("method = %s, want PUT", r.Method)
+			if r.Method != http.MethodPatch {
+				t.Fatalf("method = %s, want PATCH", r.Method)
 			}
 			if err := json.NewDecoder(r.Body).Decode(&updateRequest); err != nil {
 				t.Fatalf("decode update request: %v", err)
@@ -429,8 +431,51 @@ func TestSDKSenderUpdatesInteractiveCard(t *testing.T) {
 	if err := sender.UpdateCard(t.Context(), "om_card", card); err != nil {
 		t.Fatalf("UpdateCard returned error: %v", err)
 	}
-	if updateRequest.MsgType != "interactive" || updateRequest.Content != card {
-		t.Fatalf("update request = %#v, want interactive card", updateRequest)
+	if updateRequest.Content != card {
+		t.Fatalf("update request = %#v, want message-card content", updateRequest)
+	}
+}
+
+func TestSDKSenderDelayUpdatesInteractiveCardAfterCallback(t *testing.T) {
+	var updateRequest struct {
+		Token string                 `json:"token"`
+		Card  map[string]interface{} `json:"card"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/v3/token", "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "ok",
+				"tenant_access_token": "tenant-token",
+				"expire":              7200,
+			})
+		case "/open-apis/interactive/v1/card/update":
+			if r.Method != http.MethodPost {
+				t.Fatalf("method = %s, want POST", r.Method)
+			}
+			if err := json.NewDecoder(r.Body).Decode(&updateRequest); err != nil {
+				t.Fatalf("decode delayed card update request: %v", err)
+			}
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok"})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	sender := &sdkSender{client: client}
+	card := `{"schema":"2.0","config":{"update_multi":true},"body":{"elements":[]}}`
+	if err := sender.UpdateCardAfterInteraction(t.Context(), "c_callback", card); err != nil {
+		t.Fatalf("UpdateCardAfterInteraction returned error: %v", err)
+	}
+	if updateRequest.Token != "c_callback" || updateRequest.Card["schema"] != "2.0" {
+		t.Fatalf("delayed update request = %#v, want callback token and raw Card V2 object", updateRequest)
 	}
 }
 

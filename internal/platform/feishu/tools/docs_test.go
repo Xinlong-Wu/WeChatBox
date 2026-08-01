@@ -98,6 +98,29 @@ func TestDocsCreateToolReturnsPendingApprovalWithoutCallingFeishuDocs(t *testing
 	}
 }
 
+func TestDocsCreateToolRejectsTitleLongerThanFeishuLimit(t *testing.T) {
+	approver := &fakeApprovalRequester{}
+	cfg := Config{
+		AllowedFolderTokens: []string{"fld_token"},
+		Docs:                DocsToolsConfig{Enabled: true, AllowWrite: true},
+	}
+	tool := findDocsTool(t, NewDocsTools(&lark.Client{}, cfg, approver), createToolName)
+	args, err := json.Marshal(createArgs{
+		Title:       strings.Repeat("文", maxDocxTitle+1),
+		FolderToken: "fld_token",
+	})
+	if err != nil {
+		t.Fatalf("marshal create args: %v", err)
+	}
+	result := tool.Execute(context.Background(), tooltypes.Call{ID: "call_1", Name: createToolName, Arguments: args})
+	if !result.IsError || !strings.Contains(result.Content, "must not exceed 800 characters") {
+		t.Fatalf("Execute result = %#v, want official title-length validation error", result)
+	}
+	if approver.request.ToolName != "" {
+		t.Fatalf("approval request = %#v, want no card for invalid title", approver.request)
+	}
+}
+
 func TestDocsCreateApprovedExecutionCreatesDocument(t *testing.T) {
 	var createRequest struct {
 		Title       string `json:"title"`

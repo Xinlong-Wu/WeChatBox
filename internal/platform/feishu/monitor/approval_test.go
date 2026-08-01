@@ -50,6 +50,13 @@ func (f *fakeApprovalSender) UpdateCard(_ context.Context, messageID, cardJSON s
 	return f.updateErr
 }
 
+func (f *fakeApprovalSender) UpdateCardAfterInteraction(_ context.Context, callbackToken, cardJSON string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.updates = append(f.updates, updatedText{messageID: callbackToken, text: cardJSON})
+	return f.updateErr
+}
+
 func (f *fakeApprovalSender) snapshot() (cards []sentText, updates []updatedText, messages []sentText) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -187,8 +194,8 @@ func TestApprovalManagerApprovesExecutesAndNotifiesOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HandleCardAction returned error: %v", err)
 	}
-	if resp == nil || resp.Toast == nil || resp.Toast.Type != "success" {
-		t.Fatalf("response = %#v, want success toast", resp)
+	if resp == nil || resp.Toast == nil || resp.Toast.Type != "success" || resp.Card != nil {
+		t.Fatalf("response = %#v, want toast-only response before official delayed update", resp)
 	}
 	select {
 	case <-executor.done:
@@ -196,7 +203,7 @@ func TestApprovalManagerApprovesExecutesAndNotifiesOnce(t *testing.T) {
 		t.Fatal("approved executor was not called")
 	}
 	waitForApprovalState(t, st, pending.ID, store.ToolApprovalStateSucceeded)
-	waitForApprovalNotifications(t, sender, 2, 1)
+	waitForApprovalNotifications(t, sender, 1, 1)
 
 	calls, payload := executor.snapshot()
 	if calls != 1 || !strings.Contains(string(payload), "Quarterly plan") {
@@ -210,8 +217,8 @@ func TestApprovalManagerApprovesExecutesAndNotifiesOnce(t *testing.T) {
 		t.Fatalf("completed approval retained payload: %#v", record)
 	}
 	_, updates, messages := sender.snapshot()
-	if len(updates) < 2 || !strings.Contains(updates[0].text, "正在执行") || !strings.Contains(updates[len(updates)-1].text, "执行完成") {
-		t.Fatalf("card updates = %#v, want processing then completed", updates)
+	if len(updates) != 1 || updates[0].messageID != "c_callback" || !strings.Contains(updates[0].text, "执行完成") {
+		t.Fatalf("card updates = %#v, want one callback-token delayed completion update", updates)
 	}
 	if len(messages) != 1 || !strings.Contains(messages[0].text, "docs.feishu.cn/docx/doc123") {
 		t.Fatalf("messages = %#v, want created document notification", messages)
@@ -243,11 +250,14 @@ func TestApprovalManagerDenyDoesNotExecute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HandleCardAction returned error: %v", err)
 	}
-	if resp == nil || resp.Toast == nil || resp.Toast.Type != "success" || !strings.Contains(resp.Toast.Content, "不会执行") {
-		t.Fatalf("response = %#v, want denied toast", resp)
+	if resp == nil || resp.Toast == nil || resp.Toast.Type != "success" || !strings.Contains(resp.Toast.Content, "不会执行") || !approvalResponseCardContains(t, resp, "已拒绝授权") {
+		t.Fatalf("response = %#v, want denied toast and immediate terminal card", resp)
 	}
 	waitForApprovalState(t, st, pending.ID, store.ToolApprovalStateDenied)
-	waitForApprovalNotifications(t, sender, 1, 0)
+	_, updates, _ := sender.snapshot()
+	if len(updates) != 0 {
+		t.Fatalf("card updates = %#v, want denial handled in callback response", updates)
+	}
 	if calls, _ := executor.snapshot(); calls != 0 {
 		t.Fatalf("executor calls = %d, want 0", calls)
 	}
@@ -350,6 +360,7 @@ func approvalCardEvent(approvalID, decision, openID, chatID, messageID string) *
 	return &callback.CardActionTriggerEvent{
 		Event: &callback.CardActionTriggerRequest{
 			Operator: &callback.Operator{OpenID: openID, UserID: &userID},
+			Token:    "c_callback",
 			Context:  &callback.Context{OpenChatID: chatID, OpenMessageID: messageID},
 			Action: &callback.CallBackAction{Value: map[string]interface{}{
 				"kind":        approvalCardActionKind,
@@ -358,6 +369,18 @@ func approvalCardEvent(approvalID, decision, openID, chatID, messageID string) *
 			}},
 		},
 	}
+}
+
+func approvalResponseCardContains(t *testing.T, response *callback.CardActionTriggerResponse, want string) bool {
+	t.Helper()
+	if response == nil || response.Card == nil || response.Card.Type != "raw" || response.Card.Data == nil {
+		return false
+	}
+	data, err := json.Marshal(response.Card.Data)
+	if err != nil {
+		t.Fatalf("marshal approval response card: %v", err)
+	}
+	return strings.Contains(string(data), want)
 }
 
 func assertApprovalCardActions(t *testing.T, cardJSON, approvalID string) {
@@ -369,22 +392,38 @@ func assertApprovalCardActions(t *testing.T, cardJSON, approvalID string) {
 	if card["schema"] != "2.0" {
 		t.Fatalf("card schema = %#v, want 2.0", card["schema"])
 	}
+	config, _ := card["config"].(map[string]interface{})
+	if config["update_multi"] != true {
+		t.Fatalf("card config = %#v, want shared Card V2 update_multi=true", config)
+	}
 	body, _ := card["body"].(map[string]interface{})
 	elements, _ := body["elements"].([]interface{})
 	if len(elements) != 2 {
 		t.Fatalf("card elements = %#v, want markdown and button columns", elements)
 	}
 	columnsElement, _ := elements[1].(map[string]interface{})
+	if columnsElement["tag"] != "column_set" || columnsElement["horizontal_spacing"] != "8px" {
+		t.Fatalf("button container = %#v, want official Card V2 column_set", columnsElement)
+	}
 	columns, _ := columnsElement["columns"].([]interface{})
 	if len(columns) != 2 {
 		t.Fatalf("card columns = %#v, want approve/deny", columns)
 	}
 	for i, wantDecision := range []string{store.ToolApprovalDecisionApprove, store.ToolApprovalDecisionDeny} {
 		column, _ := columns[i].(map[string]interface{})
+		if column["tag"] != "column" || column["width"] != "weighted" || column["weight"] != float64(1) {
+			t.Fatalf("button column %d = %#v, want weighted Card V2 column", i, column)
+		}
 		buttonElements, _ := column["elements"].([]interface{})
 		button, _ := buttonElements[0].(map[string]interface{})
+		if button["tag"] != "button" || button["width"] != "fill" {
+			t.Fatalf("button %d = %#v, want Card V2 button", i, button)
+		}
 		behaviors, _ := button["behaviors"].([]interface{})
 		behavior, _ := behaviors[0].(map[string]interface{})
+		if behavior["type"] != "callback" {
+			t.Fatalf("button %d behavior = %#v, want callback behavior", i, behavior)
+		}
 		value, _ := behavior["value"].(map[string]interface{})
 		if value["approval_id"] != approvalID || value["decision"] != wantDecision || value["kind"] != approvalCardActionKind {
 			t.Fatalf("button %d callback value = %#v", i, value)
