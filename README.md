@@ -95,6 +95,10 @@ extra event subscriptions, such as `p2p_chat_create` or
 `im.chat.access_event.bot_p2p_chat_entered_v1`, only when they are listed under
 `platforms.feishu.events` with an explicit `version`. The first version
 supports text messages in 1:1 chats and group messages that mention the bot.
+When `feishu_docs_create` is enabled, also subscribe to the built-in
+`card.action.trigger` event so the long connection can receive approval-card
+button clicks. Do not add that callback under `platforms.feishu.events`;
+LingoBridge registers its handler automatically.
 
 ### 4. Run
 
@@ -312,10 +316,30 @@ document tool package under `platforms.feishu.tools.docs`. They are disabled by
 default and read-only when enabled. The first version registers
 `feishu_docs_search` and `feishu_docs_read`; `feishu_docs_create` and
 `feishu_docs_append` are registered only when `allow_write: true` and
-`allowed_folder_tokens` is non-empty. These tools use the Feishu self-built app
-tenant token, so access follows the app's document permissions rather than the
-asking user's personal permissions. Strict per-user document access requires a
-separate Feishu OAuth flow.
+`allowed_folder_tokens` is non-empty.
+
+`feishu_docs_create` is protected by a durable, one-time approval workflow. A
+tool call validates and stores the exact request, sends a Feishu Card V2
+authorization card to the current chat, and immediately returns
+`pending_approval` to the model. Only the Feishu user who triggered that LLM
+turn can approve it. The callback is also bound to the original account, chat,
+and card message; approval expires after 10 minutes and can be consumed only
+once. Approval executes document creation asynchronously and posts the result
+link back to Feishu. Denial or expiry performs no document API call. The model
+is instructed not to retry a pending request. `feishu_docs_append` remains an
+immediate write tool guarded by the configured folder allowlist.
+
+Pending requests survive process restarts in the Feishu platform SQLite
+database. The document payload is retained only while authorization is
+pending/executing and is cleared on denial, expiry, success, or failure.
+Operations interrupted while already executing are marked failed rather than
+retried automatically, avoiding duplicate document creation.
+
+The Docs tools still use the Feishu self-built app tenant token, so access
+follows the app's document permissions rather than the asking user's personal
+permissions. The card records explicit consent for that operation; it is not a
+Feishu OAuth grant. Strict per-user document access requires a separate Feishu
+OAuth flow.
 
 Feishu can also expose `feishu_chat_history_get` to read recent messages from
 the Feishu chat that triggered the current LLM turn. Enable it under
@@ -465,7 +489,7 @@ guarded tools exposed for the current PR.
 | `platforms.feishu.accounts.<name>.app_id` | — | Feishu app ID for account `<name>` |
 | `platforms.feishu.accounts.<name>.app_secret` | — | Feishu app secret for account `<name>` |
 | `platforms.feishu.accounts.<name>.base_url` | `https://open.feishu.cn` | Feishu Open Platform base URL |
-| `platforms.feishu.events[].name` | — | Extra Feishu event to register; v1.0 supports customized event names such as `p2p_chat_create`, and v2.0 currently supports `im.chat.access_event.bot_p2p_chat_entered_v1` |
+| `platforms.feishu.events[].name` | — | Extra Feishu event to register; v1.0 supports customized event names such as `p2p_chat_create`, and v2.0 currently supports `im.chat.access_event.bot_p2p_chat_entered_v1`. Built-in `im.message.receive_v1` and `card.action.trigger` handlers must not be configured here |
 | `platforms.feishu.events[].version` | — | Required Feishu event protocol version: `"1.0"` uses `OnCustomizedEvent`; `"2.0"` uses a built-in `OnP2...` mapping |
 | `platforms.feishu.events[].run` | — | Shell command string or list of shell command strings to run for the event |
 | `platforms.feishu.tools.max_results` | `5` | Shared maximum result count for Feishu tools that return lists, including `feishu_docs_search` |
@@ -474,7 +498,7 @@ guarded tools exposed for the current PR.
 | `platforms.feishu.tools.allowed_space_ids` | `[]` | Shared Wiki space ID allowlist for Feishu tools; currently used for Docs search narrowing |
 | `platforms.feishu.tools.chat_history.enabled` | `false` | Enable `feishu_chat_history_get` for the current trusted Feishu `chat_id`; each call returns at most 100 messages |
 | `platforms.feishu.tools.docs.enabled` | `false` | Enable Feishu Docs tools for tool-capable LLM profiles |
-| `platforms.feishu.tools.docs.allow_write` | `false` | Register Feishu Docs create/append tools when enabled and folder allowlist is configured |
+| `platforms.feishu.tools.docs.allow_write` | `false` | Register Feishu Docs create/append tools when enabled and the folder allowlist is configured. Create always requires requester-only, one-time card approval; append executes immediately |
 | `platforms.feishu.tools.litellm.enabled` | `false` | Enable the Feishu natural-language LiteLLM account invitation tool |
 | `platforms.feishu.tools.litellm.base_url` | — | LiteLLM proxy base URL used for API calls and invitation link construction |
 | `platforms.feishu.tools.litellm.api_key` | — | LiteLLM admin/master API key used for `/user/new` and `/invitation/new` |
@@ -526,7 +550,7 @@ saved per-user model preference that no longer exists back to
         media/{safeUserId}/{safeSessionId}/
     feishu/
       data/
-        lingobridge.db                   # Feishu sessions, user preferences, sync cursors, and legacy account rows
+        lingobridge.db                   # Feishu sessions, preferences, cursors, and durable one-time tool approvals
         sessions/{userId}/{sessionId}.jsonl # Conversation snapshots; may include compact provider_contexts and tool_traces
     github/
       data/
@@ -541,9 +565,10 @@ read WeChat data through the storage API. Account ownership is platform
 specific: WeChat accounts live in SQLite because QR login returns upstream
 session state, while Feishu and GitHub accounts live only under
 `platforms.<platform>.accounts.<name>` in config. Deleting a Feishu or GitHub
-account removes the config entry, clears that account's sync cursor, and removes
-a matching legacy SQLite account row if one exists; sessions and media are left
-intact because current history records are not account-id scoped.
+account removes the config entry and clears that account's sync cursor. Feishu
+account deletion also removes its pending/completed tool-approval metadata;
+sessions and media are left intact because current history records are not
+account-id scoped.
 
 ## Internal Architecture
 
@@ -559,13 +584,13 @@ internal/platform/wechat/   # WeChat account/runtime definition and frontend ada
 internal/platform/wechat/monitor/ # WeChat monitor, reply sender, and media handling
 internal/platform/feishu/   # Feishu account config schema and frontend support types
 internal/platform/feishu/definition/ # Feishu account/runtime definition assembly
-internal/platform/feishu/monitor/ # Feishu long-connection monitor, message/text-stream adapter, and event hooks
-internal/platform/feishu/tools/ # Feishu platform-level LLM tools, including Docs helpers and LiteLLM account invitations
+internal/platform/feishu/monitor/ # Feishu long-connection monitor, message/text-stream adapter, approval cards/callbacks, and event hooks
+internal/platform/feishu/tools/ # Feishu platform-level LLM tools and approval executor contracts, including Docs helpers and LiteLLM invitations
 internal/platform/github/   # GitHub account/runtime definition, App auth, PR polling, review prompt construction, and MCP review tool guards
 internal/core/              # Middle layer: scoped platform config/data APIs, tool orchestration, commands, sessions, LLM orchestration
 internal/tools/             # Shared tool domain interfaces and provider-neutral spec/call/result/options types
 internal/mcp/               # Global MCP host/client sessions and MCP tool adapters exposed through tools.Provider
-internal/store/             # Platform-scoped SQLite accounts/sessions/preferences/cursors, JSONL history, media persistence
+internal/store/             # Platform-scoped SQLite accounts/sessions/preferences/cursors/tool approvals, JSONL history, media persistence
 internal/llm/               # Backend provider adapters: OpenAI-compatible and Anthropic APIs
 internal/session/           # Session manager backed by the scoped store
 internal/commands/          # Shared in-chat slash commands
