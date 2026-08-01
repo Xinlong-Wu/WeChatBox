@@ -139,6 +139,7 @@ type writeOutput struct {
 	Title      string `json:"title,omitempty"`
 	URL        string `json:"url,omitempty"`
 	Appended   bool   `json:"appended,omitempty"`
+	Warning    string `json:"warning,omitempty"`
 }
 
 type pendingApprovalOutput struct {
@@ -250,6 +251,20 @@ func (t docsTool) create(ctx context.Context, raw json.RawMessage) (string, erro
 	}
 	if t.approver == nil {
 		return "", fmt.Errorf("feishu document creation approval workflow is unavailable")
+	}
+	granted, err := t.approver.HasActiveGrant(ctx, createToolName)
+	if err != nil {
+		return "", fmt.Errorf("check feishu document creation approval: %w", err)
+	}
+	if granted {
+		out, createErr := t.createDocument(ctx, args)
+		if createErr != nil {
+			if out.DocumentID == "" {
+				return "", createErr
+			}
+			out.Warning = fmt.Sprintf("文档已创建，但初始内容写入失败：%v。请勿重复创建，可稍后追加内容。", createErr)
+		}
+		return marshalToolOutput(out)
 	}
 	payload, err := json.Marshal(args)
 	if err != nil {
@@ -525,7 +540,7 @@ func docsReadSpec() tooltypes.Spec {
 func docsCreateSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        createToolName,
-		Description: "Request one-time authorization from the current Feishu user to create a docx document in an allowed folder. Returns pending_approval immediately; the document is created asynchronously only after the requester approves the Feishu card.",
+		Description: "Create a docx document in an allowed Feishu folder. A matching reusable grant executes immediately; otherwise the tool returns pending_approval and creates asynchronously after the requester approves the Feishu card.",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"title":{"type":"string","minLength":1,"maxLength":800},"content":{"type":"string"},"folder_token":{"type":"string","description":"Must be listed in platforms.feishu.tools.allowed_folder_tokens."}},"required":["title","folder_token"],"additionalProperties":false}`),
 	}
 }

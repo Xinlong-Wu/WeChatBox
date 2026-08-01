@@ -15,9 +15,19 @@ import (
 )
 
 type fakeApprovalRequester struct {
-	request ApprovalRequest
-	pending PendingApproval
-	err     error
+	request     ApprovalRequest
+	pending     PendingApproval
+	err         error
+	active      bool
+	activeErr   error
+	checkedTool string
+	checks      int
+}
+
+func (f *fakeApprovalRequester) HasActiveGrant(_ context.Context, toolName string) (bool, error) {
+	f.checkedTool = toolName
+	f.checks++
+	return f.active, f.activeErr
 }
 
 func (f *fakeApprovalRequester) RequestApproval(_ context.Context, request ApprovalRequest) (PendingApproval, error) {
@@ -81,6 +91,9 @@ func TestDocsCreateToolReturnsPendingApprovalWithoutCallingFeishuDocs(t *testing
 	if output.Status != "pending_approval" || output.ApprovalID != "approval_123" || output.ExpiresAt != expiresAt.Format(time.RFC3339) || !strings.Contains(output.Message, "请勿重复调用") {
 		t.Fatalf("pending output = %#v", output)
 	}
+	if approver.checks != 1 || approver.checkedTool != createToolName {
+		t.Fatalf("approval grant checks = %d tool=%q, want one create check", approver.checks, approver.checkedTool)
+	}
 	if approver.request.ToolName != createToolName || approver.request.Action != "创建飞书文档" {
 		t.Fatalf("approval request = %#v", approver.request)
 	}
@@ -95,6 +108,112 @@ func TestDocsCreateToolReturnsPendingApprovalWithoutCallingFeishuDocs(t *testing
 		if strings.Contains(field.Value, "private body") {
 			t.Fatalf("approval field leaked document content: %#v", field)
 		}
+	}
+}
+
+func TestDocsCreateToolUsesActiveGrantWithoutSendingCard(t *testing.T) {
+	var createCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/v3/token", "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "ok",
+				"tenant_access_token": "tenant-token",
+				"expire":              7200,
+			})
+		case "/open-apis/docx/v1/documents":
+			createCalls++
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{"document": map[string]any{"document_id": "doxcnactive123"}},
+			})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	approver := &fakeApprovalRequester{active: true}
+	cfg := Config{
+		AllowedFolderTokens: []string{"fld_token"},
+		Docs:                DocsToolsConfig{Enabled: true, AllowWrite: true},
+	}
+	tool := findDocsTool(t, NewDocsTools(client, cfg, approver), createToolName)
+	result := tool.Execute(context.Background(), tooltypes.Call{
+		ID:        "call_1",
+		Name:      createToolName,
+		Arguments: json.RawMessage(`{"title":"Quarterly plan","folder_token":"fld_token"}`),
+	})
+	if result.IsError {
+		t.Fatalf("Execute result = %#v, want direct create", result)
+	}
+	var output writeOutput
+	if err := json.Unmarshal([]byte(result.Content), &output); err != nil {
+		t.Fatalf("unmarshal create output: %v", err)
+	}
+	if output.DocumentID != "doxcnactive123" || output.Warning != "" || createCalls != 1 {
+		t.Fatalf("create output/calls = %#v/%d", output, createCalls)
+	}
+	if approver.request.ToolName != "" {
+		t.Fatalf("approval request = %#v, want no card for active grant", approver.request)
+	}
+}
+
+func TestDocsCreateToolActiveGrantReportsPartialSuccessWithoutRetrySignal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/oauth/v3/token" || r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "ok",
+				"tenant_access_token": "tenant-token",
+				"expire":              7200,
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents":
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{"document": map[string]any{"document_id": "doxcnactive123"}},
+			})
+		case strings.Contains(r.URL.Path, "/open-apis/docx/v1/documents/doxcnactive123/blocks/"):
+			writeJSON(t, w, map[string]any{"code": 99991672, "msg": "append denied"})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	cfg := Config{
+		AllowedFolderTokens: []string{"fld_token"},
+		Docs:                DocsToolsConfig{Enabled: true, AllowWrite: true},
+	}
+	tool := findDocsTool(t, NewDocsTools(client, cfg, &fakeApprovalRequester{active: true}), createToolName)
+	result := tool.Execute(context.Background(), tooltypes.Call{
+		ID:        "call_1",
+		Name:      createToolName,
+		Arguments: json.RawMessage(`{"title":"Quarterly plan","content":"body","folder_token":"fld_token"}`),
+	})
+	if result.IsError {
+		t.Fatalf("Execute result = %#v, want partial success", result)
+	}
+	var output writeOutput
+	if err := json.Unmarshal([]byte(result.Content), &output); err != nil {
+		t.Fatalf("unmarshal partial create output: %v", err)
+	}
+	if output.DocumentID != "doxcnactive123" || !strings.Contains(output.Warning, "请勿重复创建") || !strings.Contains(output.Warning, "append denied") {
+		t.Fatalf("partial create output = %#v", output)
 	}
 }
 
@@ -118,6 +237,9 @@ func TestDocsCreateToolRejectsTitleLongerThanFeishuLimit(t *testing.T) {
 	}
 	if approver.request.ToolName != "" {
 		t.Fatalf("approval request = %#v, want no card for invalid title", approver.request)
+	}
+	if approver.checks != 0 {
+		t.Fatalf("approval grant checks = %d, want validation before lookup", approver.checks)
 	}
 }
 

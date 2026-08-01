@@ -147,6 +147,49 @@ func TestApprovalManagerRequestsBoundCardWithoutDisplayingPayload(t *testing.T) 
 	}
 }
 
+func TestApprovalManagerActiveGrantRequiresExactUserChatAndTool(t *testing.T) {
+	st := openFeishuApprovalTestStore(t)
+	manager := newTestApprovalManager(t, st, &fakeApprovalSender{})
+	now := manager.currentTime()
+	if _, err := st.UpsertToolApprovalGrant(store.ToolApprovalGrant{
+		ToolApprovalGrantScope: store.ToolApprovalGrantScope{
+			AccountID: "feishu:cli_test",
+			ToolName:  "feishu_docs_create",
+			ActorType: store.ToolApprovalActorTypeOpenID,
+			ActorID:   "ou_requester",
+			ChatID:    "oc_chat",
+		},
+		SourceApprovalID: "approval_all",
+		CreatedAt:        now,
+		ExpiresAt:        now.Add(24 * time.Hour),
+	}); err != nil {
+		t.Fatalf("UpsertToolApprovalGrant returned error: %v", err)
+	}
+
+	active, err := manager.HasActiveGrant(approvalRequestContext(), "feishu_docs_create")
+	if err != nil || !active {
+		t.Fatalf("exact grant returned active=%v err=%v", active, err)
+	}
+	wrongUser := feishutools.WithActor(context.Background(), feishutools.Actor{OpenID: "ou_other", UserID: "u_requester"})
+	wrongUser = feishutools.WithChatContext(wrongUser, feishutools.ChatContext{ChatID: "oc_chat"})
+	if active, err := manager.HasActiveGrant(wrongUser, "feishu_docs_create"); err != nil || active {
+		t.Fatalf("wrong-user grant returned active=%v err=%v", active, err)
+	}
+	wrongChat := feishutools.WithActor(context.Background(), feishutools.Actor{OpenID: "ou_requester"})
+	wrongChat = feishutools.WithChatContext(wrongChat, feishutools.ChatContext{ChatID: "oc_other"})
+	if active, err := manager.HasActiveGrant(wrongChat, "feishu_docs_create"); err != nil || active {
+		t.Fatalf("wrong-chat grant returned active=%v err=%v", active, err)
+	}
+	if active, err := manager.HasActiveGrant(approvalRequestContext(), "other_tool"); err != nil || active {
+		t.Fatalf("wrong-tool grant returned active=%v err=%v", active, err)
+	}
+
+	manager.now = func() time.Time { return now.Add(24 * time.Hour) }
+	if active, err := manager.HasActiveGrant(approvalRequestContext(), "feishu_docs_create"); err != nil || active {
+		t.Fatalf("expired grant returned active=%v err=%v", active, err)
+	}
+}
+
 func TestApprovalManagerOnlyRequesterCanApprove(t *testing.T) {
 	st := openFeishuApprovalTestStore(t)
 	sender := &fakeApprovalSender{}

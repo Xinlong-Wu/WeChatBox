@@ -34,8 +34,9 @@ type ApprovalExecution struct {
 	WarningReason string
 }
 
-// ApprovalRequester creates a one-time Feishu authorization request for a tool invocation.
+// ApprovalRequester checks reusable authorization and creates a Feishu approval request when needed.
 type ApprovalRequester interface {
+	HasActiveGrant(ctx context.Context, toolName string) (bool, error)
 	RequestApproval(ctx context.Context, request ApprovalRequest) (PendingApproval, error)
 }
 

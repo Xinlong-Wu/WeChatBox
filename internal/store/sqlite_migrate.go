@@ -47,6 +47,18 @@ func (s *Store) migrate() error {
 			expires_at_ms INTEGER NOT NULL,
 			updated_at_ms INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS tool_approval_grants (
+			account_id TEXT NOT NULL,
+			tool_name TEXT NOT NULL,
+			actor_type TEXT NOT NULL,
+			actor_id TEXT NOT NULL,
+			chat_id TEXT NOT NULL,
+			source_approval_id TEXT NOT NULL,
+			created_at_ms INTEGER NOT NULL,
+			expires_at_ms INTEGER NOT NULL,
+			updated_at_ms INTEGER NOT NULL,
+			PRIMARY KEY (account_id, tool_name, actor_type, actor_id, chat_id)
+		)`,
 	}
 
 	for _, q := range queries {
@@ -59,6 +71,8 @@ func (s *Store) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_sessions_archived ON sessions(user_id, archived)`,
 		`CREATE INDEX IF NOT EXISTS idx_tool_approvals_account_state_expiry
 		 ON tool_approvals(account_id, state, expires_at_ms)`,
+		`CREATE INDEX IF NOT EXISTS idx_tool_approval_grants_account_expiry
+		 ON tool_approval_grants(account_id, expires_at_ms)`,
 	}
 	for _, q := range indexes {
 		if _, err := s.db.Exec(q); err != nil {

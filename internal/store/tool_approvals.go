@@ -304,13 +304,24 @@ func (s *Store) FailExecutingToolApprovals(accountID string, now time.Time) (int
 	return count, nil
 }
 
-// DeleteToolApprovals removes all approval metadata associated with an account.
+// DeleteToolApprovals removes all one-time approvals and reusable grants for an account.
 func (s *Store) DeleteToolApprovals(accountID string) error {
+	accountID = strings.TrimSpace(accountID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`DELETE FROM tool_approvals WHERE account_id=?`, strings.TrimSpace(accountID))
+	tx, err := s.db.Begin()
 	if err != nil {
+		return fmt.Errorf("begin delete tool approvals: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM tool_approvals WHERE account_id=?`, accountID); err != nil {
 		return fmt.Errorf("delete tool approvals: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM tool_approval_grants WHERE account_id=?`, accountID); err != nil {
+		return fmt.Errorf("delete tool approval grants: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit delete tool approvals: %w", err)
 	}
 	return nil
 }

@@ -115,6 +115,10 @@ func (fakeCoreTool) Execute(ctx context.Context, call tooltypes.Call) tooltypes.
 
 type fakeToolApprovalRequester struct{}
 
+func (fakeToolApprovalRequester) HasActiveGrant(context.Context, string) (bool, error) {
+	return false, nil
+}
+
 func (fakeToolApprovalRequester) RequestApproval(context.Context, feishutools.ApprovalRequest) (feishutools.PendingApproval, error) {
 	return feishutools.PendingApproval{ID: "approval"}, nil
 }

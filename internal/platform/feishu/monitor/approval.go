@@ -35,6 +35,7 @@ type toolApprovalStore interface {
 	FailToolApproval(id, accountID string, now time.Time) error
 	ExpireToolApprovals(accountID string, now time.Time) (int64, error)
 	FailExecutingToolApprovals(accountID string, now time.Time) (int64, error)
+	ActiveToolApprovalGrant(scope store.ToolApprovalGrantScope, now time.Time) (store.ToolApprovalGrant, bool, error)
 }
 
 func (m *approvalManager) recoverPersistedApprovals(ctx context.Context) error {
@@ -119,6 +120,36 @@ func (m *approvalManager) registerExecutor(executor feishutools.ApprovalExecutor
 	}
 	m.executors[name] = executor
 	return nil
+}
+
+func (m *approvalManager) HasActiveGrant(ctx context.Context, toolName string) (bool, error) {
+	actor, ok := feishutools.ActorFromContext(ctx)
+	if !ok || (actor.OpenID == "" && actor.UserID == "") {
+		return false, fmt.Errorf("feishu tool approval requires the requesting user identity")
+	}
+	chat, ok := feishutools.ChatContextFromContext(ctx)
+	if !ok || chat.ChatID == "" {
+		return false, fmt.Errorf("feishu tool approval requires the trusted current chat")
+	}
+	scope, err := toolApprovalGrantScope(m.account.ID, toolName, actor.OpenID, actor.UserID, chat.ChatID)
+	if err != nil {
+		return false, err
+	}
+	grant, active, err := m.store.ActiveToolApprovalGrant(scope, m.currentTime())
+	if err != nil {
+		return false, fmt.Errorf("check active feishu tool approval grant: %w", err)
+	}
+	if active {
+		feishuLog.Debug(ctx, "using active feishu tool approval grant account=%s tool=%s user=%s chat=%s expires_at=%s source_approval=%s",
+			scope.AccountID,
+			scope.ToolName,
+			scope.ActorID,
+			scope.ChatID,
+			grant.ExpiresAt.Format(time.RFC3339),
+			shortApprovalID(grant.SourceApprovalID),
+		)
+	}
+	return active, nil
 }
 
 func (m *approvalManager) RequestApproval(ctx context.Context, request feishutools.ApprovalRequest) (feishutools.PendingApproval, error) {
@@ -557,6 +588,26 @@ func approvalMatchActorID(match store.ToolApprovalMatch) string {
 		return match.ActorOpenID
 	}
 	return match.ActorUserID
+}
+
+func toolApprovalGrantScope(accountID, toolName, actorOpenID, actorUserID, chatID string) (store.ToolApprovalGrantScope, error) {
+	actorType := store.ToolApprovalActorTypeOpenID
+	actorID := strings.TrimSpace(actorOpenID)
+	if actorID == "" {
+		actorType = store.ToolApprovalActorTypeUserID
+		actorID = strings.TrimSpace(actorUserID)
+	}
+	scope := store.ToolApprovalGrantScope{
+		AccountID: strings.TrimSpace(accountID),
+		ToolName:  strings.TrimSpace(toolName),
+		ActorType: actorType,
+		ActorID:   actorID,
+		ChatID:    strings.TrimSpace(chatID),
+	}
+	if scope.AccountID == "" || scope.ToolName == "" || scope.ActorID == "" || scope.ChatID == "" {
+		return store.ToolApprovalGrantScope{}, fmt.Errorf("feishu tool approval grant account, tool, user, and chat are required")
+	}
+	return scope, nil
 }
 
 func shortApprovalID(id string) string {
