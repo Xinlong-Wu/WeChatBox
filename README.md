@@ -317,6 +317,22 @@ tenant token, so access follows the app's document permissions rather than the
 asking user's personal permissions. Strict per-user document access requires a
 separate Feishu OAuth flow.
 
+Feishu can also expose `feishu_chat_history_get` to read recent messages from
+the Feishu chat that triggered the current LLM turn. Enable it under
+`platforms.feishu.tools.chat_history`. The runtime binds the trusted current
+`chat_id`; the model cannot provide or switch to another chat ID. The optional
+`limit` argument defaults to 20 and is capped at 100. Results are fetched from
+the Feishu message history API, returned in chronological order, and bounded by
+`platforms.feishu.tools.max_chars`. Text and rich-text post messages are
+rendered as readable content; other message types use safe placeholders rather
+than exposing file or image keys.
+
+Chat history is disabled by default. Reading p2p history requires the app's
+normal message-history capability. Reading group history additionally requires
+the Feishu permission shown as `获取群组中所有消息`, and the bot must be a member
+of that group. API or permission failures are returned to the model as tool
+errors with an actionable group-permission hint.
+
 Feishu can also expose `feishu_litellm_invite_create` for LiteLLM account
 requests. Enable it under `platforms.feishu.tools.litellm` and use a
 tool-capable model profile. The user must provide both `邮箱` and `申请原因` in
@@ -446,9 +462,10 @@ guarded tools exposed for the current PR.
 | `platforms.feishu.events[].version` | — | Required Feishu event protocol version: `"1.0"` uses `OnCustomizedEvent`; `"2.0"` uses a built-in `OnP2...` mapping |
 | `platforms.feishu.events[].run` | — | Shell command string or list of shell command strings to run for the event |
 | `platforms.feishu.tools.max_results` | `5` | Shared maximum result count for Feishu tools that return lists, including `feishu_docs_search` |
-| `platforms.feishu.tools.max_chars` | `12000` | Shared maximum character count for Feishu tools that return content, including `feishu_docs_read` |
+| `platforms.feishu.tools.max_chars` | `12000` | Shared maximum character count for Feishu tools that return content, including `feishu_chat_history_get` and `feishu_docs_read` |
 | `platforms.feishu.tools.allowed_folder_tokens` | `[]` | Shared folder token allowlist for Feishu tools; currently used for Docs write tools and optional search narrowing |
 | `platforms.feishu.tools.allowed_space_ids` | `[]` | Shared Wiki space ID allowlist for Feishu tools; currently used for Docs search narrowing |
+| `platforms.feishu.tools.chat_history.enabled` | `false` | Enable `feishu_chat_history_get` for the current trusted Feishu `chat_id`; each call returns at most 100 messages |
 | `platforms.feishu.tools.docs.enabled` | `false` | Enable Feishu Docs tools for tool-capable LLM profiles |
 | `platforms.feishu.tools.docs.allow_write` | `false` | Register Feishu Docs create/append tools when enabled and folder allowlist is configured |
 | `platforms.feishu.tools.litellm.enabled` | `false` | Enable the Feishu natural-language LiteLLM account invitation tool |
