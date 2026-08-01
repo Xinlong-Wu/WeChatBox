@@ -133,6 +133,10 @@ func (fakeResourceAccessController) ValidateAccess(context.Context, feishutools.
 	return feishutools.ResourceAccessResult{RequestID: "req_access", Status: feishutools.ResourceAccessStatusGranted}, nil
 }
 
+func (fakeResourceAccessController) ConsumeAccess(context.Context, feishutools.ResourceAccessValidation, string) (feishutools.ResourceAccessResult, error) {
+	return feishutools.ResourceAccessResult{RequestID: "req_access", Status: feishutools.ResourceAccessStatusGranted}, nil
+}
+
 type sentText struct {
 	chatID string
 	text   string

@@ -71,6 +71,63 @@ func TestResourceAccessManagerGrantsBotRootWithoutCard(t *testing.T) {
 	}
 }
 
+func TestResourceAccessManagerConsumesOnceAndRejectsExpiredGrant(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+		case "/open-apis/drive/explorer/v2/root_folder/meta":
+			writeResourceAccessJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "Success",
+				"data": map[string]any{"token": "fld_bot_root"},
+			})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
+	ctx := approvalRequestContext()
+	request := feishutools.ResourceAccessRequest{
+		ResourceType:  "folder",
+		ResourceToken: feishutools.BotRootResourceAlias,
+		Permission:    feishutools.ResourcePermissionWrite,
+	}
+	first, err := manager.RequestAccess(ctx, request)
+	if err != nil {
+		t.Fatalf("first RequestAccess returned error: %v", err)
+	}
+	second, err := manager.RequestAccess(ctx, request)
+	if err != nil {
+		t.Fatalf("second RequestAccess returned error: %v", err)
+	}
+	validation := feishutools.ResourceAccessValidation{
+		RequestID:     first.RequestID,
+		ResourceType:  "folder",
+		ResourceToken: "fld_bot_root",
+		Permission:    feishutools.ResourcePermissionWrite,
+	}
+	if _, err := manager.ConsumeAccess(ctx, validation, "req_create_workflow"); err != nil {
+		t.Fatalf("ConsumeAccess returned error: %v", err)
+	}
+	stored, err := st.GetFeishuResourceAccessRequest(first.RequestID, "feishu:cli_test")
+	if err != nil || stored.ConsumedByRequestID != "req_create_workflow" || stored.ConsumedAt.IsZero() {
+		t.Fatalf("consumed request = %#v err=%v", stored, err)
+	}
+	if _, err := manager.ValidateAccess(ctx, validation); err == nil || !strings.Contains(err.Error(), "already been used") {
+		t.Fatalf("reused ValidateAccess error = %v", err)
+	}
+
+	baseNow := manager.currentTime()
+	manager.now = func() time.Time { return baseNow.Add(defaultResourceAccessTTL) }
+	validation.RequestID = second.RequestID
+	if _, err := manager.ValidateAccess(ctx, validation); err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("expired ValidateAccess error = %v", err)
+	}
+}
+
 func TestResourceAccessManagerReusesOnlyLiveExactChatGrant(t *testing.T) {
 	var authCalls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

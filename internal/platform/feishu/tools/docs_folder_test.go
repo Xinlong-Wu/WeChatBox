@@ -112,6 +112,9 @@ func TestDocsFolderCreateUsesApplicationRootAndSharesGroup(t *testing.T) {
 	if access.validation.RequestID != "req_access" || access.validation.ResourceType != "folder" || access.validation.ResourceToken != "fld_root" || access.validation.Permission != ResourcePermissionWrite {
 		t.Fatalf("access validation = %#v", access.validation)
 	}
+	if access.consumption != access.validation || access.consumedBy != output.RequestID {
+		t.Fatalf("access consumption=%#v consumed_by=%q, want workflow %q", access.consumption, access.consumedBy, output.RequestID)
+	}
 	if shareBody.MemberType != "openchat" || shareBody.MemberID != "oc_chat" || shareBody.Perm != "full_access" || shareBody.Type != "chat" {
 		t.Fatalf("share body = %#v", shareBody)
 	}

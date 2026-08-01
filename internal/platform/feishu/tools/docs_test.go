@@ -70,6 +70,159 @@ func TestDocsToolConfigDefaultsAndRegistration(t *testing.T) {
 	}
 }
 
+func TestDocsReadAndAppendExternalDocumentUseResourceAccessWithoutBinding(t *testing.T) {
+	const documentToken = "doxcnexternal12345"
+	var readCalls, appendCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/oauth/v3/token" || r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "ok",
+				"tenant_access_token": "tenant-token",
+				"expire":              7200,
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/raw_content":
+			readCalls++
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"content": "external text"}})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodGet:
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"items": []any{}, "has_more": false}})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodPost:
+			appendCalls++
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"children": []any{}}})
+		default:
+			t.Fatalf("unexpected path: %s method=%s", r.URL.Path, r.Method)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
+	st, tools, access := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
+	readTool := findDocsTool(t, tools, readToolName)
+	missing := readTool.Execute(groupDocsContext(), tooltypes.Call{
+		ID:        "read_missing",
+		Name:      readToolName,
+		Arguments: json.RawMessage(`{"token":"doxcnexternal12345"}`),
+	})
+	if !missing.IsError || !strings.Contains(missing.Content, "access_request_id is required") || readCalls != 0 {
+		t.Fatalf("missing external read result=%#v read_calls=%d", missing, readCalls)
+	}
+	read := readTool.Execute(groupDocsContext(), tooltypes.Call{
+		ID:        "read_external",
+		Name:      readToolName,
+		Arguments: json.RawMessage(`{"token":"doxcnexternal12345","access_request_id":"req_access"}`),
+	})
+	if read.IsError || !strings.Contains(read.Content, "external text") || readCalls != 1 {
+		t.Fatalf("external read result=%#v read_calls=%d", read, readCalls)
+	}
+	if access.validation.RequestID != "req_access" || access.validation.ResourceType != "docx" || access.validation.ResourceToken != documentToken || access.validation.Permission != ResourcePermissionRead {
+		t.Fatalf("external read validation = %#v", access.validation)
+	}
+
+	appendTool := findDocsTool(t, tools, appendToolName)
+	append := appendTool.Execute(groupDocsContext(), tooltypes.Call{
+		ID:        "append_external",
+		Name:      appendToolName,
+		Arguments: json.RawMessage(`{"token":"doxcnexternal12345","content":"new paragraph","access_request_id":"req_access"}`),
+	})
+	if append.IsError || !strings.Contains(append.Content, `"appended":true`) || appendCalls != 1 {
+		t.Fatalf("external append result=%#v append_calls=%d", append, appendCalls)
+	}
+	if access.validation.RequestID != "req_access" || access.validation.ResourceToken != documentToken || access.validation.Permission != ResourcePermissionWrite {
+		t.Fatalf("external append validation = %#v", access.validation)
+	}
+	if _, err := st.GetFeishuChatDocument("feishu:cli_test", "oc_chat", documentToken); !errors.Is(err, store.ErrFeishuChatDocumentNotFound) {
+		t.Fatalf("external document binding error = %v, want not found", err)
+	}
+}
+
+func TestDocsReadRejectsBotOwnedDocumentFromAnotherChat(t *testing.T) {
+	cfg := Config{Docs: DocsToolsConfig{Enabled: true}}
+	st, tools, access := newDocsToolsForTest(t, &lark.Client{}, cfg, nil)
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	if _, err := st.SaveFeishuBotResource(store.FeishuBotResource{
+		AccountID:       "feishu:cli_test",
+		ResourceType:    "docx",
+		ResourceToken:   "doxcnotherchat123",
+		ParentToken:     "fld_other_chat",
+		Name:            "Other chat",
+		SourceRequestID: "req_other",
+		CreatedAt:       now,
+	}); err != nil {
+		t.Fatalf("SaveFeishuBotResource returned error: %v", err)
+	}
+	result := findDocsTool(t, tools, readToolName).Execute(groupDocsContext(), tooltypes.Call{
+		ID:        "read_cross_chat",
+		Name:      readToolName,
+		Arguments: json.RawMessage(`{"token":"doxcnotherchat123","access_request_id":"req_access"}`),
+	})
+	if !result.IsError || !strings.Contains(result.Content, "not available to the current Feishu chat") {
+		t.Fatalf("cross-chat read result = %#v", result)
+	}
+	if access.validation.RequestID != "" {
+		t.Fatalf("cross-chat Bot document unexpectedly used external access: %#v", access.validation)
+	}
+}
+
+func TestDocsReadRepairsBotOwnedDocumentBindingInCurrentChat(t *testing.T) {
+	const documentToken = "doxcnrepair12345"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/v3/token", "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "ok",
+				"tenant_access_token": "tenant-token",
+				"expire":              7200,
+			})
+		case "/open-apis/docx/v1/documents/" + documentToken + "/raw_content":
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"content": "repaired"}})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	st, tools, access := newDocsToolsForTest(t, client, Config{Docs: DocsToolsConfig{Enabled: true}}, nil)
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	if _, err := st.SaveFeishuBotResource(store.FeishuBotResource{
+		AccountID:       "feishu:cli_test",
+		ResourceType:    "docx",
+		ResourceToken:   documentToken,
+		ParentToken:     "fld_token",
+		Name:            "Repair me",
+		URL:             "https://docs.feishu.cn/docx/" + documentToken,
+		SourceRequestID: "req_created",
+		CreatedAt:       now,
+	}); err != nil {
+		t.Fatalf("SaveFeishuBotResource returned error: %v", err)
+	}
+	result := findDocsTool(t, tools, readToolName).Execute(groupDocsContext(), tooltypes.Call{
+		ID:        "read_repair",
+		Name:      readToolName,
+		Arguments: json.RawMessage(`{"token":"doxcnrepair12345"}`),
+	})
+	if result.IsError || !strings.Contains(result.Content, "repaired") {
+		t.Fatalf("repair read result = %#v", result)
+	}
+	document, err := st.GetFeishuChatDocument("feishu:cli_test", "oc_chat", documentToken)
+	if err != nil || document.FolderToken != "fld_token" || document.SourceRequestID != "req_created" {
+		t.Fatalf("repaired document binding = %#v err=%v", document, err)
+	}
+	if access.validation.RequestID != "" {
+		t.Fatalf("Bot-owned repair unexpectedly used external access: %#v", access.validation)
+	}
+}
+
 func TestDocsCreateToolReturnsPendingApprovalWithoutCallingFeishuDocs(t *testing.T) {
 	expiresAt := time.Date(2026, time.August, 1, 12, 10, 0, 0, time.UTC)
 	approver := &fakeApprovalRequester{pending: PendingApproval{RequestID: "req_123", ExpiresAt: expiresAt}}
@@ -142,7 +295,7 @@ func TestDocsCreateToolUsesActiveGrantWithoutSendingCard(t *testing.T) {
 	)
 	approver := &fakeApprovalRequester{active: true}
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
-	st, tools, _ := newDocsToolsForTest(t, client, cfg, approver)
+	st, tools, access := newDocsToolsForTest(t, client, cfg, approver)
 	tool := findDocsTool(t, tools, createToolName)
 	result := tool.Execute(groupDocsContext(), tooltypes.Call{
 		ID:        "call_1",
@@ -158,6 +311,9 @@ func TestDocsCreateToolUsesActiveGrantWithoutSendingCard(t *testing.T) {
 	}
 	if output.DocumentID != "doxcnactive123" || output.Warning != "" || createCalls != 1 {
 		t.Fatalf("create output/calls = %#v/%d", output, createCalls)
+	}
+	if access.consumption.RequestID != "req_access" || access.consumption.ResourceToken != "fld_token" || access.consumedBy != output.RequestID {
+		t.Fatalf("access consumption=%#v consumed_by=%q", access.consumption, access.consumedBy)
 	}
 	if approver.request.ToolName != "" {
 		t.Fatalf("approval request = %#v, want no card for active grant", approver.request)
@@ -201,7 +357,7 @@ func TestDocsCreateToolActiveGrantReportsPartialSuccessWithoutRetrySignal(t *tes
 		lark.WithHttpClient(server.Client()),
 	)
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
-	_, tools, _ := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{active: true})
+	st, tools, _ := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{active: true})
 	tool := findDocsTool(t, tools, createToolName)
 	result := tool.Execute(groupDocsContext(), tooltypes.Call{
 		ID:        "call_1",
@@ -217,6 +373,9 @@ func TestDocsCreateToolActiveGrantReportsPartialSuccessWithoutRetrySignal(t *tes
 	}
 	if output.DocumentID != "doxcnactive123" || !strings.Contains(output.Warning, "请勿重复创建") || !strings.Contains(output.Warning, "append denied") {
 		t.Fatalf("partial create output = %#v", output)
+	}
+	if _, err := st.GetFeishuChatDocument("feishu:cli_test", "oc_chat", output.DocumentID); err != nil {
+		t.Fatalf("partially created document was not recoverably bound to chat: %v", err)
 	}
 }
 
@@ -301,6 +460,9 @@ func TestDocsCreateApprovedExecutionCreatesDocument(t *testing.T) {
 	}
 	if access.validation.RequestID != "req_access" || access.validation.ResourceToken != "fld_token" || access.actor.OpenID != "ou_requester" || access.chat.ChatID != "oc_chat" {
 		t.Fatalf("approved access validation=%#v actor=%#v chat=%#v", access.validation, access.actor, access.chat)
+	}
+	if access.consumption.RequestID != "req_access" || access.consumption.ResourceToken != "fld_token" || access.consumedBy != "req_approved" {
+		t.Fatalf("approved access consumption=%#v consumed_by=%q", access.consumption, access.consumedBy)
 	}
 }
 

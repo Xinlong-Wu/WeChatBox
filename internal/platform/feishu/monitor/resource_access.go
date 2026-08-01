@@ -41,6 +41,7 @@ type resourceAccessStore interface {
 	PrepareFeishuResourceAccessOAuth(id, accountID, stateHash, verifier, subjectType, subjectID string, now time.Time) error
 	SetFeishuResourceAccessCardMessageID(id, accountID, messageID string, now time.Time) error
 	GetFeishuResourceAccessRequest(id, accountID string) (store.FeishuResourceAccessRequest, error)
+	ConsumeFeishuResourceAccessRequest(id, accountID, consumedByRequestID string, now time.Time) error
 	ClaimFeishuResourceAccessOAuth(stateHash, accountID string, now time.Time) (store.FeishuResourceAccessRequest, error)
 	DenyFeishuResourceAccessRequest(id, accountID string, match store.FeishuResourceAccessMatch, now time.Time) (store.FeishuResourceAccessRequest, error)
 	CompleteFeishuResourceAccessRequest(id, accountID, source, verifiedPermission string, grant *store.FeishuResourceGrant, now time.Time) error
@@ -327,6 +328,13 @@ func (m *resourceAccessManager) ValidateAccess(ctx context.Context, validation f
 	if request.ResourceType != validation.ResourceType || request.ResourceToken != validation.ResourceToken {
 		return feishutools.ResourceAccessResult{}, fmt.Errorf("access_request_id does not match the requested resource")
 	}
+	now := m.currentTime()
+	if !request.ExpiresAt.After(now) {
+		return feishutools.ResourceAccessResult{}, fmt.Errorf("access_request_id has expired; call %s again", feishutools.ResourceAccessToolName)
+	}
+	if request.ConsumedByRequestID != "" {
+		return feishutools.ResourceAccessResult{}, fmt.Errorf("access_request_id has already been used; call %s again", feishutools.ResourceAccessToolName)
+	}
 	if !store.FeishuResourcePermissionSatisfies(request.VerifiedPermission, validation.Permission) {
 		return feishutools.ResourceAccessResult{}, fmt.Errorf("access_request_id does not grant the required %s permission", validation.Permission)
 	}
@@ -363,6 +371,33 @@ func (m *resourceAccessManager) ValidateAccess(ctx context.Context, validation f
 		return feishutools.ResourceAccessResult{}, fmt.Errorf("refresh feishu resource grant verification: %w", err)
 	}
 	return m.resourceAccessResult(request, feishutools.ResourceAccessStatusGranted, request.GrantSource), nil
+}
+
+func (m *resourceAccessManager) ConsumeAccess(ctx context.Context, validation feishutools.ResourceAccessValidation, consumingRequestID string) (feishutools.ResourceAccessResult, error) {
+	consumingRequestID = strings.TrimSpace(consumingRequestID)
+	if consumingRequestID == "" {
+		return feishutools.ResourceAccessResult{}, fmt.Errorf("consuming workflow request_id is required")
+	}
+	result, err := m.ValidateAccess(ctx, validation)
+	if err != nil {
+		return feishutools.ResourceAccessResult{}, err
+	}
+	if err := m.store.ConsumeFeishuResourceAccessRequest(result.RequestID, m.account.ID, consumingRequestID, m.currentTime()); err != nil {
+		switch {
+		case errors.Is(err, store.ErrFeishuResourceAccessExpired):
+			return feishutools.ResourceAccessResult{}, fmt.Errorf("access_request_id has expired; call %s again", feishutools.ResourceAccessToolName)
+		case errors.Is(err, store.ErrFeishuResourceAccessConsumed):
+			return feishutools.ResourceAccessResult{}, fmt.Errorf("access_request_id has already been used; call %s again", feishutools.ResourceAccessToolName)
+		case errors.Is(err, store.ErrFeishuResourceAccessResolved):
+			return feishutools.ResourceAccessResult{}, fmt.Errorf("access_request_id is no longer granted; call %s again", feishutools.ResourceAccessToolName)
+		default:
+			return feishutools.ResourceAccessResult{}, fmt.Errorf("consume feishu resource access request: %w", err)
+		}
+	}
+	feishuLog.Debug(ctx, "consumed feishu resource access request=%s operation=%s account=%s type=%s resource_ref=%s permission=%s",
+		shortRequestID(result.RequestID), shortRequestID(consumingRequestID), m.account.ID,
+		result.ResourceType, shortResourceRef(result.ResourceToken), result.Permission)
+	return result, nil
 }
 
 func (m *resourceAccessManager) HandleCardAction(ctx context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {

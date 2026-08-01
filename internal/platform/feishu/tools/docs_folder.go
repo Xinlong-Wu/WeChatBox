@@ -192,8 +192,17 @@ func (t docsFolderTool) createFolder(ctx context.Context, raw json.RawMessage) (
 	if err != nil {
 		return "", fmt.Errorf("create feishu folder workflow request: %w", err)
 	}
-	feishuToolsLog.Info(ctx, "creating feishu application folder request=%s account=%s chat=%s parent=%s name_chars=%d",
-		shortToolRequestID(request.ID), t.accountID, chat.ChatID, createParentToken, utf8.RuneCountInString(args.Name))
+	if _, err := consumeGrantedResourceAccess(ctx, t.resourceAccess, ResourceAccessValidation{
+		RequestID:     args.AccessRequestID,
+		ResourceType:  "folder",
+		ResourceToken: createParentToken,
+		Permission:    ResourcePermissionWrite,
+	}, request.ID); err != nil {
+		t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStateFailed)
+		return "", fmt.Errorf("consume parent folder access: %w", err)
+	}
+	feishuToolsLog.Info(ctx, "creating feishu application folder request=%s account=%s chat=%s parent_ref=%s name_chars=%d",
+		shortToolRequestID(request.ID), t.accountID, chat.ChatID, hashString(createParentToken), utf8.RuneCountInString(args.Name))
 	created, err := t.createApplicationFolder(ctx, args.Name, createParentToken)
 	if err != nil {
 		t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStateFailed)

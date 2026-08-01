@@ -134,6 +134,60 @@ func TestFeishuResourceAccessOAuthLifecycleAndChatScopedGrant(t *testing.T) {
 	}
 }
 
+func TestFeishuResourceAccessConsumptionIsAtomicAndExpires(t *testing.T) {
+	st := openFeishuDocsTestStore(t)
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	request := createPendingFeishuResourceAccess(t, st, now)
+	if err := st.CompleteFeishuResourceAccessRequest(
+		request.ID,
+		request.AccountID,
+		FeishuResourceGrantSourceBotOwner,
+		request.Permission,
+		nil,
+		now.Add(time.Second),
+	); err != nil {
+		t.Fatalf("CompleteFeishuResourceAccessRequest returned error: %v", err)
+	}
+	workflow, err := st.CreateWorkflowRequest(WorkflowRequest{
+		AccountID: request.AccountID,
+		Kind:      WorkflowRequestKindFeishuDocsCreate,
+		State:     WorkflowRequestStateExecuting,
+		CreatedAt: now.Add(2 * time.Second),
+	})
+	if err != nil {
+		t.Fatalf("CreateWorkflowRequest returned error: %v", err)
+	}
+	consumedAt := now.Add(3 * time.Second)
+	if err := st.ConsumeFeishuResourceAccessRequest(request.ID, request.AccountID, workflow.ID, consumedAt); err != nil {
+		t.Fatalf("ConsumeFeishuResourceAccessRequest returned error: %v", err)
+	}
+	consumed, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil {
+		t.Fatalf("GetFeishuResourceAccessRequest returned error: %v", err)
+	}
+	if consumed.ConsumedByRequestID != workflow.ID || !consumed.ConsumedAt.Equal(consumedAt) {
+		t.Fatalf("consumed request = %#v", consumed)
+	}
+	if err := st.ConsumeFeishuResourceAccessRequest(request.ID, request.AccountID, "req_second", consumedAt.Add(time.Second)); !errors.Is(err, ErrFeishuResourceAccessConsumed) {
+		t.Fatalf("second consumption error = %v, want ErrFeishuResourceAccessConsumed", err)
+	}
+
+	expired := createPendingFeishuResourceAccess(t, st, now.Add(time.Hour))
+	if err := st.CompleteFeishuResourceAccessRequest(
+		expired.ID,
+		expired.AccountID,
+		FeishuResourceGrantSourceBotOwner,
+		expired.Permission,
+		nil,
+		expired.CreatedAt.Add(time.Second),
+	); err != nil {
+		t.Fatalf("complete expiring access request: %v", err)
+	}
+	if err := st.ConsumeFeishuResourceAccessRequest(expired.ID, expired.AccountID, "req_after_expiry", expired.ExpiresAt); !errors.Is(err, ErrFeishuResourceAccessExpired) {
+		t.Fatalf("expired consumption error = %v, want ErrFeishuResourceAccessExpired", err)
+	}
+}
+
 func TestFeishuResourceAccessDenyValidatesActorAndCard(t *testing.T) {
 	st := openFeishuDocsTestStore(t)
 	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)

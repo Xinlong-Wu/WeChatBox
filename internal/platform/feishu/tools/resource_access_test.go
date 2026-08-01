@@ -10,12 +10,14 @@ import (
 )
 
 type fakeResourceAccessController struct {
-	request    ResourceAccessRequest
-	validation ResourceAccessValidation
-	result     ResourceAccessResult
-	err        error
-	actor      Actor
-	chat       ChatContext
+	request     ResourceAccessRequest
+	validation  ResourceAccessValidation
+	consumption ResourceAccessValidation
+	consumedBy  string
+	result      ResourceAccessResult
+	err         error
+	actor       Actor
+	chat        ChatContext
 }
 
 func (f *fakeResourceAccessController) RequestAccess(_ context.Context, request ResourceAccessRequest) (ResourceAccessResult, error) {
@@ -25,6 +27,14 @@ func (f *fakeResourceAccessController) RequestAccess(_ context.Context, request 
 
 func (f *fakeResourceAccessController) ValidateAccess(ctx context.Context, validation ResourceAccessValidation) (ResourceAccessResult, error) {
 	f.validation = validation
+	f.actor, _ = ActorFromContext(ctx)
+	f.chat, _ = ChatContextFromContext(ctx)
+	return f.result, f.err
+}
+
+func (f *fakeResourceAccessController) ConsumeAccess(ctx context.Context, validation ResourceAccessValidation, consumingRequestID string) (ResourceAccessResult, error) {
+	f.consumption = validation
+	f.consumedBy = consumingRequestID
 	f.actor, _ = ActorFromContext(ctx)
 	f.chat, _ = ChatContextFromContext(ctx)
 	return f.result, f.err

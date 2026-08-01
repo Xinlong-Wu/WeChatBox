@@ -81,6 +81,7 @@ type ResourceAccessValidation struct {
 type ResourceAccessController interface {
 	RequestAccess(context.Context, ResourceAccessRequest) (ResourceAccessResult, error)
 	ValidateAccess(context.Context, ResourceAccessValidation) (ResourceAccessResult, error)
+	ConsumeAccess(context.Context, ResourceAccessValidation, string) (ResourceAccessResult, error)
 }
 
 func validateGrantedResourceAccess(ctx context.Context, controller ResourceAccessController, validation ResourceAccessValidation) (ResourceAccessResult, error) {
@@ -92,7 +93,7 @@ func validateGrantedResourceAccess(ctx context.Context, controller ResourceAcces
 		return ResourceAccessResult{}, fmt.Errorf("feishu resource access workflow is unavailable")
 	}
 	if validation.RequestID == "" {
-		return ResourceAccessResult{}, fmt.Errorf("access_request_id is required; call %s before creating the resource", ResourceAccessToolName)
+		return ResourceAccessResult{}, fmt.Errorf("access_request_id is required; call %s before using the resource", ResourceAccessToolName)
 	}
 	result, err := controller.ValidateAccess(ctx, validation)
 	if err != nil {
@@ -100,6 +101,24 @@ func validateGrantedResourceAccess(ctx context.Context, controller ResourceAcces
 	}
 	if result.Status != ResourceAccessStatusGranted || strings.TrimSpace(result.RequestID) != validation.RequestID {
 		return ResourceAccessResult{}, fmt.Errorf("access_request_id is not a granted request for this operation; call %s again", ResourceAccessToolName)
+	}
+	return result, nil
+}
+
+func consumeGrantedResourceAccess(ctx context.Context, controller ResourceAccessController, validation ResourceAccessValidation, consumingRequestID string) (ResourceAccessResult, error) {
+	consumingRequestID = strings.TrimSpace(consumingRequestID)
+	if consumingRequestID == "" {
+		return ResourceAccessResult{}, fmt.Errorf("consuming workflow request_id is required")
+	}
+	if controller == nil {
+		return ResourceAccessResult{}, fmt.Errorf("feishu resource access workflow is unavailable")
+	}
+	result, err := controller.ConsumeAccess(ctx, validation, consumingRequestID)
+	if err != nil {
+		return ResourceAccessResult{}, err
+	}
+	if result.Status != ResourceAccessStatusGranted || strings.TrimSpace(result.RequestID) != strings.TrimSpace(validation.RequestID) {
+		return ResourceAccessResult{}, fmt.Errorf("access_request_id was not consumed for this operation; call %s again", ResourceAccessToolName)
 	}
 	return result, nil
 }
@@ -204,7 +223,7 @@ func ResourceTokenAlias(token string) bool {
 func docsResourceAccessSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        ResourceAccessToolName,
-		Description: "Verify or request read/write access to one Feishu file or folder for the trusted current chat. Call this before every folder or document creation and pass the returned request_id to the create tool. Bot-owned resources return granted immediately. Existing chat-scoped grants are live-checked; otherwise the requester receives a card linking to Feishu's official OAuth page. write also satisfies read. Use resource_token=bot_root for the Bot root or chat_default_folder for the current chat's default Bot folder.",
+		Description: "Verify or request read/write access to one Feishu file or folder for the trusted current chat. Call this before every folder or document creation and pass the returned request_id to the create tool. Also call it before reading or appending an external document that is not bound to the current chat. Bot-owned resources return granted immediately. Existing chat-scoped grants are live-checked; otherwise the requester receives a card linking to Feishu's official OAuth page. write also satisfies read. Use resource_token=bot_root for the Bot root or chat_default_folder for the current chat's default Bot folder.",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"resource_type":{"type":"string","enum":["folder","doc","docx","sheet","file","wiki","bitable","mindnote","minutes","slides"]},"resource_token":{"type":"string","description":"Exact Feishu resource token, or bot_root/chat_default_folder for a trusted Bot folder alias."},"resource_url":{"type":"string","description":"Optional Feishu resource URL used for the card and post-authorization redirect."},"permission":{"type":"string","enum":["read","write"]},"reason":{"type":"string","maxLength":500,"description":"Short user-visible reason for requesting access."}},"required":["resource_type","resource_token","permission"],"additionalProperties":false}`),
 	}
 }

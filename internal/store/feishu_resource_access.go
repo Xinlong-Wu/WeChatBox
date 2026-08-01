@@ -21,6 +21,8 @@ var (
 	ErrFeishuResourceAccessExpired = errors.New("feishu resource access request expired")
 	// ErrFeishuResourceAccessResolved is returned after a request leaves its actionable state.
 	ErrFeishuResourceAccessResolved = errors.New("feishu resource access request already resolved")
+	// ErrFeishuResourceAccessConsumed is returned when a granted request already authorized an operation.
+	ErrFeishuResourceAccessConsumed = errors.New("feishu resource access request already consumed")
 	// ErrFeishuResourceGrantNotFound is returned when no chat-scoped grant is recorded.
 	ErrFeishuResourceGrantNotFound = errors.New("feishu resource grant not found")
 )
@@ -61,28 +63,30 @@ type FeishuBotResource struct {
 // OAuth state is stored only as a hash, and the PKCE verifier is cleared as soon as
 // the callback atomically claims the request.
 type FeishuResourceAccessRequest struct {
-	ID                 string
-	AccountID          string
-	ActorOpenID        string
-	ActorUserID        string
-	ChatID             string
-	SourceMessageID    string
-	ResourceType       string
-	ResourceToken      string
-	ResourceURL        string
-	Permission         string
-	Reason             string
-	SubjectType        string
-	SubjectID          string
-	GrantSource        string
-	VerifiedPermission string
-	CardMessageID      string
-	OAuthStateHash     string
-	PKCEVerifier       string
-	State              string
-	CreatedAt          time.Time
-	ExpiresAt          time.Time
-	UpdatedAt          time.Time
+	ID                  string
+	AccountID           string
+	ActorOpenID         string
+	ActorUserID         string
+	ChatID              string
+	SourceMessageID     string
+	ResourceType        string
+	ResourceToken       string
+	ResourceURL         string
+	Permission          string
+	Reason              string
+	SubjectType         string
+	SubjectID           string
+	GrantSource         string
+	VerifiedPermission  string
+	CardMessageID       string
+	OAuthStateHash      string
+	PKCEVerifier        string
+	State               string
+	ConsumedByRequestID string
+	ConsumedAt          time.Time
+	CreatedAt           time.Time
+	ExpiresAt           time.Time
+	UpdatedAt           time.Time
 }
 
 // FeishuResourceAccessMatch contains trusted callback identity and card context.
@@ -293,6 +297,61 @@ func (s *Store) GetFeishuResourceAccessRequest(id, accountID string) (FeishuReso
 		feishuResourceAccessSelect+` WHERE id=? AND account_id=?`,
 		strings.TrimSpace(id), strings.TrimSpace(accountID),
 	))
+}
+
+// ConsumeFeishuResourceAccessRequest atomically binds one still-valid granted
+// access request to the concrete workflow that is about to call a create API.
+func (s *Store) ConsumeFeishuResourceAccessRequest(id, accountID, consumedByRequestID string, now time.Time) error {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return err
+	}
+	id = strings.TrimSpace(id)
+	accountID = strings.TrimSpace(accountID)
+	consumedByRequestID = strings.TrimSpace(consumedByRequestID)
+	if id == "" || accountID == "" || consumedByRequestID == "" {
+		return fmt.Errorf("feishu resource access id, account, and consuming request are required")
+	}
+	now = normalizedWorkflowTime(now)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.Exec(
+		`UPDATE feishu_resource_access_requests
+		 SET consumed_by_request_id=?, consumed_at_ms=?, updated_at_ms=?
+		 WHERE id=? AND account_id=? AND state=? AND expires_at_ms>? AND consumed_by_request_id=''`,
+		consumedByRequestID,
+		now.UnixMilli(),
+		now.UnixMilli(),
+		id,
+		accountID,
+		FeishuResourceAccessStateSucceeded,
+		now.UnixMilli(),
+	)
+	if err != nil {
+		return fmt.Errorf("consume feishu resource access request: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("inspect feishu resource access consumption: %w", err)
+	}
+	if count == 1 {
+		return nil
+	}
+	request, err := scanFeishuResourceAccessRequest(s.db.QueryRow(
+		feishuResourceAccessSelect+` WHERE id=? AND account_id=?`, id, accountID,
+	))
+	if err != nil {
+		return err
+	}
+	if request.State != FeishuResourceAccessStateSucceeded {
+		return ErrFeishuResourceAccessResolved
+	}
+	if !request.ExpiresAt.After(now) {
+		return ErrFeishuResourceAccessExpired
+	}
+	if request.ConsumedByRequestID != "" {
+		return ErrFeishuResourceAccessConsumed
+	}
+	return fmt.Errorf("consume feishu resource access request: no row updated")
 }
 
 // ClaimFeishuResourceAccessOAuth atomically consumes a valid OAuth state and
@@ -693,7 +752,7 @@ const feishuResourceAccessSelect = `SELECT id, account_id, actor_open_id, actor_
  chat_id, source_message_id, resource_type, resource_token, resource_url,
  permission, reason, subject_type, subject_id, grant_source, verified_permission,
  card_message_id, oauth_state_hash, pkce_verifier, state,
- created_at_ms, expires_at_ms, updated_at_ms
+ consumed_by_request_id, consumed_at_ms, created_at_ms, expires_at_ms, updated_at_ms
  FROM feishu_resource_access_requests`
 
 type feishuResourceAccessScanner interface {
@@ -726,7 +785,7 @@ func scanFeishuBotResource(row feishuResourceAccessScanner) (FeishuBotResource, 
 
 func scanFeishuResourceAccessRequest(row feishuResourceAccessScanner) (FeishuResourceAccessRequest, error) {
 	var request FeishuResourceAccessRequest
-	var createdAtMS, expiresAtMS, updatedAtMS int64
+	var consumedAtMS, createdAtMS, expiresAtMS, updatedAtMS int64
 	if err := row.Scan(
 		&request.ID,
 		&request.AccountID,
@@ -747,6 +806,8 @@ func scanFeishuResourceAccessRequest(row feishuResourceAccessScanner) (FeishuRes
 		&request.OAuthStateHash,
 		&request.PKCEVerifier,
 		&request.State,
+		&request.ConsumedByRequestID,
+		&consumedAtMS,
 		&createdAtMS,
 		&expiresAtMS,
 		&updatedAtMS,
@@ -759,6 +820,9 @@ func scanFeishuResourceAccessRequest(row feishuResourceAccessScanner) (FeishuRes
 	request.CreatedAt = time.UnixMilli(createdAtMS).UTC()
 	request.ExpiresAt = time.UnixMilli(expiresAtMS).UTC()
 	request.UpdatedAt = time.UnixMilli(updatedAtMS).UTC()
+	if consumedAtMS > 0 {
+		request.ConsumedAt = time.UnixMilli(consumedAtMS).UTC()
+	}
 	return request, nil
 }
 
