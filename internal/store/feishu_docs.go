@@ -259,8 +259,8 @@ func (s *Store) GetFeishuChatDocument(accountID, chatID, documentToken string) (
 	))
 }
 
-// DeleteFeishuDocsData removes all chat folder/document bindings and their
-// folder-creation workflow requests for one bot account.
+// DeleteFeishuDocsData removes all Feishu document/resource metadata and
+// document-related workflow requests for one bot account.
 func (s *Store) DeleteFeishuDocsData(accountID string) error {
 	if err := s.requireFeishuDocsStore(); err != nil {
 		return err
@@ -279,8 +279,24 @@ func (s *Store) DeleteFeishuDocsData(accountID string) error {
 	if _, err := tx.Exec(`DELETE FROM feishu_chat_folders WHERE account_id=?`, accountID); err != nil {
 		return fmt.Errorf("delete feishu chat folders: %w", err)
 	}
-	if _, err := tx.Exec(`DELETE FROM workflow_requests WHERE account_id=? AND kind=?`, accountID, WorkflowRequestKindFeishuFolderCreate); err != nil {
-		return fmt.Errorf("delete feishu folder workflow requests: %w", err)
+	if _, err := tx.Exec(`DELETE FROM feishu_resource_grants WHERE account_id=?`, accountID); err != nil {
+		return fmt.Errorf("delete feishu resource grants: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM feishu_resource_access_requests WHERE account_id=?`, accountID); err != nil {
+		return fmt.Errorf("delete feishu resource access requests: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM feishu_bot_resources WHERE account_id=?`, accountID); err != nil {
+		return fmt.Errorf("delete feishu bot resources: %w", err)
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM workflow_requests WHERE account_id=? AND kind IN (?, ?, ?, ?)`,
+		accountID,
+		WorkflowRequestKindFeishuFolderCreate,
+		WorkflowRequestKindFeishuDocsCreate,
+		WorkflowRequestKindFeishuDocsAppend,
+		WorkflowRequestKindFeishuResourceAccess,
+	); err != nil {
+		return fmt.Errorf("delete feishu docs workflow requests: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit delete feishu docs data: %w", err)

@@ -1,0 +1,973 @@
+package store
+
+import (
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+)
+
+var (
+	// ErrFeishuBotResourceNotFound is returned when a resource is not known to be Bot-owned.
+	ErrFeishuBotResourceNotFound = errors.New("feishu bot resource not found")
+	// ErrFeishuResourceAccessNotFound is returned when a resource access request is unknown.
+	ErrFeishuResourceAccessNotFound = errors.New("feishu resource access request not found")
+	// ErrFeishuResourceAccessForbidden is returned when a different user responds to a request.
+	ErrFeishuResourceAccessForbidden = errors.New("feishu resource access actor does not match")
+	// ErrFeishuResourceAccessContextMismatch is returned for a callback from another card or chat.
+	ErrFeishuResourceAccessContextMismatch = errors.New("feishu resource access callback context does not match")
+	// ErrFeishuResourceAccessExpired is returned when a pending request has expired.
+	ErrFeishuResourceAccessExpired = errors.New("feishu resource access request expired")
+	// ErrFeishuResourceAccessResolved is returned after a request leaves its actionable state.
+	ErrFeishuResourceAccessResolved = errors.New("feishu resource access request already resolved")
+	// ErrFeishuResourceGrantNotFound is returned when no chat-scoped grant is recorded.
+	ErrFeishuResourceGrantNotFound = errors.New("feishu resource grant not found")
+)
+
+const (
+	FeishuResourcePermissionRead  = "read"
+	FeishuResourcePermissionWrite = "write"
+
+	FeishuResourceAccessStatePending   = WorkflowRequestStatePending
+	FeishuResourceAccessStateExecuting = WorkflowRequestStateExecuting
+	FeishuResourceAccessStateDenied    = WorkflowRequestStateDenied
+	FeishuResourceAccessStateSucceeded = WorkflowRequestStateSucceeded
+	FeishuResourceAccessStateFailed    = WorkflowRequestStateFailed
+	FeishuResourceAccessStateExpired   = WorkflowRequestStateExpired
+
+	FeishuResourceGrantSourceBotOwner      = "bot_owner"
+	FeishuResourceGrantSourceExistingGrant = "existing_grant"
+	FeishuResourceGrantSourceNewlyGranted  = "newly_granted"
+
+	FeishuResourceGrantStateActive  = "active"
+	FeishuResourceGrantStateRevoked = "revoked"
+)
+
+// FeishuBotResource records one folder or file created and owned by the Bot account.
+type FeishuBotResource struct {
+	AccountID       string
+	ResourceType    string
+	ResourceToken   string
+	ParentToken     string
+	Name            string
+	URL             string
+	SourceRequestID string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+// FeishuResourceAccessRequest is one globally identified access verification workflow.
+// OAuth state is stored only as a hash, and the PKCE verifier is cleared as soon as
+// the callback atomically claims the request.
+type FeishuResourceAccessRequest struct {
+	ID                 string
+	AccountID          string
+	ActorOpenID        string
+	ActorUserID        string
+	ChatID             string
+	SourceMessageID    string
+	ResourceType       string
+	ResourceToken      string
+	ResourceURL        string
+	Permission         string
+	Reason             string
+	SubjectType        string
+	SubjectID          string
+	GrantSource        string
+	VerifiedPermission string
+	CardMessageID      string
+	OAuthStateHash     string
+	PKCEVerifier       string
+	State              string
+	CreatedAt          time.Time
+	ExpiresAt          time.Time
+	UpdatedAt          time.Time
+}
+
+// FeishuResourceAccessMatch contains trusted callback identity and card context.
+type FeishuResourceAccessMatch struct {
+	ActorOpenID   string
+	ActorUserID   string
+	ChatID        string
+	CardMessageID string
+}
+
+// FeishuResourceGrant records the permission last verified for one exact Bot account,
+// chat, resource type, and resource token.
+type FeishuResourceGrant struct {
+	AccountID       string
+	ChatID          string
+	ResourceType    string
+	ResourceToken   string
+	Permission      string
+	SubjectType     string
+	SubjectID       string
+	SourceRequestID string
+	State           string
+	CreatedAt       time.Time
+	VerifiedAt      time.Time
+	UpdatedAt       time.Time
+}
+
+// SaveFeishuBotResource creates or refreshes Bot ownership metadata.
+func (s *Store) SaveFeishuBotResource(resource FeishuBotResource) (FeishuBotResource, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return FeishuBotResource{}, err
+	}
+	resource = normalizeFeishuBotResource(resource)
+	if err := validateFeishuBotResource(resource); err != nil {
+		return FeishuBotResource{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`INSERT INTO feishu_bot_resources (
+			account_id, resource_type, resource_token, parent_token, name, url,
+			source_request_id, created_at_ms, updated_at_ms
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(account_id, resource_type, resource_token) DO UPDATE SET
+			parent_token=excluded.parent_token,
+			name=CASE WHEN excluded.name='' THEN feishu_bot_resources.name ELSE excluded.name END,
+			url=CASE WHEN excluded.url='' THEN feishu_bot_resources.url ELSE excluded.url END,
+			source_request_id=CASE
+				WHEN excluded.source_request_id='' THEN feishu_bot_resources.source_request_id
+				ELSE excluded.source_request_id
+			END,
+			updated_at_ms=excluded.updated_at_ms`,
+		resource.AccountID,
+		resource.ResourceType,
+		resource.ResourceToken,
+		resource.ParentToken,
+		resource.Name,
+		resource.URL,
+		resource.SourceRequestID,
+		resource.CreatedAt.UnixMilli(),
+		resource.UpdatedAt.UnixMilli(),
+	)
+	if err != nil {
+		return FeishuBotResource{}, fmt.Errorf("save feishu bot resource: %w", err)
+	}
+	return resource, nil
+}
+
+// GetFeishuBotResource returns ownership metadata for one exact account and resource.
+func (s *Store) GetFeishuBotResource(accountID, resourceType, resourceToken string) (FeishuBotResource, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return FeishuBotResource{}, err
+	}
+	return scanFeishuBotResource(s.db.QueryRow(
+		`SELECT account_id, resource_type, resource_token, parent_token, name, url,
+		 source_request_id, created_at_ms, updated_at_ms
+		 FROM feishu_bot_resources
+		 WHERE account_id=? AND resource_type=? AND resource_token=?`,
+		strings.TrimSpace(accountID), strings.TrimSpace(resourceType), strings.TrimSpace(resourceToken),
+	))
+}
+
+// CreateFeishuResourceAccessRequest atomically creates a global workflow root
+// and its pending resource access record.
+func (s *Store) CreateFeishuResourceAccessRequest(request FeishuResourceAccessRequest) (FeishuResourceAccessRequest, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return FeishuResourceAccessRequest{}, err
+	}
+	request = normalizeFeishuResourceAccessRequest(request)
+	workflow, err := prepareWorkflowRequest(WorkflowRequest{
+		ID:        request.ID,
+		AccountID: request.AccountID,
+		Kind:      WorkflowRequestKindFeishuResourceAccess,
+		State:     WorkflowRequestStatePending,
+		CreatedAt: request.CreatedAt,
+	})
+	if err != nil {
+		return FeishuResourceAccessRequest{}, err
+	}
+	request.ID = workflow.ID
+	request.State = FeishuResourceAccessStatePending
+	request.UpdatedAt = request.CreatedAt
+	if err := validateNewFeishuResourceAccessRequest(request); err != nil {
+		return FeishuResourceAccessRequest{}, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("begin create feishu resource access request: %w", err)
+	}
+	defer tx.Rollback()
+	if err := insertWorkflowRequest(tx, workflow); err != nil {
+		return FeishuResourceAccessRequest{}, err
+	}
+	_, err = tx.Exec(
+		`INSERT INTO feishu_resource_access_requests (
+			id, account_id, actor_open_id, actor_user_id, chat_id, source_message_id,
+			resource_type, resource_token, resource_url, permission, reason,
+			subject_type, subject_id, grant_source, verified_permission,
+			card_message_id, oauth_state_hash, pkce_verifier, state,
+			created_at_ms, expires_at_ms, updated_at_ms
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', '', '', '', ?, ?, ?, ?)`,
+		request.ID,
+		request.AccountID,
+		request.ActorOpenID,
+		request.ActorUserID,
+		request.ChatID,
+		request.SourceMessageID,
+		request.ResourceType,
+		request.ResourceToken,
+		request.ResourceURL,
+		request.Permission,
+		request.Reason,
+		request.SubjectType,
+		request.SubjectID,
+		request.State,
+		request.CreatedAt.UnixMilli(),
+		request.ExpiresAt.UnixMilli(),
+		request.UpdatedAt.UnixMilli(),
+	)
+	if err != nil {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("create feishu resource access request: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("commit feishu resource access request: %w", err)
+	}
+	return request, nil
+}
+
+// PrepareFeishuResourceAccessOAuth binds the one-time OAuth state and PKCE verifier.
+func (s *Store) PrepareFeishuResourceAccessOAuth(id, accountID, stateHash, verifier, subjectType, subjectID string, now time.Time) error {
+	id = strings.TrimSpace(id)
+	accountID = strings.TrimSpace(accountID)
+	stateHash = strings.TrimSpace(stateHash)
+	verifier = strings.TrimSpace(verifier)
+	subjectType = strings.TrimSpace(subjectType)
+	subjectID = strings.TrimSpace(subjectID)
+	if id == "" || accountID == "" || stateHash == "" || verifier == "" || subjectType == "" || subjectID == "" {
+		return fmt.Errorf("feishu resource access id, account, oauth state, verifier, and subject are required")
+	}
+	now = normalizedWorkflowTime(now)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.Exec(
+		`UPDATE feishu_resource_access_requests
+		 SET oauth_state_hash=?, pkce_verifier=?, subject_type=?, subject_id=?, updated_at_ms=?
+		 WHERE id=? AND account_id=? AND state=? AND oauth_state_hash='' AND pkce_verifier=''`,
+		stateHash, verifier, subjectType, subjectID, now.UnixMilli(),
+		id, accountID, FeishuResourceAccessStatePending,
+	)
+	if err != nil {
+		return fmt.Errorf("prepare feishu resource access oauth: %w", err)
+	}
+	return requireOneFeishuResourceAccessRow(result)
+}
+
+// SetFeishuResourceAccessCardMessageID binds the pending request to the exact card message.
+func (s *Store) SetFeishuResourceAccessCardMessageID(id, accountID, messageID string, now time.Time) error {
+	id = strings.TrimSpace(id)
+	accountID = strings.TrimSpace(accountID)
+	messageID = strings.TrimSpace(messageID)
+	if id == "" || accountID == "" || messageID == "" {
+		return fmt.Errorf("feishu resource access id, account, and card message id are required")
+	}
+	now = normalizedWorkflowTime(now)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.Exec(
+		`UPDATE feishu_resource_access_requests
+		 SET card_message_id=?, updated_at_ms=?
+		 WHERE id=? AND account_id=? AND state=? AND card_message_id=''`,
+		messageID, now.UnixMilli(), id, accountID, FeishuResourceAccessStatePending,
+	)
+	if err != nil {
+		return fmt.Errorf("bind feishu resource access card: %w", err)
+	}
+	return requireOneFeishuResourceAccessRow(result)
+}
+
+// GetFeishuResourceAccessRequest returns one request by its global ID and account.
+func (s *Store) GetFeishuResourceAccessRequest(id, accountID string) (FeishuResourceAccessRequest, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return FeishuResourceAccessRequest{}, err
+	}
+	return scanFeishuResourceAccessRequest(s.db.QueryRow(
+		feishuResourceAccessSelect+` WHERE id=? AND account_id=?`,
+		strings.TrimSpace(id), strings.TrimSpace(accountID),
+	))
+}
+
+// ClaimFeishuResourceAccessOAuth atomically consumes a valid OAuth state and
+// returns the PKCE verifier to the caller. Both stored one-time values are cleared.
+func (s *Store) ClaimFeishuResourceAccessOAuth(stateHash, accountID string, now time.Time) (FeishuResourceAccessRequest, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return FeishuResourceAccessRequest{}, err
+	}
+	stateHash = strings.TrimSpace(stateHash)
+	accountID = strings.TrimSpace(accountID)
+	if stateHash == "" || accountID == "" {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("feishu resource oauth state and account are required")
+	}
+	now = normalizedWorkflowTime(now)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("begin claim feishu resource oauth: %w", err)
+	}
+	defer tx.Rollback()
+	request, err := scanFeishuResourceAccessRequest(tx.QueryRow(
+		feishuResourceAccessSelect+` WHERE oauth_state_hash=? AND account_id=?`, stateHash, accountID,
+	))
+	if err != nil {
+		return FeishuResourceAccessRequest{}, err
+	}
+	if request.State != FeishuResourceAccessStatePending {
+		return request, ErrFeishuResourceAccessResolved
+	}
+	if !now.Before(request.ExpiresAt) {
+		if err := updateFeishuResourceAccessTerminal(tx, request.ID, request.AccountID, FeishuResourceAccessStateExpired, "", "", now); err != nil {
+			return FeishuResourceAccessRequest{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return FeishuResourceAccessRequest{}, fmt.Errorf("commit expired feishu resource oauth: %w", err)
+		}
+		request.State = FeishuResourceAccessStateExpired
+		request.OAuthStateHash = ""
+		request.PKCEVerifier = ""
+		request.UpdatedAt = now
+		return request, ErrFeishuResourceAccessExpired
+	}
+	result, err := tx.Exec(
+		`UPDATE feishu_resource_access_requests
+		 SET state=?, oauth_state_hash='', pkce_verifier='', updated_at_ms=?
+		 WHERE id=? AND account_id=? AND state=?`,
+		FeishuResourceAccessStateExecuting, now.UnixMilli(), request.ID, request.AccountID, FeishuResourceAccessStatePending,
+	)
+	if err != nil {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("claim feishu resource oauth: %w", err)
+	}
+	if err := requireOneFeishuResourceAccessRow(result); err != nil {
+		return FeishuResourceAccessRequest{}, err
+	}
+	if err := updateWorkflowRequestState(tx, request.ID, request.AccountID, WorkflowRequestStateExecuting, now); err != nil {
+		return FeishuResourceAccessRequest{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("commit claimed feishu resource oauth: %w", err)
+	}
+	request.State = FeishuResourceAccessStateExecuting
+	request.OAuthStateHash = ""
+	request.UpdatedAt = now
+	return request, nil
+}
+
+// DenyFeishuResourceAccessRequest consumes a pending request from its exact user/card context.
+func (s *Store) DenyFeishuResourceAccessRequest(id, accountID string, match FeishuResourceAccessMatch, now time.Time) (FeishuResourceAccessRequest, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return FeishuResourceAccessRequest{}, err
+	}
+	id = strings.TrimSpace(id)
+	accountID = strings.TrimSpace(accountID)
+	match = normalizeFeishuResourceAccessMatch(match)
+	if id == "" || accountID == "" {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("feishu resource access id and account are required")
+	}
+	now = normalizedWorkflowTime(now)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("begin deny feishu resource access: %w", err)
+	}
+	defer tx.Rollback()
+	request, err := feishuResourceAccessByID(tx, id, accountID)
+	if err != nil {
+		return FeishuResourceAccessRequest{}, err
+	}
+	if request.State != FeishuResourceAccessStatePending {
+		return request, ErrFeishuResourceAccessResolved
+	}
+	if !now.Before(request.ExpiresAt) {
+		if err := updateFeishuResourceAccessTerminal(tx, request.ID, request.AccountID, FeishuResourceAccessStateExpired, "", "", now); err != nil {
+			return FeishuResourceAccessRequest{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return FeishuResourceAccessRequest{}, fmt.Errorf("commit expired feishu resource access: %w", err)
+		}
+		request.State = FeishuResourceAccessStateExpired
+		request.PKCEVerifier = ""
+		request.OAuthStateHash = ""
+		request.UpdatedAt = now
+		return request, ErrFeishuResourceAccessExpired
+	}
+	if !feishuResourceAccessActorMatches(request, match) {
+		return request, ErrFeishuResourceAccessForbidden
+	}
+	if request.ChatID != match.ChatID || request.CardMessageID == "" || request.CardMessageID != match.CardMessageID {
+		return request, ErrFeishuResourceAccessContextMismatch
+	}
+	if err := updateFeishuResourceAccessTerminal(tx, request.ID, request.AccountID, FeishuResourceAccessStateDenied, "", "", now); err != nil {
+		return FeishuResourceAccessRequest{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("commit denied feishu resource access: %w", err)
+	}
+	request.State = FeishuResourceAccessStateDenied
+	request.PKCEVerifier = ""
+	request.OAuthStateHash = ""
+	request.UpdatedAt = now
+	return request, nil
+}
+
+// CompleteFeishuResourceAccessRequest marks a request as verified and optionally
+// upserts the durable chat-scoped grant in the same transaction.
+func (s *Store) CompleteFeishuResourceAccessRequest(id, accountID, source, verifiedPermission string, grant *FeishuResourceGrant, now time.Time) error {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return err
+	}
+	id = strings.TrimSpace(id)
+	accountID = strings.TrimSpace(accountID)
+	source = strings.TrimSpace(source)
+	verifiedPermission = strings.TrimSpace(verifiedPermission)
+	if id == "" || accountID == "" || !validFeishuResourceGrantSource(source) || !validFeishuResourcePermission(verifiedPermission) {
+		return fmt.Errorf("feishu resource access id, account, source, and verified permission are required")
+	}
+	now = normalizedWorkflowTime(now)
+	var normalizedGrant FeishuResourceGrant
+	if grant != nil {
+		normalizedGrant = normalizeFeishuResourceGrant(*grant)
+		if err := validateFeishuResourceGrant(normalizedGrant); err != nil {
+			return err
+		}
+		if normalizedGrant.AccountID != accountID || normalizedGrant.SourceRequestID != id {
+			return fmt.Errorf("feishu resource grant account and source request must match the access request")
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin complete feishu resource access: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(
+		`UPDATE feishu_resource_access_requests
+		 SET state=?, grant_source=?, verified_permission=?, oauth_state_hash='', pkce_verifier='', updated_at_ms=?
+		 WHERE id=? AND account_id=? AND state IN (?, ?)`,
+		FeishuResourceAccessStateSucceeded, source, verifiedPermission, now.UnixMilli(),
+		id, accountID, FeishuResourceAccessStatePending, FeishuResourceAccessStateExecuting,
+	)
+	if err != nil {
+		return fmt.Errorf("complete feishu resource access: %w", err)
+	}
+	if err := requireOneFeishuResourceAccessRow(result); err != nil {
+		return err
+	}
+	if grant != nil {
+		if err := upsertFeishuResourceGrant(tx, normalizedGrant); err != nil {
+			return err
+		}
+	}
+	if err := updateWorkflowRequestState(tx, id, accountID, WorkflowRequestStateSucceeded, now); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit completed feishu resource access: %w", err)
+	}
+	return nil
+}
+
+// FailFeishuResourceAccessRequest closes a pending or executing request and clears one-time secrets.
+func (s *Store) FailFeishuResourceAccessRequest(id, accountID string, now time.Time) error {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return err
+	}
+	id = strings.TrimSpace(id)
+	accountID = strings.TrimSpace(accountID)
+	if id == "" || accountID == "" {
+		return fmt.Errorf("feishu resource access id and account are required")
+	}
+	now = normalizedWorkflowTime(now)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin fail feishu resource access: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(
+		`UPDATE feishu_resource_access_requests
+		 SET state=?, oauth_state_hash='', pkce_verifier='', updated_at_ms=?
+		 WHERE id=? AND account_id=? AND state IN (?, ?)`,
+		FeishuResourceAccessStateFailed, now.UnixMilli(), id, accountID,
+		FeishuResourceAccessStatePending, FeishuResourceAccessStateExecuting,
+	)
+	if err != nil {
+		return fmt.Errorf("fail feishu resource access: %w", err)
+	}
+	if err := requireOneFeishuResourceAccessRow(result); err != nil {
+		return err
+	}
+	if err := updateWorkflowRequestState(tx, id, accountID, WorkflowRequestStateFailed, now); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit failed feishu resource access: %w", err)
+	}
+	return nil
+}
+
+// ExpireFeishuResourceAccessRequests expires stale pending OAuth requests.
+func (s *Store) ExpireFeishuResourceAccessRequests(accountID string, now time.Time) (int64, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return 0, err
+	}
+	accountID = strings.TrimSpace(accountID)
+	now = normalizedWorkflowTime(now)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin expire feishu resource access requests: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(
+		`UPDATE feishu_resource_access_requests
+		 SET state=?, oauth_state_hash='', pkce_verifier='', updated_at_ms=?
+		 WHERE account_id=? AND state=? AND expires_at_ms<=?`,
+		FeishuResourceAccessStateExpired, now.UnixMilli(), accountID,
+		FeishuResourceAccessStatePending, now.UnixMilli(),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("expire feishu resource access requests: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("inspect expired feishu resource access requests: %w", err)
+	}
+	if _, err := tx.Exec(
+		`UPDATE workflow_requests SET state=?, updated_at_ms=?
+		 WHERE account_id=? AND kind=? AND state=?
+		 AND id IN (SELECT id FROM feishu_resource_access_requests WHERE account_id=? AND state=? AND updated_at_ms=?)`,
+		WorkflowRequestStateExpired, now.UnixMilli(), accountID, WorkflowRequestKindFeishuResourceAccess,
+		WorkflowRequestStatePending, accountID, FeishuResourceAccessStateExpired, now.UnixMilli(),
+	); err != nil {
+		return 0, fmt.Errorf("expire feishu resource access workflows: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit expired feishu resource access requests: %w", err)
+	}
+	return count, nil
+}
+
+// FailExecutingFeishuResourceAccessRequests closes callbacks interrupted by a restart.
+func (s *Store) FailExecutingFeishuResourceAccessRequests(accountID string, now time.Time) (int64, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return 0, err
+	}
+	accountID = strings.TrimSpace(accountID)
+	now = normalizedWorkflowTime(now)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin fail executing feishu resource access requests: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(
+		`UPDATE feishu_resource_access_requests
+		 SET state=?, oauth_state_hash='', pkce_verifier='', updated_at_ms=?
+		 WHERE account_id=? AND state=?`,
+		FeishuResourceAccessStateFailed, now.UnixMilli(), accountID, FeishuResourceAccessStateExecuting,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("fail executing feishu resource access requests: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("inspect failed feishu resource access requests: %w", err)
+	}
+	if _, err := tx.Exec(
+		`UPDATE workflow_requests SET state=?, updated_at_ms=?
+		 WHERE account_id=? AND kind=? AND state=?`,
+		WorkflowRequestStateFailed, now.UnixMilli(), accountID,
+		WorkflowRequestKindFeishuResourceAccess, WorkflowRequestStateExecuting,
+	); err != nil {
+		return 0, fmt.Errorf("fail executing feishu resource access workflows: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit failed executing feishu resource access requests: %w", err)
+	}
+	return count, nil
+}
+
+// UpsertFeishuResourceGrant creates, renews, or upgrades one exact chat-scoped grant.
+func (s *Store) UpsertFeishuResourceGrant(grant FeishuResourceGrant) (FeishuResourceGrant, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return FeishuResourceGrant{}, err
+	}
+	grant = normalizeFeishuResourceGrant(grant)
+	if err := validateFeishuResourceGrant(grant); err != nil {
+		return FeishuResourceGrant{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := upsertFeishuResourceGrant(s.db, grant); err != nil {
+		return FeishuResourceGrant{}, err
+	}
+	return grant, nil
+}
+
+// ActiveFeishuResourceGrant returns an active exact-chat grant satisfying the requested permission.
+func (s *Store) ActiveFeishuResourceGrant(accountID, chatID, resourceType, resourceToken, permission string) (FeishuResourceGrant, bool, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return FeishuResourceGrant{}, false, err
+	}
+	permission = strings.TrimSpace(permission)
+	if !validFeishuResourcePermission(permission) {
+		return FeishuResourceGrant{}, false, fmt.Errorf("valid feishu resource permission is required")
+	}
+	grant, err := scanFeishuResourceGrant(s.db.QueryRow(
+		`SELECT account_id, chat_id, resource_type, resource_token, permission,
+		 subject_type, subject_id, source_request_id, state,
+		 created_at_ms, verified_at_ms, updated_at_ms
+		 FROM feishu_resource_grants
+		 WHERE account_id=? AND chat_id=? AND resource_type=? AND resource_token=? AND state=?`,
+		strings.TrimSpace(accountID), strings.TrimSpace(chatID), strings.TrimSpace(resourceType), strings.TrimSpace(resourceToken), FeishuResourceGrantStateActive,
+	))
+	if errors.Is(err, ErrFeishuResourceGrantNotFound) {
+		return FeishuResourceGrant{}, false, nil
+	}
+	if err != nil {
+		return FeishuResourceGrant{}, false, err
+	}
+	if !FeishuResourcePermissionSatisfies(grant.Permission, permission) {
+		return FeishuResourceGrant{}, false, nil
+	}
+	return grant, true, nil
+}
+
+// RevokeFeishuResourceGrant marks an exact chat-scoped grant unusable after a failed live check.
+func (s *Store) RevokeFeishuResourceGrant(accountID, chatID, resourceType, resourceToken string, now time.Time) error {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return err
+	}
+	now = normalizedWorkflowTime(now)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.Exec(
+		`UPDATE feishu_resource_grants SET state=?, updated_at_ms=?
+		 WHERE account_id=? AND chat_id=? AND resource_type=? AND resource_token=?`,
+		FeishuResourceGrantStateRevoked, now.UnixMilli(),
+		strings.TrimSpace(accountID), strings.TrimSpace(chatID), strings.TrimSpace(resourceType), strings.TrimSpace(resourceToken),
+	)
+	if err != nil {
+		return fmt.Errorf("revoke feishu resource grant: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("inspect revoked feishu resource grant: %w", err)
+	}
+	if count == 0 {
+		return ErrFeishuResourceGrantNotFound
+	}
+	return nil
+}
+
+// FeishuResourcePermissionSatisfies reports whether granted covers requested.
+func FeishuResourcePermissionSatisfies(granted, requested string) bool {
+	granted = strings.TrimSpace(granted)
+	requested = strings.TrimSpace(requested)
+	return granted == FeishuResourcePermissionWrite || granted == requested
+}
+
+const feishuResourceAccessSelect = `SELECT id, account_id, actor_open_id, actor_user_id,
+ chat_id, source_message_id, resource_type, resource_token, resource_url,
+ permission, reason, subject_type, subject_id, grant_source, verified_permission,
+ card_message_id, oauth_state_hash, pkce_verifier, state,
+ created_at_ms, expires_at_ms, updated_at_ms
+ FROM feishu_resource_access_requests`
+
+type feishuResourceAccessScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanFeishuBotResource(row feishuResourceAccessScanner) (FeishuBotResource, error) {
+	var resource FeishuBotResource
+	var createdAtMS, updatedAtMS int64
+	if err := row.Scan(
+		&resource.AccountID,
+		&resource.ResourceType,
+		&resource.ResourceToken,
+		&resource.ParentToken,
+		&resource.Name,
+		&resource.URL,
+		&resource.SourceRequestID,
+		&createdAtMS,
+		&updatedAtMS,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return FeishuBotResource{}, ErrFeishuBotResourceNotFound
+		}
+		return FeishuBotResource{}, fmt.Errorf("get feishu bot resource: %w", err)
+	}
+	resource.CreatedAt = time.UnixMilli(createdAtMS).UTC()
+	resource.UpdatedAt = time.UnixMilli(updatedAtMS).UTC()
+	return resource, nil
+}
+
+func scanFeishuResourceAccessRequest(row feishuResourceAccessScanner) (FeishuResourceAccessRequest, error) {
+	var request FeishuResourceAccessRequest
+	var createdAtMS, expiresAtMS, updatedAtMS int64
+	if err := row.Scan(
+		&request.ID,
+		&request.AccountID,
+		&request.ActorOpenID,
+		&request.ActorUserID,
+		&request.ChatID,
+		&request.SourceMessageID,
+		&request.ResourceType,
+		&request.ResourceToken,
+		&request.ResourceURL,
+		&request.Permission,
+		&request.Reason,
+		&request.SubjectType,
+		&request.SubjectID,
+		&request.GrantSource,
+		&request.VerifiedPermission,
+		&request.CardMessageID,
+		&request.OAuthStateHash,
+		&request.PKCEVerifier,
+		&request.State,
+		&createdAtMS,
+		&expiresAtMS,
+		&updatedAtMS,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return FeishuResourceAccessRequest{}, ErrFeishuResourceAccessNotFound
+		}
+		return FeishuResourceAccessRequest{}, fmt.Errorf("get feishu resource access request: %w", err)
+	}
+	request.CreatedAt = time.UnixMilli(createdAtMS).UTC()
+	request.ExpiresAt = time.UnixMilli(expiresAtMS).UTC()
+	request.UpdatedAt = time.UnixMilli(updatedAtMS).UTC()
+	return request, nil
+}
+
+func scanFeishuResourceGrant(row feishuResourceAccessScanner) (FeishuResourceGrant, error) {
+	var grant FeishuResourceGrant
+	var createdAtMS, verifiedAtMS, updatedAtMS int64
+	if err := row.Scan(
+		&grant.AccountID,
+		&grant.ChatID,
+		&grant.ResourceType,
+		&grant.ResourceToken,
+		&grant.Permission,
+		&grant.SubjectType,
+		&grant.SubjectID,
+		&grant.SourceRequestID,
+		&grant.State,
+		&createdAtMS,
+		&verifiedAtMS,
+		&updatedAtMS,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return FeishuResourceGrant{}, ErrFeishuResourceGrantNotFound
+		}
+		return FeishuResourceGrant{}, fmt.Errorf("get feishu resource grant: %w", err)
+	}
+	grant.CreatedAt = time.UnixMilli(createdAtMS).UTC()
+	grant.VerifiedAt = time.UnixMilli(verifiedAtMS).UTC()
+	grant.UpdatedAt = time.UnixMilli(updatedAtMS).UTC()
+	return grant, nil
+}
+
+func normalizeFeishuBotResource(resource FeishuBotResource) FeishuBotResource {
+	resource.AccountID = strings.TrimSpace(resource.AccountID)
+	resource.ResourceType = strings.TrimSpace(resource.ResourceType)
+	resource.ResourceToken = strings.TrimSpace(resource.ResourceToken)
+	resource.ParentToken = strings.TrimSpace(resource.ParentToken)
+	resource.Name = strings.TrimSpace(resource.Name)
+	resource.URL = strings.TrimSpace(resource.URL)
+	resource.SourceRequestID = strings.TrimSpace(resource.SourceRequestID)
+	resource.CreatedAt = normalizedWorkflowTime(resource.CreatedAt)
+	resource.UpdatedAt = resource.CreatedAt
+	return resource
+}
+
+func validateFeishuBotResource(resource FeishuBotResource) error {
+	if resource.AccountID == "" || resource.ResourceType == "" || resource.ResourceToken == "" {
+		return fmt.Errorf("feishu bot resource account, type, and token are required")
+	}
+	return nil
+}
+
+func normalizeFeishuResourceAccessRequest(request FeishuResourceAccessRequest) FeishuResourceAccessRequest {
+	request.ID = strings.TrimSpace(request.ID)
+	request.AccountID = strings.TrimSpace(request.AccountID)
+	request.ActorOpenID = strings.TrimSpace(request.ActorOpenID)
+	request.ActorUserID = strings.TrimSpace(request.ActorUserID)
+	request.ChatID = strings.TrimSpace(request.ChatID)
+	request.SourceMessageID = strings.TrimSpace(request.SourceMessageID)
+	request.ResourceType = strings.TrimSpace(request.ResourceType)
+	request.ResourceToken = strings.TrimSpace(request.ResourceToken)
+	request.ResourceURL = strings.TrimSpace(request.ResourceURL)
+	request.Permission = strings.TrimSpace(request.Permission)
+	request.Reason = strings.TrimSpace(request.Reason)
+	request.SubjectType = strings.TrimSpace(request.SubjectType)
+	request.SubjectID = strings.TrimSpace(request.SubjectID)
+	request.CreatedAt = normalizedWorkflowTime(request.CreatedAt)
+	request.ExpiresAt = request.ExpiresAt.UTC()
+	return request
+}
+
+func validateNewFeishuResourceAccessRequest(request FeishuResourceAccessRequest) error {
+	if request.AccountID == "" || request.ChatID == "" || request.ResourceType == "" || request.ResourceToken == "" || !validFeishuResourcePermission(request.Permission) {
+		return fmt.Errorf("feishu resource access account, chat, resource, and valid permission are required")
+	}
+	if request.ActorOpenID == "" && request.ActorUserID == "" {
+		return fmt.Errorf("feishu resource access requesting user is required")
+	}
+	if !request.ExpiresAt.After(request.CreatedAt) {
+		return fmt.Errorf("feishu resource access expires_at must be after created_at")
+	}
+	return nil
+}
+
+func normalizeFeishuResourceAccessMatch(match FeishuResourceAccessMatch) FeishuResourceAccessMatch {
+	match.ActorOpenID = strings.TrimSpace(match.ActorOpenID)
+	match.ActorUserID = strings.TrimSpace(match.ActorUserID)
+	match.ChatID = strings.TrimSpace(match.ChatID)
+	match.CardMessageID = strings.TrimSpace(match.CardMessageID)
+	return match
+}
+
+func normalizeFeishuResourceGrant(grant FeishuResourceGrant) FeishuResourceGrant {
+	grant.AccountID = strings.TrimSpace(grant.AccountID)
+	grant.ChatID = strings.TrimSpace(grant.ChatID)
+	grant.ResourceType = strings.TrimSpace(grant.ResourceType)
+	grant.ResourceToken = strings.TrimSpace(grant.ResourceToken)
+	grant.Permission = strings.TrimSpace(grant.Permission)
+	grant.SubjectType = strings.TrimSpace(grant.SubjectType)
+	grant.SubjectID = strings.TrimSpace(grant.SubjectID)
+	grant.SourceRequestID = strings.TrimSpace(grant.SourceRequestID)
+	grant.State = strings.TrimSpace(grant.State)
+	if grant.State == "" {
+		grant.State = FeishuResourceGrantStateActive
+	}
+	grant.CreatedAt = normalizedWorkflowTime(grant.CreatedAt)
+	grant.VerifiedAt = normalizedWorkflowTime(grant.VerifiedAt)
+	grant.UpdatedAt = grant.VerifiedAt
+	return grant
+}
+
+func validateFeishuResourceGrant(grant FeishuResourceGrant) error {
+	if grant.AccountID == "" || grant.ChatID == "" || grant.ResourceType == "" || grant.ResourceToken == "" ||
+		grant.SubjectType == "" || grant.SubjectID == "" || grant.SourceRequestID == "" || !validFeishuResourcePermission(grant.Permission) {
+		return fmt.Errorf("feishu resource grant account, chat, resource, permission, subject, and source request are required")
+	}
+	if grant.State != FeishuResourceGrantStateActive && grant.State != FeishuResourceGrantStateRevoked {
+		return fmt.Errorf("unsupported feishu resource grant state %q", grant.State)
+	}
+	return nil
+}
+
+func validFeishuResourcePermission(permission string) bool {
+	return permission == FeishuResourcePermissionRead || permission == FeishuResourcePermissionWrite
+}
+
+func validFeishuResourceGrantSource(source string) bool {
+	return source == FeishuResourceGrantSourceBotOwner || source == FeishuResourceGrantSourceExistingGrant || source == FeishuResourceGrantSourceNewlyGranted
+}
+
+func validFeishuResourceAccessTerminalState(state string) bool {
+	return state == FeishuResourceAccessStateDenied || state == FeishuResourceAccessStateFailed || state == FeishuResourceAccessStateExpired
+}
+
+func feishuResourceAccessActorMatches(request FeishuResourceAccessRequest, match FeishuResourceAccessMatch) bool {
+	if request.ActorOpenID != "" {
+		return request.ActorOpenID == match.ActorOpenID
+	}
+	return request.ActorUserID != "" && request.ActorUserID == match.ActorUserID
+}
+
+type feishuResourceAccessQueryer interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+func feishuResourceAccessByID(queryer feishuResourceAccessQueryer, id, accountID string) (FeishuResourceAccessRequest, error) {
+	return scanFeishuResourceAccessRequest(queryer.QueryRow(
+		feishuResourceAccessSelect+` WHERE id=? AND account_id=?`, id, accountID,
+	))
+}
+
+func updateFeishuResourceAccessTerminal(tx *sql.Tx, id, accountID, state, source, permission string, now time.Time) error {
+	if !validFeishuResourceAccessTerminalState(state) {
+		return fmt.Errorf("unsupported terminal feishu resource access state %q", state)
+	}
+	result, err := tx.Exec(
+		`UPDATE feishu_resource_access_requests
+		 SET state=?, grant_source=?, verified_permission=?, oauth_state_hash='', pkce_verifier='', updated_at_ms=?
+		 WHERE id=? AND account_id=? AND state=?`,
+		state, source, permission, now.UnixMilli(), id, accountID, FeishuResourceAccessStatePending,
+	)
+	if err != nil {
+		return fmt.Errorf("update terminal feishu resource access: %w", err)
+	}
+	if err := requireOneFeishuResourceAccessRow(result); err != nil {
+		return err
+	}
+	return updateWorkflowRequestState(tx, id, accountID, state, now)
+}
+
+type feishuResourceGrantExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func upsertFeishuResourceGrant(execer feishuResourceGrantExecer, grant FeishuResourceGrant) error {
+	_, err := execer.Exec(
+		`INSERT INTO feishu_resource_grants (
+			account_id, chat_id, resource_type, resource_token, permission,
+			subject_type, subject_id, source_request_id, state,
+			created_at_ms, verified_at_ms, updated_at_ms
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(account_id, chat_id, resource_type, resource_token) DO UPDATE SET
+			permission=CASE
+				WHEN feishu_resource_grants.permission='write' OR excluded.permission='write' THEN 'write'
+				ELSE 'read'
+			END,
+			subject_type=excluded.subject_type,
+			subject_id=excluded.subject_id,
+			source_request_id=excluded.source_request_id,
+			state=excluded.state,
+			verified_at_ms=excluded.verified_at_ms,
+			updated_at_ms=excluded.updated_at_ms`,
+		grant.AccountID,
+		grant.ChatID,
+		grant.ResourceType,
+		grant.ResourceToken,
+		grant.Permission,
+		grant.SubjectType,
+		grant.SubjectID,
+		grant.SourceRequestID,
+		grant.State,
+		grant.CreatedAt.UnixMilli(),
+		grant.VerifiedAt.UnixMilli(),
+		grant.UpdatedAt.UnixMilli(),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert feishu resource grant: %w", err)
+	}
+	return nil
+}
+
+func requireOneFeishuResourceAccessRow(result sql.Result) error {
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("inspect feishu resource access update: %w", err)
+	}
+	if count != 1 {
+		return ErrFeishuResourceAccessResolved
+	}
+	return nil
+}

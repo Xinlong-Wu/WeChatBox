@@ -73,6 +73,16 @@ func TestWorkflowMigrationBackfillsApprovalsAndRenamesGrantSource(t *testing.T) 
 			created_at_ms INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
 			PRIMARY KEY (account_id, tool_name, actor_type, actor_id, chat_id)
 		)`,
+		`CREATE TABLE feishu_chat_folders (
+			account_id TEXT NOT NULL, chat_id TEXT NOT NULL, folder_token TEXT NOT NULL,
+			name TEXT NOT NULL, url TEXT NOT NULL DEFAULT '', parent_folder_token TEXT NOT NULL DEFAULT '',
+			is_default INTEGER NOT NULL DEFAULT 0, share_member_type TEXT NOT NULL,
+			share_member_id TEXT NOT NULL, share_state TEXT NOT NULL,
+			create_request_id TEXT NOT NULL UNIQUE, created_by_open_id TEXT NOT NULL DEFAULT '',
+			created_by_user_id TEXT NOT NULL DEFAULT '', created_at_ms INTEGER NOT NULL,
+			updated_at_ms INTEGER NOT NULL,
+			PRIMARY KEY (account_id, chat_id, folder_token)
+		)`,
 		`INSERT INTO tool_approvals VALUES (
 			'legacy_request', 'feishu:cli_test', 'feishu_docs_create', 'ou_requester', '',
 			'oc_chat', 'om_source', 'om_card', '{}', 'pending', 1, 60001, 1
@@ -80,6 +90,11 @@ func TestWorkflowMigrationBackfillsApprovalsAndRenamesGrantSource(t *testing.T) 
 		`INSERT INTO tool_approval_grants VALUES (
 			'feishu:cli_test', 'feishu_docs_create', 'open_id', 'ou_requester', 'oc_chat',
 			'legacy_request', 1, 60001, 1
+		)`,
+		`INSERT INTO feishu_chat_folders VALUES (
+			'feishu:cli_test', 'oc_chat', 'fld_legacy', 'Legacy Folder',
+			'https://docs.feishu.cn/drive/folder/fld_legacy', '', 1, 'openchat', 'oc_chat',
+			'succeeded', 'req_folder', 'ou_requester', 'u_requester', 1, 1
 		)`,
 	}
 	for _, statement := range statements {
@@ -107,5 +122,9 @@ func TestWorkflowMigrationBackfillsApprovalsAndRenamesGrantSource(t *testing.T) 
 	}
 	if sourceRequestID != "legacy_request" {
 		t.Fatalf("source_request_id = %q, want legacy_request", sourceRequestID)
+	}
+	resource, err := st.GetFeishuBotResource("feishu:cli_test", "folder", "fld_legacy")
+	if err != nil || resource.Name != "Legacy Folder" || resource.SourceRequestID != "req_folder" {
+		t.Fatalf("backfilled bot resource = %#v err=%v", resource, err)
 	}
 }

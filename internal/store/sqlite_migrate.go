@@ -97,6 +97,57 @@ func (s *Store) migrate() error {
 			updated_at_ms INTEGER NOT NULL,
 			PRIMARY KEY (account_id, chat_id, document_token)
 		)`,
+		`CREATE TABLE IF NOT EXISTS feishu_bot_resources (
+			account_id TEXT NOT NULL,
+			resource_type TEXT NOT NULL,
+			resource_token TEXT NOT NULL,
+			parent_token TEXT NOT NULL DEFAULT '',
+			name TEXT NOT NULL DEFAULT '',
+			url TEXT NOT NULL DEFAULT '',
+			source_request_id TEXT NOT NULL DEFAULT '',
+			created_at_ms INTEGER NOT NULL,
+			updated_at_ms INTEGER NOT NULL,
+			PRIMARY KEY (account_id, resource_type, resource_token)
+		)`,
+		`CREATE TABLE IF NOT EXISTS feishu_resource_access_requests (
+			id TEXT PRIMARY KEY,
+			account_id TEXT NOT NULL,
+			actor_open_id TEXT NOT NULL DEFAULT '',
+			actor_user_id TEXT NOT NULL DEFAULT '',
+			chat_id TEXT NOT NULL,
+			source_message_id TEXT NOT NULL DEFAULT '',
+			resource_type TEXT NOT NULL,
+			resource_token TEXT NOT NULL,
+			resource_url TEXT NOT NULL DEFAULT '',
+			permission TEXT NOT NULL,
+			reason TEXT NOT NULL DEFAULT '',
+			subject_type TEXT NOT NULL DEFAULT '',
+			subject_id TEXT NOT NULL DEFAULT '',
+			grant_source TEXT NOT NULL DEFAULT '',
+			verified_permission TEXT NOT NULL DEFAULT '',
+			card_message_id TEXT NOT NULL DEFAULT '',
+			oauth_state_hash TEXT NOT NULL DEFAULT '',
+			pkce_verifier TEXT NOT NULL DEFAULT '',
+			state TEXT NOT NULL,
+			created_at_ms INTEGER NOT NULL,
+			expires_at_ms INTEGER NOT NULL,
+			updated_at_ms INTEGER NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS feishu_resource_grants (
+			account_id TEXT NOT NULL,
+			chat_id TEXT NOT NULL,
+			resource_type TEXT NOT NULL,
+			resource_token TEXT NOT NULL,
+			permission TEXT NOT NULL,
+			subject_type TEXT NOT NULL,
+			subject_id TEXT NOT NULL,
+			source_request_id TEXT NOT NULL,
+			state TEXT NOT NULL,
+			created_at_ms INTEGER NOT NULL,
+			verified_at_ms INTEGER NOT NULL,
+			updated_at_ms INTEGER NOT NULL,
+			PRIMARY KEY (account_id, chat_id, resource_type, resource_token)
+		)`,
 	}
 
 	for _, q := range queries {
@@ -114,6 +165,16 @@ func (s *Store) migrate() error {
 	); err != nil {
 		return fmt.Errorf("migrate workflow requests: %w", err)
 	}
+	if _, err := s.db.Exec(
+		`INSERT OR IGNORE INTO feishu_bot_resources (
+			account_id, resource_type, resource_token, parent_token, name, url,
+			source_request_id, created_at_ms, updated_at_ms
+		) SELECT account_id, 'folder', folder_token, parent_folder_token, name, url,
+			create_request_id, created_at_ms, updated_at_ms
+		  FROM feishu_chat_folders`,
+	); err != nil {
+		return fmt.Errorf("backfill feishu bot folders: %w", err)
+	}
 	indexes := []string{
 		`CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_archived ON sessions(user_id, archived)`,
@@ -129,6 +190,14 @@ func (s *Store) migrate() error {
 			 ON feishu_chat_folders(account_id, chat_id, created_at_ms)`,
 		`CREATE INDEX IF NOT EXISTS idx_feishu_chat_documents_folder
 			 ON feishu_chat_documents(account_id, chat_id, folder_token)`,
+		`CREATE INDEX IF NOT EXISTS idx_feishu_bot_resources_account_type
+			 ON feishu_bot_resources(account_id, resource_type, created_at_ms)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_feishu_resource_access_oauth_state
+			 ON feishu_resource_access_requests(oauth_state_hash) WHERE oauth_state_hash<>''`,
+		`CREATE INDEX IF NOT EXISTS idx_feishu_resource_access_account_state
+			 ON feishu_resource_access_requests(account_id, state, expires_at_ms)`,
+		`CREATE INDEX IF NOT EXISTS idx_feishu_resource_grants_account_chat
+			 ON feishu_resource_grants(account_id, chat_id, state, updated_at_ms)`,
 	}
 	for _, q := range indexes {
 		if _, err := s.db.Exec(q); err != nil {

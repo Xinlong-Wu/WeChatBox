@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"errors"
 	"testing"
 	"time"
@@ -165,6 +166,39 @@ func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("SaveFeishuChatDocument returned error: %v", err)
 		}
+		if _, err := st.SaveFeishuBotResource(FeishuBotResource{
+			AccountID:       accountID,
+			ResourceType:    "folder",
+			ResourceToken:   folder.FolderToken,
+			Name:            folder.Name,
+			SourceRequestID: request.ID,
+			CreatedAt:       now,
+		}); err != nil {
+			t.Fatalf("SaveFeishuBotResource returned error: %v", err)
+		}
+		access, err := st.CreateFeishuResourceAccessRequest(FeishuResourceAccessRequest{
+			AccountID:     accountID,
+			ActorOpenID:   "ou_requester",
+			ChatID:        folder.ChatID,
+			ResourceType:  "folder",
+			ResourceToken: folder.FolderToken,
+			Permission:    FeishuResourcePermissionWrite,
+			CreatedAt:     now,
+			ExpiresAt:     now.Add(time.Minute),
+		})
+		if err != nil {
+			t.Fatalf("CreateFeishuResourceAccessRequest returned error: %v", err)
+		}
+		if err := st.CompleteFeishuResourceAccessRequest(
+			access.ID,
+			accountID,
+			FeishuResourceGrantSourceBotOwner,
+			FeishuResourcePermissionWrite,
+			nil,
+			now,
+		); err != nil {
+			t.Fatalf("CompleteFeishuResourceAccessRequest returned error: %v", err)
+		}
 	}
 	if err := st.DeleteFeishuDocsData("feishu:first"); err != nil {
 		t.Fatalf("DeleteFeishuDocsData returned error: %v", err)
@@ -174,6 +208,26 @@ func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
 	}
 	if folders, err := st.ListFeishuChatFolders("feishu:second", "oc_chat"); err != nil || len(folders) != 1 {
 		t.Fatalf("other account folders = %#v err=%v", folders, err)
+	}
+	if _, err := st.GetFeishuBotResource("feishu:first", "folder", "fld_feishu:first"); !errors.Is(err, ErrFeishuBotResourceNotFound) {
+		t.Fatalf("deleted account bot resource error = %v, want ErrFeishuBotResourceNotFound", err)
+	}
+	if _, err := st.GetFeishuBotResource("feishu:second", "folder", "fld_feishu:second"); err != nil {
+		t.Fatalf("other account bot resource error = %v", err)
+	}
+	var deletedAccessID string
+	if err := st.db.QueryRow(
+		`SELECT id FROM workflow_requests WHERE account_id=? AND kind=?`,
+		"feishu:first", WorkflowRequestKindFeishuResourceAccess,
+	).Scan(&deletedAccessID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deleted account resource workflow query error = %v, want sql.ErrNoRows", err)
+	}
+	var otherAccessID string
+	if err := st.db.QueryRow(
+		`SELECT id FROM workflow_requests WHERE account_id=? AND kind=?`,
+		"feishu:second", WorkflowRequestKindFeishuResourceAccess,
+	).Scan(&otherAccessID); err != nil || otherAccessID == "" {
+		t.Fatalf("other account resource workflow id = %q err=%v", otherAccessID, err)
 	}
 }
 
