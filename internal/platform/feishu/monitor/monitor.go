@@ -74,8 +74,7 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 	if err != nil {
 		return fmt.Errorf("resolve feishu bot identity for account %s: %w", acc.Name, err)
 	}
-	tools := feishutools.NewDocsTools(restClient, p.config.Tools)
-	tools = append(tools, feishutools.NewLiteLLMAccountTools(restClient, p.config.Tools)...)
+	tools := newFeishuTools(restClient, p.config.Tools)
 	if names := toolNames(tools); len(names) > 0 {
 		feishuLog.Info(ctx, "registered tools for account %s (%s): %s", acc.Name, acc.ID, strings.Join(names, ", "))
 	} else {
@@ -117,6 +116,13 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 	feishuLog.Info(ctx, "registered events for account %s (%s): %s", acc.Name, acc.ID, strings.Join(registeredEvents, ", "))
 	feishuLog.Info(ctx, "starting for account %s (%s)", acc.Name, acc.ID)
 	return runClient(ctx, wsClient)
+}
+
+func newFeishuTools(client *lark.Client, cfg feishutools.Config) []tooltypes.Tool {
+	tools := feishutools.NewChatHistoryTools(client, cfg)
+	tools = append(tools, feishutools.NewDocsTools(client, cfg)...)
+	tools = append(tools, feishutools.NewLiteLLMAccountTools(client, cfg)...)
+	return tools
 }
 
 func toolNames(tools []tooltypes.Tool) []string {

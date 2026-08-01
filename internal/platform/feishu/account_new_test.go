@@ -222,6 +222,8 @@ func TestLoadConfigParsesSharedToolsConfig(t *testing.T) {
     - ""
   allowed_space_ids:
     - spc_token
+  chat_history:
+    enabled: true
   docs:
     enabled: true
     allow_write: true
@@ -256,6 +258,9 @@ func TestLoadConfigParsesSharedToolsConfig(t *testing.T) {
 	}
 	if got := tools.AllowedSpaceIDs; len(got) != 1 || got[0] != "spc_token" {
 		t.Fatalf("allowed_space_ids = %#v, want spc_token", got)
+	}
+	if !tools.ChatHistory.Enabled {
+		t.Fatalf("chat history config = %#v, want enabled", tools.ChatHistory)
 	}
 	if !tools.Docs.Enabled || !tools.Docs.AllowWrite {
 		t.Fatalf("docs config = %#v, want enabled write tools", tools.Docs)

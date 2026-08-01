@@ -159,6 +159,11 @@ func (b *bot) processMessage(in incomingMessage) {
 		OpenID: in.SenderOpenID,
 		UserID: in.SenderUserID,
 	})
+	ctx = feishutools.WithChatContext(ctx, feishutools.ChatContext{
+		ChatID:    in.ChatID,
+		MessageID: in.MessageID,
+		IsGroup:   in.IsGroup,
+	})
 	resp := feishuResponder{sender: b.sender, chatID: in.ChatID, messageID: in.MessageID, replyToMessageID: in.ReplyToMessageID, mentions: in.Mentions}
 	if in.Unsupported {
 		if err := resp.Send(ctx, core.OutboundMessage{Text: unsupportedMessageText}); err != nil {

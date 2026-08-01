@@ -136,6 +136,14 @@ platforms:
       max_chars: 12000
       allowed_folder_tokens: []
       allowed_space_ids: []
+
+      chat_history:
+        # Disabled by default. When enabled, tool-capable models can read up to
+        # 100 recent messages from the current trusted Feishu chat_id. The model
+        # cannot select another chat. Group history requires the Feishu
+        # permission shown as "获取群组中所有消息", and the bot must be in the group.
+        enabled: false
+
       docs:
         # Disabled by default. When enabled, the Feishu app's tenant access
         # token is used, so document visibility follows app permissions rather
