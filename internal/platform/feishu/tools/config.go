@@ -8,8 +8,14 @@ type Config struct {
 	MaxChars            int                `yaml:"max_chars,omitempty"`
 	AllowedFolderTokens []string           `yaml:"allowed_folder_tokens,omitempty"`
 	AllowedSpaceIDs     []string           `yaml:"allowed_space_ids,omitempty"`
+	ChatHistory         ChatHistoryConfig  `yaml:"chat_history,omitempty"`
 	Docs                DocsToolsConfig    `yaml:"docs,omitempty"`
 	LiteLLM             LiteLLMToolsConfig `yaml:"litellm,omitempty"`
+}
+
+// ChatHistoryConfig controls the current-chat Feishu message history tool.
+type ChatHistoryConfig struct {
+	Enabled bool `yaml:"enabled,omitempty"`
 }
 
 // DocsToolsConfig controls Feishu document tools exposed to tool-capable models.

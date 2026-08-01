@@ -39,6 +39,8 @@ type fakeProcessor struct {
 	metadata    map[string]string
 	actor       feishutools.Actor
 	actorOK     bool
+	chat        feishutools.ChatContext
+	chatOK      bool
 	tools       int
 	called      bool
 	calls       int
@@ -56,6 +58,8 @@ type fakeProcessorSnapshot struct {
 	metadata    map[string]string
 	actor       feishutools.Actor
 	actorOK     bool
+	chat        feishutools.ChatContext
+	chatOK      bool
 	tools       int
 	called      bool
 	calls       int
@@ -63,6 +67,7 @@ type fakeProcessorSnapshot struct {
 
 func (f *fakeProcessor) Handle(ctx context.Context, msg core.InboundMessage, sender core.Sender) error {
 	actor, actorOK := feishutools.ActorFromContext(ctx)
+	chat, chatOK := feishutools.ChatContextFromContext(ctx)
 	f.mu.Lock()
 	f.called = true
 	f.platform = msg.Platform
@@ -74,6 +79,8 @@ func (f *fakeProcessor) Handle(ctx context.Context, msg core.InboundMessage, sen
 	f.metadata = msg.Metadata
 	f.actor = actor
 	f.actorOK = actorOK
+	f.chat = chat
+	f.chatOK = chatOK
 	f.tools = len(msg.Tools)
 	f.calls++
 	started := f.started
@@ -275,6 +282,8 @@ func (f *fakeProcessor) snapshot() fakeProcessorSnapshot {
 		metadata:    f.metadata,
 		actor:       f.actor,
 		actorOK:     f.actorOK,
+		chat:        f.chat,
+		chatOK:      f.chatOK,
 		tools:       f.tools,
 		called:      f.called,
 		calls:       f.calls,
@@ -924,11 +933,22 @@ func TestHandleGroupTextMessageRepliesToOriginal(t *testing.T) {
 	if !processorSnap.actorOK || processorSnap.actor.OpenID != "ou_user" {
 		t.Fatalf("processor actor = %#v ok=%v, want sender open_id", processorSnap.actor, processorSnap.actorOK)
 	}
+	if !processorSnap.chatOK || processorSnap.chat.ChatID != "oc_chat" || processorSnap.chat.MessageID != "om_message" || !processorSnap.chat.IsGroup {
+		t.Fatalf("processor chat = %#v ok=%v, want current group chat", processorSnap.chat, processorSnap.chatOK)
+	}
 	if len(senderSnap.replyCreates) != 1 || senderSnap.replyCreates[0].messageID != "om_message" || senderSnap.replyCreates[0].text != "ok" {
 		t.Fatalf("reply creates = %#v, want ok reply to om_message", senderSnap.replyCreates)
 	}
 	if len(senderSnap.messages) != 0 {
 		t.Fatalf("messages = %#v, want no plain sends", senderSnap.messages)
+	}
+}
+
+func TestNewFeishuToolsRegistersEnabledChatHistory(t *testing.T) {
+	cfg := feishutools.Config{ChatHistory: feishutools.ChatHistoryConfig{Enabled: true}}
+	names := toolNames(newFeishuTools(&lark.Client{}, cfg))
+	if len(names) != 1 || names[0] != "feishu_chat_history_get" {
+		t.Fatalf("tool names = %#v, want chat history", names)
 	}
 }
 
