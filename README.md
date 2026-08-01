@@ -68,7 +68,9 @@ If Feishu credentials are omitted, LingoBridge prompts for them interactively:
 
 Feishu app credentials are saved under `platforms.feishu.accounts` in the
 shared `~/.lingobridge/config.yaml`. Those config entries are the Feishu
-account source used by `account list` and `run`.
+account source used by `account list` and `run`. Re-running `account new
+feishu` for the same account name updates its app credentials while preserving
+the existing OAuth base URL, redirect URI, and callback listener settings.
 
 Or add a GitHub App PR review account:
 
@@ -114,7 +116,9 @@ configuration.
 Listens to all enabled accounts concurrently. If no enabled accounts exist yet,
 it stays running and waits for a later account reload. Use `--account` to run a
 specific one, and `--verbose` to set the log level (`all`, `debug`, `info`,
-`warn`, or `error`; default `info`). Use `all` to include Feishu SDK debug logs:
+`warn`, or `error`; default `info`). Use `all` to include Feishu SDK diagnostics.
+Raw long-connection event/card payloads are still suppressed because they may
+contain user-entered form data or callback tokens.
 
 If all active account monitors exit because of a non-cancellation error, such as
 invalid account or platform config, `run` exits and prints the monitor error.
@@ -361,13 +365,27 @@ and the current chat's default Bot folder.
 Every folder or document creation must first call
 `feishu_docs_request_access` for `folder/write` on the actual parent or target
 folder, then pass its granted `request_id` to the create tool as
-`access_request_id`. Bot-owned resources return `granted` immediately. For
+`access_request_id`. A granted access request remains usable only until its
+returned `expires_at` and is atomically consumed by exactly one concrete create
+workflow immediately before the Feishu create API call. It remains consumed if
+that API reports an error, avoiding an unsafe duplicate after an uncertain
+external side effect. Bot-owned resources return `granted` immediately. For
 other resources, LingoBridge first checks an exact
 `account_id + chat_id + resource_type + resource_token` grant and verifies it
 against Feishu in real time. If access is missing, it sends a Card V2 link to
 Feishu's official OAuth authorization page. The authorization request and any
 later create-time validation remain bound to the original Feishu user and
 chat; the model cannot provide another `chat_id`.
+
+`feishu_docs_read` and `feishu_docs_append` continue to work directly for a
+document already bound to the current chat. For an unbound external Docx, call
+`feishu_docs_request_access` for `docx/read` or `docx/write` respectively and
+pass the granted `request_id` as `access_request_id`. That permission is
+live-checked on each operation, and the external document is not permanently
+bound to the chat. A Bot-owned document missing its local binding is repaired
+only when its recorded parent is a fully shared Bot folder in the same chat;
+Bot-owned documents from another chat are rejected even if their token is
+provided.
 
 The OAuth callback uses state hashing and PKCE S256. Feishu's authorization
 code is valid for five minutes and can be exchanged only once. LingoBridge
@@ -424,10 +442,13 @@ permission was revoked, no document-create API call is made. The approval
 callback responds within three seconds; terminal denial/expiry states can
 replace the card in that response, while an approved asynchronous operation
 uses the callback token and Feishu's delayed card-update API for its final
-state. If the document exists but initial content append or local registration
-fails, the result reports partial success and tells the model not to create a
-duplicate. `feishu_docs_append` remains an immediate write tool restricted to a
-document already bound to the current trusted chat.
+state. After Feishu creates the document, LingoBridge records Bot ownership and
+the current-chat binding before appending optional initial content. If any
+post-create step fails, the result reports partial success and tells the model
+not to create a duplicate; an initial append failure can be recovered through
+`feishu_docs_append`. `feishu_docs_append` remains an immediate write tool restricted to a
+document bound to the current trusted chat or an external Docx accompanied by
+a live `docx/write` access request.
 
 Pending operation and resource-access requests survive process restarts in the
 Feishu platform SQLite database. The document payload is retained only while
@@ -437,7 +458,9 @@ is cleared when the callback claims it. Operations interrupted while already
 executing are marked failed rather than retried automatically, avoiding
 duplicate creation. Resource grants store only chat/resource scope,
 collaborator identity, permission, source request, state, and timestamps; they
-contain no user OAuth token and are rechecked before use.
+contain no user OAuth token and are rechecked before use. Successful resource
+access requests also record the consuming create workflow ID and timestamp so
+concurrent or repeated create calls cannot reuse the same credential.
 
 The app needs a message permission that can both send and update bot cards;
 `im:message:send_as_bot` is the recommended narrow permission, while
@@ -628,7 +651,7 @@ guarded tools exposed for the current PR.
 | `platforms.feishu.tools.max_chars` | `12000` | Shared maximum character count for Feishu tools that return content, including `feishu_chat_history_get` and `feishu_docs_read` |
 | `platforms.feishu.tools.chat_history.enabled` | `false` | Enable `feishu_chat_history_get` for the current trusted Feishu `chat_id`; each call returns at most 100 messages |
 | `platforms.feishu.tools.docs.enabled` | `false` | Enable Feishu Docs tools for tool-capable LLM profiles |
-| `platforms.feishu.tools.docs.allow_write` | `false` | Register folder/document create and append tools. Every create requires a granted resource `access_request_id`; document create additionally requires requester-only operation approval unless the same user, bot account, chat, and tool have an active 24-hour grant |
+| `platforms.feishu.tools.docs.allow_write` | `false` | Register folder/document create and append tools. Every create requires a still-valid, single-use resource `access_request_id`; document create additionally requires requester-only operation approval unless the same user, bot account, chat, and tool have an active 24-hour grant. External append requires a live `docx/write` request |
 | `platforms.feishu.tools.litellm.enabled` | `false` | Enable the Feishu natural-language LiteLLM account invitation tool |
 | `platforms.feishu.tools.litellm.base_url` | — | LiteLLM proxy base URL used for API calls and invitation link construction |
 | `platforms.feishu.tools.litellm.api_key` | — | LiteLLM admin/master API key used for `/user/new` and `/invitation/new` |
