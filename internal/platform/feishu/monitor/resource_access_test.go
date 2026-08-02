@@ -436,6 +436,28 @@ func TestResourceAccessOAuthServerUsesConfiguredCallbackPath(t *testing.T) {
 	}
 }
 
+func TestResourceAccessOAuthServerSkipsListenerFreeMode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected Feishu API request: %s", r.URL.Path)
+	}))
+	defer server.Close()
+	manager, _, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://oauth.wulongxin.com/feishu/oauth/callback",
+	})
+	if !manager.oauthEnabled() || manager.oauthHTTPCallbackEnabled() {
+		t.Fatalf("oauth modes enabled=%t http=%t", manager.oauthEnabled(), manager.oauthHTTPCallbackEnabled())
+	}
+	callbackServer, err := startResourceAccessOAuthServer(context.Background(), manager)
+	if err != nil {
+		t.Fatalf("startResourceAccessOAuthServer returned error: %v", err)
+	}
+	if callbackServer != nil {
+		t.Fatalf("listener-free mode started callback server: %#v", callbackServer)
+	}
+}
+
 func newTestResourceAccessManager(t *testing.T, server *httptest.Server, oauth resourceAccessOAuthConfig) (*resourceAccessManager, *store.Store, *fakeApprovalSender) {
 	t.Helper()
 	st := openFeishuApprovalTestStore(t)

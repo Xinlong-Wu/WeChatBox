@@ -20,7 +20,7 @@ type oauthCallbackServer struct {
 }
 
 func startResourceAccessOAuthServer(ctx context.Context, manager *resourceAccessManager) (*oauthCallbackServer, error) {
-	if manager == nil || !manager.oauthEnabled() {
+	if manager == nil || !manager.oauthHTTPCallbackEnabled() {
 		return nil, nil
 	}
 	redirect, err := url.Parse(manager.oauth.CallbackURL)

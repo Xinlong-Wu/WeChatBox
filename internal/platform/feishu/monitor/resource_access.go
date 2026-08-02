@@ -105,8 +105,8 @@ func newResourceAccessManager(
 	oauth.BaseURL = strings.TrimRight(strings.TrimSpace(oauth.BaseURL), "/")
 	oauth.CallbackURL = strings.TrimSpace(oauth.CallbackURL)
 	oauth.CallbackListenAddress = strings.TrimSpace(oauth.CallbackListenAddress)
-	if (oauth.CallbackURL == "") != (oauth.CallbackListenAddress == "") {
-		return nil, fmt.Errorf("feishu oauth_callback_url and oauth_callback_listen_address must be configured together")
+	if oauth.CallbackURL == "" && oauth.CallbackListenAddress != "" {
+		return nil, fmt.Errorf("feishu oauth_callback_listen_address requires oauth_callback_url")
 	}
 	if oauth.CallbackURL != "" {
 		parsed, err := url.Parse(oauth.CallbackURL)
@@ -819,7 +819,11 @@ func (m *resourceAccessManager) authorizationURL(state, challenge string) (strin
 }
 
 func (m *resourceAccessManager) oauthEnabled() bool {
-	return m.oauth.ClientID != "" && m.oauth.BaseURL != "" && m.oauth.CallbackURL != "" && m.oauth.CallbackListenAddress != ""
+	return m.oauth.ClientID != "" && m.oauth.BaseURL != "" && m.oauth.CallbackURL != ""
+}
+
+func (m *resourceAccessManager) oauthHTTPCallbackEnabled() bool {
+	return m.oauthEnabled() && m.oauth.CallbackListenAddress != ""
 }
 
 func (m *resourceAccessManager) resourceAccessResult(request store.FeishuResourceAccessRequest, status, source string) feishutools.ResourceAccessResult {
