@@ -70,7 +70,8 @@ Feishu app credentials are saved under `platforms.feishu.accounts` in the
 shared `~/.lingobridge/config.yaml`. Those config entries are the Feishu
 account source used by `account list` and `run`. Re-running `account new
 feishu` for the same account name updates its app credentials while preserving
-the existing OAuth base URL, redirect URI, and callback listener settings.
+the existing OAuth base URL, callback URL, and optional callback-listener
+settings.
 
 Or add a GitHub App PR review account:
 
@@ -104,7 +105,7 @@ Configuration** and add the Card action trigger callback
 resource-card button clicks. This is a callback, not an event: do not add it
 under `platforms.feishu.events`; LingoBridge registers its SDK handler
 automatically. External resource authorization also requires the account's
-public `oauth_redirect_uri` to be registered in the app's OAuth redirect URL
+public `oauth_callback_url` to be registered in the app's OAuth redirect URL
 configuration.
 
 ### 4. Run
@@ -333,21 +334,31 @@ platforms:
         app_secret: your-app-secret
         base_url: https://open.feishu.cn
         oauth_base_url: https://accounts.feishu.cn
-        oauth_redirect_uri: https://bridge.example.com/feishu/oauth/callback
-        oauth_listen_address: 127.0.0.1:8080
+        oauth_callback_url: https://oauth.wulongxin.com/feishu/oauth/callback
+        # Optional: enables direct HTTP callbacks.
+        # oauth_callback_listen_address: 127.0.0.1:18080
     tools:
       docs:
         enabled: true
         allow_write: true
 ```
 
-`oauth_redirect_uri` and `oauth_listen_address` must either both be configured
-or both be omitted. Register the exact public HTTPS redirect URI in the Feishu
-app console. It may be reverse-proxied to the local listener; LingoBridge serves
-the callback path taken from the configured redirect URI. No custom H5 page is
-required. Without the OAuth callback, Bot-owned resources and already
-live-verifiable grants still work, but LingoBridge cannot start a new external
-resource grant.
+Register the exact public HTTPS `oauth_callback_url` in the Feishu app console.
+With only that field configured, LingoBridge does not open an HTTP port: after
+authorization, the requester copies the complete callback URL from the browser
+address bar (or copies only the authorization code), returns to the original
+Feishu resource card, and submits it there. The callback page does not need to
+be reachable for this manual handoff, although some mobile or in-app browsers
+may not preserve an unreachable URL reliably.
+
+Optionally configure `oauth_callback_listen_address` to enable direct HTTP
+callbacks. The public callback URL may be reverse-proxied to that local TCP
+listener, and LingoBridge serves the path taken from the callback URL. The
+resource card still accepts a manual handoff as a fallback. A listen address
+without a callback URL is invalid. If neither field is configured, Bot-owned
+resources and already live-verifiable grants still work, but LingoBridge cannot
+start a new external resource grant. The removed `oauth_redirect_uri` and
+`oauth_listen_address` names are not accepted as compatibility aliases.
 
 When Docs is enabled, LingoBridge registers `feishu_docs_request_access`,
 `feishu_docs_search`, `feishu_docs_read`, and
@@ -375,7 +386,10 @@ other resources, LingoBridge first checks an exact
 against Feishu in real time. If access is missing, it sends a Card V2 link to
 Feishu's official OAuth authorization page. The authorization request and any
 later create-time validation remain bound to the original Feishu user and
-chat; the model cannot provide another `chat_id`.
+chat; the model cannot provide another `chat_id`. The same card contains a
+required, 1,000-character `oauth_result` input and a submit button for the
+complete callback URL or raw authorization code when LingoBridge has no
+browser-reachable callback listener.
 
 `feishu_docs_read` and `feishu_docs_append` continue to work directly for a
 document already bound to the current chat. For an unbound external Docx, call
@@ -387,17 +401,27 @@ only when its recorded parent is a fully shared Bot folder in the same chat;
 Bot-owned documents from another chat are rejected even if their token is
 provided.
 
-The OAuth callback uses state hashing and PKCE S256. Feishu's authorization
-code is valid for five minutes and can be exchanged only once. LingoBridge
-exchanges it for a temporary `user_access_token`, verifies
+The OAuth flow uses a cryptographically random state stored only as a hash and
+PKCE S256. Feishu's authorization code is valid for five minutes and can be
+exchanged only once. A complete URL submitted through the card must match the
+configured callback scheme, host, and path exactly and return the request's
+state. A raw code is accepted only from the original account, user, chat, card
+message, and request; its PKCE verifier still binds it to that OAuth attempt.
+The HTTP and card transports atomically claim the same one-time request, so a
+duplicate or racing submission cannot grant twice.
+
+LingoBridge exchanges the code for a temporary `user_access_token`, verifies
 that the authorizing user is the requester, adds the required collaborator,
 and then verifies the resulting permission with the Bot tenant identity. For a
 non-folder document, the collaborator is the Bot `open_id`. For an external
 folder in a group chat, the collaborator is the current `openchat`; a private
 chat cannot directly grant an external folder to the Bot and returns an
 `unsupported` result. LingoBridge does not request `offline_access` and never
-stores a user access token or refresh token. It updates the original card,
-notifies the chat, and redirects the browser back to the Feishu resource.
+stores a callback URL, authorization code, user access token, or refresh token.
+It updates the original card and notifies the chat. In direct HTTP mode the
+browser is additionally redirected to the Feishu resource; in manual mode the
+requester stays in control of returning to the original Feishu chat. No custom
+H5 callback page, clipboard automation, or AppLink return is implemented.
 
 `feishu_docs_folder_create` creates only under the Bot root or another
 Bot-owned folder already bound to the current chat. It does not show a separate
@@ -454,7 +478,8 @@ Pending operation and resource-access requests survive process restarts in the
 Feishu platform SQLite database. The document payload is retained only while
 operation authorization is pending/executing and is cleared on denial, expiry,
 success, or failure. OAuth state is stored only as a hash, and its PKCE verifier
-is cleared when the callback claims it. Operations interrupted while already
+is cleared when either the HTTP callback or exact-context card submission
+claims it. Operations interrupted while already
 executing are marked failed rather than retried automatically, avoiding
 duplicate creation. Resource grants store only chat/resource scope,
 collaborator identity, permission, source request, state, and timestamps; they
@@ -642,8 +667,8 @@ guarded tools exposed for the current PR.
 | `platforms.feishu.accounts.<name>.app_secret` | — | Feishu app secret for account `<name>` |
 | `platforms.feishu.accounts.<name>.base_url` | `https://open.feishu.cn` | Feishu Open Platform base URL |
 | `platforms.feishu.accounts.<name>.oauth_base_url` | `https://accounts.feishu.cn` for the default Feishu API domain | Feishu OAuth authorization/token service base URL |
-| `platforms.feishu.accounts.<name>.oauth_redirect_uri` | — | Public absolute OAuth callback URI registered in the Feishu app console; configure together with `oauth_listen_address` |
-| `platforms.feishu.accounts.<name>.oauth_listen_address` | — | Local TCP address for the OAuth callback server, such as `127.0.0.1:8080`; configure together with `oauth_redirect_uri` |
+| `platforms.feishu.accounts.<name>.oauth_callback_url` | — | Public absolute OAuth callback URL registered exactly in the Feishu app console. By itself it enables listener-free card handoff |
+| `platforms.feishu.accounts.<name>.oauth_callback_listen_address` | — | Optional local TCP address for direct OAuth HTTP callbacks, such as `127.0.0.1:18080`; requires `oauth_callback_url` |
 | `platforms.feishu.events[].name` | — | Extra Feishu event to register; v1.0 supports customized event names such as `p2p_chat_create`, and v2.0 currently supports `im.chat.access_event.bot_p2p_chat_entered_v1`. Built-in `im.message.receive_v1` and `card.action.trigger` handlers must not be configured here |
 | `platforms.feishu.events[].version` | — | Required Feishu event protocol version: `"1.0"` uses `OnCustomizedEvent`; `"2.0"` uses a built-in `OnP2...` mapping |
 | `platforms.feishu.events[].run` | — | Shell command string or list of shell command strings to run for the event |

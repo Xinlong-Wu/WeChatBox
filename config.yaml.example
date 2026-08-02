@@ -119,11 +119,13 @@ platforms:
         # Optional OAuth service base URL. The default Feishu API domain uses
         # https://accounts.feishu.cn.
         oauth_base_url: "https://accounts.feishu.cn"
-        # Configure these two fields together to grant the Bot access to
-        # external files/folders. Register the public URI in Feishu; it may be
-        # reverse-proxied to the local listener. No custom H5 page is needed.
-        oauth_redirect_uri: "https://bridge.example.com/feishu/oauth/callback"
-        oauth_listen_address: "127.0.0.1:8080"
+        # Register this exact public URL as the Feishu OAuth redirect URL.
+        # With no listen address, users paste the resulting callback URL or
+        # authorization code into the original Feishu resource card.
+        oauth_callback_url: "https://oauth.wulongxin.com/feishu/oauth/callback"
+        # Optional. Enables direct HTTP callbacks; a reverse proxy may forward
+        # the public callback URL to this local TCP listener.
+        # oauth_callback_listen_address: "127.0.0.1:18080"
 
     # Optional event shell hooks for Feishu events other than
     # im.message.receive_v1, which is always handled by LingoBridge.

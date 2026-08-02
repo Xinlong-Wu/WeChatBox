@@ -296,7 +296,7 @@ func (m *resourceAccessManager) RequestAccess(ctx context.Context, input feishut
 		shortRequestID(request.ID), request.AccountID, resourceAccessActorID(request), request.ChatID,
 		request.ResourceType, shortResourceRef(request.ResourceToken), request.Permission, request.ExpiresAt.Format(time.RFC3339))
 	result.ExpiresAt = request.ExpiresAt
-	result.Message = "已向当前飞书用户发送资源授权卡片。请在卡片中打开飞书官方授权页；完成后机器人会更新卡片并通知当前对话。"
+	result.Message = "已向当前飞书用户发送资源授权卡片。请在卡片中打开飞书官方授权页；如果浏览器无法直接回调 LingoBridge，请复制地址栏中的完整回调 URL（或授权码）粘贴到原卡片并提交。完成核验后机器人会更新卡片并通知当前对话。"
 	return result, nil
 }
 
