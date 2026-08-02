@@ -74,8 +74,8 @@ func Definition() platform.Definition {
 			}
 			if ok {
 				accountConfig.OAuthBaseURL = existing.OAuthBaseURL
-				accountConfig.OAuthRedirectURI = existing.OAuthRedirectURI
-				accountConfig.OAuthListenAddress = existing.OAuthListenAddress
+				accountConfig.OAuthCallbackURL = existing.OAuthCallbackURL
+				accountConfig.OAuthCallbackListenAddress = existing.OAuthCallbackListenAddress
 			}
 			if err := feishu.UpsertAccountConfig(ctx.Platform, opts.Name, accountConfig); err != nil {
 				return err

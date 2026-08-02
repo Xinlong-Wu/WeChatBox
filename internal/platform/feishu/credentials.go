@@ -32,12 +32,12 @@ type Config struct {
 
 // AccountConfig holds one Feishu self-built app account config.
 type AccountConfig struct {
-	AppID              string `yaml:"app_id"`
-	AppSecret          string `yaml:"app_secret"`
-	BaseURL            string `yaml:"base_url"`
-	OAuthBaseURL       string `yaml:"oauth_base_url,omitempty"`
-	OAuthRedirectURI   string `yaml:"oauth_redirect_uri,omitempty"`
-	OAuthListenAddress string `yaml:"oauth_listen_address,omitempty"`
+	AppID                      string `yaml:"app_id"`
+	AppSecret                  string `yaml:"app_secret"`
+	BaseURL                    string `yaml:"base_url"`
+	OAuthBaseURL               string `yaml:"oauth_base_url,omitempty"`
+	OAuthCallbackURL           string `yaml:"oauth_callback_url,omitempty"`
+	OAuthCallbackListenAddress string `yaml:"oauth_callback_listen_address,omitempty"`
 }
 
 // EventConfig holds one configured Feishu event shell hook.
@@ -218,8 +218,8 @@ func normalizeAccountConfig(account AccountConfig) AccountConfig {
 	account.AppSecret = strings.TrimSpace(account.AppSecret)
 	account.BaseURL = strings.TrimRight(strings.TrimSpace(account.BaseURL), "/")
 	account.OAuthBaseURL = strings.TrimRight(strings.TrimSpace(account.OAuthBaseURL), "/")
-	account.OAuthRedirectURI = strings.TrimSpace(account.OAuthRedirectURI)
-	account.OAuthListenAddress = strings.TrimSpace(account.OAuthListenAddress)
+	account.OAuthCallbackURL = strings.TrimSpace(account.OAuthCallbackURL)
+	account.OAuthCallbackListenAddress = strings.TrimSpace(account.OAuthCallbackListenAddress)
 	if account.BaseURL == "" {
 		account.BaseURL = DefaultBaseURL
 	}

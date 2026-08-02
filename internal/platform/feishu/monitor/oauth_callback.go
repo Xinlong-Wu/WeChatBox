@@ -23,7 +23,7 @@ func startResourceAccessOAuthServer(ctx context.Context, manager *resourceAccess
 	if manager == nil || !manager.oauthEnabled() {
 		return nil, nil
 	}
-	redirect, err := url.Parse(manager.oauth.RedirectURI)
+	redirect, err := url.Parse(manager.oauth.CallbackURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse feishu OAuth redirect URI: %w", err)
 	}
@@ -31,9 +31,9 @@ func startResourceAccessOAuthServer(ctx context.Context, manager *resourceAccess
 	if callbackPath == "" {
 		callbackPath = "/"
 	}
-	listener, err := net.Listen("tcp", manager.oauth.ListenAddress)
+	listener, err := net.Listen("tcp", manager.oauth.CallbackListenAddress)
 	if err != nil {
-		return nil, fmt.Errorf("listen feishu OAuth callback address %s: %w", manager.oauth.ListenAddress, err)
+		return nil, fmt.Errorf("listen feishu OAuth callback address %s: %w", manager.oauth.CallbackListenAddress, err)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(callbackPath, manager.HandleOAuthCallback)
@@ -61,7 +61,7 @@ func startResourceAccessOAuthServer(ctx context.Context, manager *resourceAccess
 			feishuLog.Warn(context.Background(), "shutdown feishu OAuth callback server account=%s: %v", manager.account.ID, err)
 		}
 	}()
-	feishuLog.Info(ctx, "started feishu OAuth callback server account=%s listen=%s path=%s", manager.account.ID, manager.oauth.ListenAddress, callbackPath)
+	feishuLog.Info(ctx, "started feishu OAuth callback server account=%s listen=%s path=%s", manager.account.ID, manager.oauth.CallbackListenAddress, callbackPath)
 	return server, nil
 }
 

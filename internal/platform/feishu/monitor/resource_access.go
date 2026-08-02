@@ -54,10 +54,10 @@ type resourceAccessStore interface {
 }
 
 type resourceAccessOAuthConfig struct {
-	ClientID      string
-	BaseURL       string
-	RedirectURI   string
-	ListenAddress string
+	ClientID              string
+	BaseURL               string
+	CallbackURL           string
+	CallbackListenAddress string
 }
 
 type resourceAccessNotifier interface {
@@ -103,15 +103,15 @@ func newResourceAccessManager(
 	}
 	oauth.ClientID = strings.TrimSpace(oauth.ClientID)
 	oauth.BaseURL = strings.TrimRight(strings.TrimSpace(oauth.BaseURL), "/")
-	oauth.RedirectURI = strings.TrimSpace(oauth.RedirectURI)
-	oauth.ListenAddress = strings.TrimSpace(oauth.ListenAddress)
-	if (oauth.RedirectURI == "") != (oauth.ListenAddress == "") {
-		return nil, fmt.Errorf("feishu oauth_redirect_uri and oauth_listen_address must be configured together")
+	oauth.CallbackURL = strings.TrimSpace(oauth.CallbackURL)
+	oauth.CallbackListenAddress = strings.TrimSpace(oauth.CallbackListenAddress)
+	if (oauth.CallbackURL == "") != (oauth.CallbackListenAddress == "") {
+		return nil, fmt.Errorf("feishu oauth_callback_url and oauth_callback_listen_address must be configured together")
 	}
-	if oauth.RedirectURI != "" {
-		parsed, err := url.Parse(oauth.RedirectURI)
+	if oauth.CallbackURL != "" {
+		parsed, err := url.Parse(oauth.CallbackURL)
 		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-			return nil, fmt.Errorf("feishu oauth_redirect_uri must be an absolute URL")
+			return nil, fmt.Errorf("feishu oauth_callback_url must be an absolute URL")
 		}
 		if oauth.ClientID == "" || oauth.BaseURL == "" {
 			return nil, fmt.Errorf("feishu OAuth client_id and oauth_base_url are required when the callback is enabled")
@@ -527,7 +527,7 @@ func (m *resourceAccessManager) HandleOAuthCallback(w http.ResponseWriter, r *ht
 func (m *resourceAccessManager) exchangeAuthorizationCode(ctx context.Context, code, verifier string) (string, error) {
 	resp, err := m.client.AccessToken.RetrieveByAuthorizationCode(ctx, authorizationcode.NewTokenRequestBuilder().
 		Code(code).
-		RedirectUri(m.oauth.RedirectURI).
+		RedirectUri(m.oauth.CallbackURL).
 		CodeVerifier(verifier).
 		Build())
 	if err != nil {
@@ -759,7 +759,7 @@ func (m *resourceAccessManager) authorizationURL(state, challenge string) (strin
 	query := base.Query()
 	query.Set("client_id", m.oauth.ClientID)
 	query.Set("response_type", "code")
-	query.Set("redirect_uri", m.oauth.RedirectURI)
+	query.Set("redirect_uri", m.oauth.CallbackURL)
 	query.Set("scope", resourceAccessOAuthScope)
 	query.Set("state", state)
 	query.Set("prompt", "consent")
@@ -770,7 +770,7 @@ func (m *resourceAccessManager) authorizationURL(state, challenge string) (strin
 }
 
 func (m *resourceAccessManager) oauthEnabled() bool {
-	return m.oauth.ClientID != "" && m.oauth.BaseURL != "" && m.oauth.RedirectURI != "" && m.oauth.ListenAddress != ""
+	return m.oauth.ClientID != "" && m.oauth.BaseURL != "" && m.oauth.CallbackURL != "" && m.oauth.CallbackListenAddress != ""
 }
 
 func (m *resourceAccessManager) resourceAccessResult(request store.FeishuResourceAccessRequest, status, source string) feishutools.ResourceAccessResult {

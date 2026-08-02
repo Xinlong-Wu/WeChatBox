@@ -243,10 +243,10 @@ func TestResourceAccessOAuthCardCallbackGrantsAndRedirects(t *testing.T) {
 	defer server.Close()
 
 	oauth := resourceAccessOAuthConfig{
-		ClientID:      "cli_xxx",
-		BaseURL:       server.URL,
-		RedirectURI:   "https://bridge.example.com/feishu/oauth/callback",
-		ListenAddress: "127.0.0.1:0",
+		ClientID:              "cli_xxx",
+		BaseURL:               server.URL,
+		CallbackURL:           "https://bridge.example.com/feishu/oauth/callback",
+		CallbackListenAddress: "127.0.0.1:0",
 	}
 	manager, st, sender := newTestResourceAccessManager(t, server, oauth)
 	result, err := manager.RequestAccess(approvalRequestContext(), feishutools.ResourceAccessRequest{
@@ -273,7 +273,7 @@ func TestResourceAccessOAuthCardCallbackGrantsAndRedirects(t *testing.T) {
 	}
 	state := parsedAuthURL.Query().Get("state")
 	if parsedAuthURL.Path != "/open-apis/authen/v1/authorize" || parsedAuthURL.Query().Get("client_id") != "cli_xxx" ||
-		parsedAuthURL.Query().Get("redirect_uri") != oauth.RedirectURI || parsedAuthURL.Query().Get("scope") != resourceAccessOAuthScope ||
+		parsedAuthURL.Query().Get("redirect_uri") != oauth.CallbackURL || parsedAuthURL.Query().Get("scope") != resourceAccessOAuthScope ||
 		parsedAuthURL.Query().Get("prompt") != "consent" || parsedAuthURL.Query().Get("code_challenge_method") != "S256" ||
 		state == "" || parsedAuthURL.Query().Get("code_challenge") == "" {
 		t.Fatalf("authorization URL = %s", authURL)
@@ -290,7 +290,7 @@ func TestResourceAccessOAuthCardCallbackGrantsAndRedirects(t *testing.T) {
 		t.Fatalf("callback response status/location = %d/%q", recorder.Code, recorder.Header().Get("Location"))
 	}
 	if tokenBody["grant_type"] != "authorization_code" || tokenBody["client_id"] != "cli_xxx" || tokenBody["client_secret"] != "secret" ||
-		tokenBody["code"] != "auth-code" || tokenBody["redirect_uri"] != oauth.RedirectURI || strings.TrimSpace(stringValue(tokenBody["code_verifier"])) == "" {
+		tokenBody["code"] != "auth-code" || tokenBody["redirect_uri"] != oauth.CallbackURL || strings.TrimSpace(stringValue(tokenBody["code_verifier"])) == "" {
 		t.Fatalf("OAuth token body = %#v", tokenBody)
 	}
 	if permissionBody["member_type"] != "openid" || permissionBody["member_id"] != "ou_bot" || permissionBody["perm"] != "edit" || permissionBody["type"] != "user" {
@@ -322,10 +322,10 @@ func TestResourceAccessManagerRejectsPrivateExternalFolderWithoutOAuthCard(t *te
 	}))
 	defer server.Close()
 	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
-		ClientID:      "cli_xxx",
-		BaseURL:       server.URL,
-		RedirectURI:   "https://bridge.example.com/feishu/oauth/callback",
-		ListenAddress: "127.0.0.1:0",
+		ClientID:              "cli_xxx",
+		BaseURL:               server.URL,
+		CallbackURL:           "https://bridge.example.com/feishu/oauth/callback",
+		CallbackListenAddress: "127.0.0.1:0",
 	})
 	ctx := feishutools.WithActor(context.Background(), feishutools.Actor{OpenID: "ou_requester", UserID: "u_requester"})
 	ctx = feishutools.WithChatContext(ctx, feishutools.ChatContext{ChatID: "oc_private", MessageID: "om_source", IsGroup: false})
@@ -372,10 +372,10 @@ func TestResourceAccessCardRejectIsBoundToRequester(t *testing.T) {
 	}))
 	defer server.Close()
 	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
-		ClientID:      "cli_xxx",
-		BaseURL:       server.URL,
-		RedirectURI:   "https://bridge.example.com/feishu/oauth/callback",
-		ListenAddress: "127.0.0.1:0",
+		ClientID:              "cli_xxx",
+		BaseURL:               server.URL,
+		CallbackURL:           "https://bridge.example.com/feishu/oauth/callback",
+		CallbackListenAddress: "127.0.0.1:0",
 	})
 	result, err := manager.RequestAccess(approvalRequestContext(), feishutools.ResourceAccessRequest{
 		ResourceType:  "docx",
@@ -410,10 +410,10 @@ func TestResourceAccessOAuthServerUsesConfiguredCallbackPath(t *testing.T) {
 	}))
 	defer server.Close()
 	manager, _, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
-		ClientID:      "cli_xxx",
-		BaseURL:       server.URL,
-		RedirectURI:   "https://bridge.example.com/custom/feishu/callback",
-		ListenAddress: "127.0.0.1:0",
+		ClientID:              "cli_xxx",
+		BaseURL:               server.URL,
+		CallbackURL:           "https://bridge.example.com/custom/feishu/callback",
+		CallbackListenAddress: "127.0.0.1:0",
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	callbackServer, err := startResourceAccessOAuthServer(ctx, manager)

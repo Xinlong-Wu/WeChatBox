@@ -86,10 +86,10 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 			return fmt.Errorf("initialize feishu cards for account %s: %w", acc.Name, err)
 		}
 		resourceAccess, err = newResourceAccessManager(ctx, p.store, restClient, acc, botOpenID, cards, sender, resourceAccessOAuthConfig{
-			ClientID:      creds.AppID,
-			BaseURL:       accountConfig.OAuthBaseURL,
-			RedirectURI:   accountConfig.OAuthRedirectURI,
-			ListenAddress: accountConfig.OAuthListenAddress,
+			ClientID:              creds.AppID,
+			BaseURL:               accountConfig.OAuthBaseURL,
+			CallbackURL:           accountConfig.OAuthCallbackURL,
+			CallbackListenAddress: accountConfig.OAuthCallbackListenAddress,
 		})
 		if err != nil {
 			return fmt.Errorf("initialize feishu resource access for account %s: %w", acc.Name, err)

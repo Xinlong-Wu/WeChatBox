@@ -30,12 +30,12 @@ func TestCreateOrUpdateAccountPreservesOAuthConfig(t *testing.T) {
 		t.Fatalf("NewPlatformContext returned error: %v", err)
 	}
 	if err := feishu.UpsertAccountConfig(platformCtx, "fsbot", feishu.AccountConfig{
-		AppID:              "cli_old",
-		AppSecret:          "old-secret",
-		BaseURL:            "https://open.feishu.cn",
-		OAuthBaseURL:       "https://accounts.example.com",
-		OAuthRedirectURI:   "https://bridge.example.com/feishu/oauth/callback",
-		OAuthListenAddress: "127.0.0.1:8080",
+		AppID:                      "cli_old",
+		AppSecret:                  "old-secret",
+		BaseURL:                    "https://open.feishu.cn",
+		OAuthBaseURL:               "https://accounts.example.com",
+		OAuthCallbackURL:           "https://bridge.example.com/feishu/oauth/callback",
+		OAuthCallbackListenAddress: "127.0.0.1:8080",
 	}); err != nil {
 		t.Fatalf("seed account config: %v", err)
 	}
@@ -59,8 +59,8 @@ func TestCreateOrUpdateAccountPreservesOAuthConfig(t *testing.T) {
 		t.Fatalf("updated account credentials = %#v", account)
 	}
 	if account.OAuthBaseURL != "https://accounts.example.com" ||
-		account.OAuthRedirectURI != "https://bridge.example.com/feishu/oauth/callback" ||
-		account.OAuthListenAddress != "127.0.0.1:8080" {
+		account.OAuthCallbackURL != "https://bridge.example.com/feishu/oauth/callback" ||
+		account.OAuthCallbackListenAddress != "127.0.0.1:8080" {
 		t.Fatalf("updated account lost OAuth config = %#v", account)
 	}
 }

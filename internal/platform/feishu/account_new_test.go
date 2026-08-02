@@ -89,10 +89,10 @@ func TestUpsertAndResolveAccountConfig(t *testing.T) {
 		t.Fatalf("NewPlatformContext returned error: %v", err)
 	}
 	if err := UpsertAccountConfig(platformCtx, "fsbot", AccountConfig{
-		AppID:              " cli_xxx ",
-		AppSecret:          " secret ",
-		OAuthRedirectURI:   " https://bridge.example.com/feishu/oauth/callback ",
-		OAuthListenAddress: " 127.0.0.1:8080 ",
+		AppID:                      " cli_xxx ",
+		AppSecret:                  " secret ",
+		OAuthCallbackURL:           " https://bridge.example.com/feishu/oauth/callback ",
+		OAuthCallbackListenAddress: " 127.0.0.1:8080 ",
 	}); err != nil {
 		t.Fatalf("UpsertAccountConfig returned error: %v", err)
 	}
@@ -105,8 +105,8 @@ func TestUpsertAndResolveAccountConfig(t *testing.T) {
 		t.Fatal("ResolveAccountConfig did not find account")
 	}
 	if account.AppID != "cli_xxx" || account.AppSecret != "secret" || account.BaseURL != DefaultBaseURL ||
-		account.OAuthBaseURL != DefaultOAuthBaseURL || account.OAuthRedirectURI != "https://bridge.example.com/feishu/oauth/callback" ||
-		account.OAuthListenAddress != "127.0.0.1:8080" {
+		account.OAuthBaseURL != DefaultOAuthBaseURL || account.OAuthCallbackURL != "https://bridge.example.com/feishu/oauth/callback" ||
+		account.OAuthCallbackListenAddress != "127.0.0.1:8080" {
 		t.Fatalf("account = %#v", account)
 	}
 }
