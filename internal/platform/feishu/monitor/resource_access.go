@@ -428,6 +428,31 @@ func (m *resourceAccessManager) HandleCardAction(ctx context.Context, event *cal
 	), nil
 }
 
+type resourceAccessOAuthResponse struct {
+	Code  string
+	Error string
+}
+
+type resourceAccessOAuthCompletionError struct {
+	cause        error
+	httpStatus   int
+	httpResponse string
+}
+
+func (e *resourceAccessOAuthCompletionError) Error() string {
+	if e == nil || e.cause == nil {
+		return "feishu resource OAuth completion failed"
+	}
+	return e.cause.Error()
+}
+
+func (e *resourceAccessOAuthCompletionError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
 func (m *resourceAccessManager) HandleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
@@ -445,48 +470,74 @@ func (m *resourceAccessManager) HandleOAuthCallback(w http.ResponseWriter, r *ht
 		if errors.Is(err, store.ErrFeishuResourceAccessExpired) {
 			status = http.StatusGone
 		}
-		feishuLog.Warn(r.Context(), "reject feishu resource OAuth callback account=%s state_ref=%s: %v", m.account.ID, shortResourceRef(state), err)
+		feishuLog.Warn(r.Context(), "reject feishu resource OAuth callback account=%s state_ref=%s: %v", m.account.ID, shortResourceRef(hashResourceAccessState(state)), err)
 		http.Error(w, "OAuth request is invalid, expired, or already used", status)
 		return
 	}
 	callbackCtx, cancel := context.WithTimeout(m.baseContext(), resourceAccessCallbackTimeout)
 	defer cancel()
-	if oauthError := strings.TrimSpace(r.URL.Query().Get("error")); oauthError != "" {
-		m.finishOAuthFailure(callbackCtx, request, fmt.Errorf("user authorization returned %s", oauthError), "授权未完成", "用户未在飞书官方授权页完成授权。")
-		http.Error(w, "Feishu authorization was not completed", http.StatusForbidden)
-		return
-	}
-	code := strings.TrimSpace(r.URL.Query().Get("code"))
-	if code == "" {
-		m.finishOAuthFailure(callbackCtx, request, fmt.Errorf("missing authorization code"), "授权失败", "飞书回调缺少授权码，请重新发起。")
-		http.Error(w, "missing authorization code", http.StatusBadRequest)
-		return
-	}
-	accessToken, err := m.exchangeAuthorizationCode(callbackCtx, code, request.PKCEVerifier)
+	err = m.completeResourceAccessOAuth(callbackCtx, request, resourceAccessOAuthResponse{
+		Code:  r.URL.Query().Get("code"),
+		Error: r.URL.Query().Get("error"),
+	})
 	if err != nil {
-		m.finishOAuthFailure(callbackCtx, request, err, "授权失败", "飞书授权码兑换失败，请重新发起。")
-		http.Error(w, "authorization code exchange failed", http.StatusBadGateway)
+		var completionErr *resourceAccessOAuthCompletionError
+		if errors.As(err, &completionErr) {
+			http.Error(w, completionErr.httpResponse, completionErr.httpStatus)
+			return
+		}
+		http.Error(w, "resource access authorization failed", http.StatusInternalServerError)
 		return
 	}
-	if err := m.verifyOAuthUser(callbackCtx, accessToken, request); err != nil {
-		m.finishOAuthFailure(callbackCtx, request, err, "授权用户不匹配", "只有发起资源请求的飞书用户可以完成授权。")
-		http.Error(w, "authorized user does not match the requester", http.StatusForbidden)
-		return
+	redirectToResource(w, r, request.ResourceURL)
+}
+
+func (m *resourceAccessManager) completeResourceAccessOAuth(ctx context.Context, request store.FeishuResourceAccessRequest, response resourceAccessOAuthResponse) error {
+	fail := func(cause error, title, message string, httpStatus int, httpResponse string) error {
+		m.finishOAuthFailure(ctx, request, cause, title, message)
+		return &resourceAccessOAuthCompletionError{
+			cause:        cause,
+			httpStatus:   httpStatus,
+			httpResponse: httpResponse,
+		}
 	}
-	createCode, err := m.grantResourceAccess(callbackCtx, accessToken, request)
+
+	if strings.TrimSpace(response.Error) != "" {
+		return fail(
+			fmt.Errorf("user did not complete feishu authorization"),
+			"授权未完成",
+			"用户未在飞书官方授权页完成授权。",
+			http.StatusForbidden,
+			"Feishu authorization was not completed",
+		)
+	}
+	code := strings.TrimSpace(response.Code)
+	if code == "" {
+		return fail(
+			fmt.Errorf("missing authorization code"),
+			"授权失败",
+			"飞书回调缺少授权码，请重新发起。",
+			http.StatusBadRequest,
+			"missing authorization code",
+		)
+	}
+	accessToken, err := m.exchangeAuthorizationCode(ctx, code, request.PKCEVerifier)
+	if err != nil {
+		return fail(err, "授权失败", "飞书授权码兑换失败，请重新发起。", http.StatusBadGateway, "authorization code exchange failed")
+	}
+	if err := m.verifyOAuthUser(ctx, accessToken, request); err != nil {
+		return fail(err, "授权用户不匹配", "只有发起资源请求的飞书用户可以完成授权。", http.StatusForbidden, "authorized user does not match the requester")
+	}
+	createCode, err := m.grantResourceAccess(ctx, accessToken, request)
 	if err != nil && createCode != 1063003 {
-		m.finishOAuthFailure(callbackCtx, request, err, "授予权限失败", "飞书未能把所需权限授予机器人或当前群聊，请重新检查资源权限。")
-		http.Error(w, "granting resource access failed", http.StatusBadGateway)
-		return
+		return fail(err, "授予权限失败", "飞书未能把所需权限授予机器人或当前群聊，请重新检查资源权限。", http.StatusBadGateway, "granting resource access failed")
 	}
-	verified, verifyErr := m.verifyTenantAccess(callbackCtx, request.ResourceType, request.ResourceToken, request.Permission, request.SubjectType, request.SubjectID)
+	verified, verifyErr := m.verifyTenantAccess(ctx, request.ResourceType, request.ResourceToken, request.Permission, request.SubjectType, request.SubjectID)
 	if verifyErr != nil || !verified {
 		if verifyErr == nil {
 			verifyErr = fmt.Errorf("permission verification returned false")
 		}
-		m.finishOAuthFailure(callbackCtx, request, verifyErr, "权限核验失败", "飞书没有确认机器人或当前群聊已获得所需权限。")
-		http.Error(w, "resource access verification failed", http.StatusBadGateway)
-		return
+		return fail(verifyErr, "权限核验失败", "飞书没有确认机器人或当前群聊已获得所需权限。", http.StatusBadGateway, "resource access verification failed")
 	}
 	completedAt := m.currentTime()
 	grant := store.FeishuResourceGrant{
@@ -510,18 +561,16 @@ func (m *resourceAccessManager) HandleOAuthCallback(w http.ResponseWriter, r *ht
 		&grant,
 		completedAt,
 	); err != nil {
-		m.finishOAuthFailure(callbackCtx, request, err, "授权记录失败", "飞书已授予权限，但 LingoBridge 未能保存核验结果；请重新调用授权工具核验。")
-		http.Error(w, "saving resource access failed", http.StatusInternalServerError)
-		return
+		return fail(err, "授权记录失败", "飞书已授予权限，但 LingoBridge 未能保存核验结果；请重新调用授权工具核验。", http.StatusInternalServerError, "saving resource access failed")
 	}
-	feishuLog.Info(callbackCtx, "granted feishu resource access request=%s account=%s user=%s chat=%s type=%s resource_ref=%s permission=%s subject_type=%s",
+	feishuLog.Info(ctx, "granted feishu resource access request=%s account=%s user=%s chat=%s type=%s resource_ref=%s permission=%s subject_type=%s",
 		shortRequestID(request.ID), request.AccountID, resourceAccessActorID(request), request.ChatID,
 		request.ResourceType, shortResourceRef(request.ResourceToken), request.Permission, request.SubjectType)
-	m.notifyResourceAccessResult(callbackCtx, request,
+	m.notifyResourceAccessResult(ctx, request,
 		statusCard{title: "权限已授予", template: "green", message: "飞书已确认所需资源权限。现在可以使用该 request_id 继续原操作。"},
 		fmt.Sprintf("✅ 飞书资源权限已授予。request_id：`%s`，可继续原操作。", request.ID),
 	)
-	redirectToResource(w, r, request.ResourceURL)
+	return nil
 }
 
 func (m *resourceAccessManager) exchangeAuthorizationCode(ctx context.Context, code, verifier string) (string, error) {
