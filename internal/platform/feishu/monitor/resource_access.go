@@ -43,6 +43,7 @@ type resourceAccessStore interface {
 	GetFeishuResourceAccessRequest(id, accountID string) (store.FeishuResourceAccessRequest, error)
 	ConsumeFeishuResourceAccessRequest(id, accountID, consumedByRequestID string, now time.Time) error
 	ClaimFeishuResourceAccessOAuth(stateHash, accountID string, now time.Time) (store.FeishuResourceAccessRequest, error)
+	ClaimFeishuResourceAccessOAuthFromCard(id, accountID, stateHash string, match store.FeishuResourceAccessMatch, now time.Time) (store.FeishuResourceAccessRequest, error)
 	DenyFeishuResourceAccessRequest(id, accountID string, match store.FeishuResourceAccessMatch, now time.Time) (store.FeishuResourceAccessRequest, error)
 	CompleteFeishuResourceAccessRequest(id, accountID, source, verifiedPermission string, grant *store.FeishuResourceGrant, now time.Time) error
 	FailFeishuResourceAccessRequest(id, accountID string, now time.Time) error
@@ -402,35 +403,69 @@ func (m *resourceAccessManager) ConsumeAccess(ctx context.Context, validation fe
 
 func (m *resourceAccessManager) HandleCardAction(ctx context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
 	requestID, action, ok := parseResourceAccessCardAction(event)
-	if !ok || action != resourceAccessCardActionReject {
+	if !ok {
 		return nil, nil
 	}
 	if event == nil || event.Event == nil || event.Event.Operator == nil || event.Event.Context == nil {
 		return cardToast("error", "授权回调信息不完整，请重新发起。"), nil
 	}
 	operator := event.Event.Operator
-	request, err := m.store.DenyFeishuResourceAccessRequest(requestID, m.account.ID, store.FeishuResourceAccessMatch{
+	match := store.FeishuResourceAccessMatch{
 		ActorOpenID:   operator.OpenID,
 		ActorUserID:   deref(operator.UserID),
 		ChatID:        event.Event.Context.OpenChatID,
 		CardMessageID: event.Event.Context.OpenMessageID,
-	}, m.currentTime())
-	if err != nil {
-		return m.resourceAccessDecisionError(ctx, request, requestID, err), nil
 	}
-	feishuLog.Info(ctx, "denied feishu resource access request=%s account=%s user=%s chat=%s type=%s resource_ref=%s",
-		shortRequestID(request.ID), request.AccountID, resourceAccessActorID(request), request.ChatID,
-		request.ResourceType, shortResourceRef(request.ResourceToken))
-	return approvalCallbackResponse(
-		"success",
-		"已拒绝，本次不会授予资源权限。",
-		statusCard{title: "已拒绝授权", template: "grey", message: "请求已取消，未授予资源权限。"},
-	), nil
+	switch action {
+	case resourceAccessCardActionReject:
+		request, err := m.store.DenyFeishuResourceAccessRequest(requestID, m.account.ID, match, m.currentTime())
+		if err != nil {
+			return m.resourceAccessDecisionError(ctx, request, requestID, err), nil
+		}
+		feishuLog.Info(ctx, "denied feishu resource access request=%s account=%s user=%s chat=%s type=%s resource_ref=%s",
+			shortRequestID(request.ID), request.AccountID, resourceAccessActorID(request), request.ChatID,
+			request.ResourceType, shortResourceRef(request.ResourceToken))
+		return approvalCallbackResponse(
+			"success",
+			"已拒绝，本次不会授予资源权限。",
+			statusCard{title: "已拒绝授权", template: "grey", message: "请求已取消，未授予资源权限。"},
+		), nil
+	case resourceAccessCardActionSubmitOAuth:
+		rawResult := resourceAccessCardOAuthResult(event)
+		submission, err := m.parseResourceAccessOAuthSubmission(rawResult)
+		if err != nil {
+			feishuLog.Warn(ctx, "rejected feishu resource OAuth card input request=%s account=%s chars=%d: %v",
+				shortRequestID(requestID), m.account.ID, len([]rune(rawResult)), err)
+			return cardToast("error", err.Error()), nil
+		}
+		request, err := m.store.ClaimFeishuResourceAccessOAuthFromCard(
+			requestID,
+			m.account.ID,
+			submission.StateHash,
+			match,
+			m.currentTime(),
+		)
+		if err != nil {
+			return m.resourceAccessDecisionError(ctx, request, requestID, err), nil
+		}
+		feishuLog.Info(ctx, "accepted feishu resource OAuth card handoff request=%s account=%s user=%s chat=%s input_kind=%s",
+			shortRequestID(request.ID), request.AccountID, resourceAccessActorID(request), request.ChatID, submission.InputKind)
+		go m.completeResourceAccessOAuthFromCard(request, submission.Response)
+		return cardToast("success", "已收到授权结果，正在核验并授予资源权限；完成后机器人会更新卡片并通知当前对话。"), nil
+	default:
+		return cardToast("error", "不支持的资源授权操作。"), nil
+	}
 }
 
 type resourceAccessOAuthResponse struct {
 	Code  string
 	Error string
+}
+
+type resourceAccessOAuthSubmission struct {
+	InputKind string
+	StateHash string
+	Response  resourceAccessOAuthResponse
 }
 
 type resourceAccessOAuthCompletionError struct {
@@ -451,6 +486,77 @@ func (e *resourceAccessOAuthCompletionError) Unwrap() error {
 		return nil
 	}
 	return e.cause
+}
+
+func (m *resourceAccessManager) parseResourceAccessOAuthSubmission(raw string) (resourceAccessOAuthSubmission, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return resourceAccessOAuthSubmission{}, fmt.Errorf("请粘贴完整回调 URL 或授权码。")
+	}
+	if len([]rune(raw)) > resourceAccessOAuthResultMaxLength {
+		return resourceAccessOAuthSubmission{}, fmt.Errorf("授权结果超过 %d 个字符，请重新复制。", resourceAccessOAuthResultMaxLength)
+	}
+	if strings.Contains(raw, "://") {
+		submitted, err := url.ParseRequestURI(raw)
+		if err != nil || submitted.Scheme == "" || submitted.Host == "" || submitted.User != nil || submitted.Fragment != "" {
+			return resourceAccessOAuthSubmission{}, fmt.Errorf("授权回调 URL 格式无效，请复制浏览器地址栏中的完整 URL。")
+		}
+		configured, err := url.Parse(m.oauth.CallbackURL)
+		if err != nil || configured.Scheme == "" || configured.Host == "" {
+			return resourceAccessOAuthSubmission{}, fmt.Errorf("机器人 OAuth 回调配置无效，请联系管理员。")
+		}
+		if !strings.EqualFold(submitted.Scheme, configured.Scheme) ||
+			!strings.EqualFold(submitted.Host, configured.Host) ||
+			normalizedOAuthCallbackPath(submitted) != normalizedOAuthCallbackPath(configured) {
+			return resourceAccessOAuthSubmission{}, fmt.Errorf("授权回调 URL 与当前机器人配置不匹配。")
+		}
+		query := submitted.Query()
+		if len(query["state"]) != 1 || strings.TrimSpace(query.Get("state")) == "" {
+			return resourceAccessOAuthSubmission{}, fmt.Errorf("授权回调 URL 缺少有效的 state，请重新发起授权。")
+		}
+		if len(query["code"]) > 1 || len(query["error"]) > 1 {
+			return resourceAccessOAuthSubmission{}, fmt.Errorf("授权回调 URL 包含重复的授权结果参数，请重新发起授权。")
+		}
+		code := strings.TrimSpace(query.Get("code"))
+		oauthError := strings.TrimSpace(query.Get("error"))
+		if (code == "") == (oauthError == "") {
+			return resourceAccessOAuthSubmission{}, fmt.Errorf("授权回调 URL 必须且只能包含授权码或 OAuth 错误。")
+		}
+		return resourceAccessOAuthSubmission{
+			InputKind: "url",
+			StateHash: hashResourceAccessState(strings.TrimSpace(query.Get("state"))),
+			Response: resourceAccessOAuthResponse{
+				Code:  code,
+				Error: oauthError,
+			},
+		}, nil
+	}
+	if strings.ContainsAny(raw, " \t\r\n") {
+		return resourceAccessOAuthSubmission{}, fmt.Errorf("授权码不能包含空白字符，请重新复制。")
+	}
+	return resourceAccessOAuthSubmission{
+		InputKind: "code",
+		Response:  resourceAccessOAuthResponse{Code: raw},
+	}, nil
+}
+
+func normalizedOAuthCallbackPath(value *url.URL) string {
+	if value == nil {
+		return ""
+	}
+	path := value.EscapedPath()
+	if path == "" {
+		return "/"
+	}
+	return path
+}
+
+func (m *resourceAccessManager) completeResourceAccessOAuthFromCard(request store.FeishuResourceAccessRequest, response resourceAccessOAuthResponse) {
+	ctx, cancel := context.WithTimeout(m.baseContext(), resourceAccessCallbackTimeout)
+	defer cancel()
+	if err := m.completeResourceAccessOAuth(ctx, request, response); err != nil {
+		return
+	}
 }
 
 func (m *resourceAccessManager) HandleOAuthCallback(w http.ResponseWriter, r *http.Request) {
@@ -841,9 +947,11 @@ func (m *resourceAccessManager) resourceAccessResult(request store.FeishuResourc
 func (m *resourceAccessManager) resourceAccessDecisionError(ctx context.Context, request store.FeishuResourceAccessRequest, requestID string, err error) *callback.CardActionTriggerResponse {
 	switch {
 	case errors.Is(err, store.ErrFeishuResourceAccessForbidden):
-		return cardToast("error", "只有发起请求的用户可以拒绝该授权。")
+		return cardToast("error", "只有发起请求的用户可以处理该授权。")
 	case errors.Is(err, store.ErrFeishuResourceAccessContextMismatch):
 		return cardToast("error", "授权卡片与原请求不匹配。")
+	case errors.Is(err, store.ErrFeishuResourceAccessOAuthStateMismatch):
+		return cardToast("error", "授权链接的 state 与原请求不匹配，请重新复制或重新发起授权。")
 	case errors.Is(err, store.ErrFeishuResourceAccessExpired):
 		return approvalCallbackResponse("error", "授权请求已过期。", statusCard{title: "授权已过期", template: "grey", message: "请重新调用资源授权工具。"})
 	case errors.Is(err, store.ErrFeishuResourceAccessResolved):

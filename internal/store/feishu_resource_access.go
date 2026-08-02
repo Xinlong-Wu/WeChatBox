@@ -17,6 +17,8 @@ var (
 	ErrFeishuResourceAccessForbidden = errors.New("feishu resource access actor does not match")
 	// ErrFeishuResourceAccessContextMismatch is returned for a callback from another card or chat.
 	ErrFeishuResourceAccessContextMismatch = errors.New("feishu resource access callback context does not match")
+	// ErrFeishuResourceAccessOAuthStateMismatch is returned when a card submission carries another OAuth request's state.
+	ErrFeishuResourceAccessOAuthStateMismatch = errors.New("feishu resource access oauth state does not match")
 	// ErrFeishuResourceAccessExpired is returned when a pending request has expired.
 	ErrFeishuResourceAccessExpired = errors.New("feishu resource access request expired")
 	// ErrFeishuResourceAccessResolved is returned after a request leaves its actionable state.
@@ -366,6 +368,49 @@ func (s *Store) ClaimFeishuResourceAccessOAuth(stateHash, accountID string, now 
 		return FeishuResourceAccessRequest{}, fmt.Errorf("feishu resource oauth state and account are required")
 	}
 	now = normalizedWorkflowTime(now)
+	return s.claimFeishuResourceAccessOAuthRequest(now, func(tx *sql.Tx) (FeishuResourceAccessRequest, error) {
+		return scanFeishuResourceAccessRequest(tx.QueryRow(
+			feishuResourceAccessSelect+` WHERE oauth_state_hash=? AND account_id=?`, stateHash, accountID,
+		))
+	}, nil)
+}
+
+// ClaimFeishuResourceAccessOAuthFromCard atomically consumes a pending OAuth
+// request from the exact requester, chat, and card. stateHash is optional only
+// for a raw authorization-code submission; PKCE still binds that code to this request.
+func (s *Store) ClaimFeishuResourceAccessOAuthFromCard(id, accountID, stateHash string, match FeishuResourceAccessMatch, now time.Time) (FeishuResourceAccessRequest, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return FeishuResourceAccessRequest{}, err
+	}
+	id = strings.TrimSpace(id)
+	accountID = strings.TrimSpace(accountID)
+	stateHash = strings.TrimSpace(stateHash)
+	match = normalizeFeishuResourceAccessMatch(match)
+	if id == "" || accountID == "" || (match.ActorOpenID == "" && match.ActorUserID == "") || match.ChatID == "" || match.CardMessageID == "" {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("feishu resource oauth request, account, actor, chat, and card are required")
+	}
+	now = normalizedWorkflowTime(now)
+	return s.claimFeishuResourceAccessOAuthRequest(now, func(tx *sql.Tx) (FeishuResourceAccessRequest, error) {
+		return feishuResourceAccessByID(tx, id, accountID)
+	}, func(request FeishuResourceAccessRequest) error {
+		if !feishuResourceAccessActorMatches(request, match) {
+			return ErrFeishuResourceAccessForbidden
+		}
+		if request.ChatID != match.ChatID || request.CardMessageID == "" || request.CardMessageID != match.CardMessageID {
+			return ErrFeishuResourceAccessContextMismatch
+		}
+		if stateHash != "" && request.OAuthStateHash != stateHash {
+			return ErrFeishuResourceAccessOAuthStateMismatch
+		}
+		return nil
+	})
+}
+
+func (s *Store) claimFeishuResourceAccessOAuthRequest(
+	now time.Time,
+	load func(*sql.Tx) (FeishuResourceAccessRequest, error),
+	validate func(FeishuResourceAccessRequest) error,
+) (FeishuResourceAccessRequest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.Begin()
@@ -373,9 +418,7 @@ func (s *Store) ClaimFeishuResourceAccessOAuth(stateHash, accountID string, now 
 		return FeishuResourceAccessRequest{}, fmt.Errorf("begin claim feishu resource oauth: %w", err)
 	}
 	defer tx.Rollback()
-	request, err := scanFeishuResourceAccessRequest(tx.QueryRow(
-		feishuResourceAccessSelect+` WHERE oauth_state_hash=? AND account_id=?`, stateHash, accountID,
-	))
+	request, err := load(tx)
 	if err != nil {
 		return FeishuResourceAccessRequest{}, err
 	}
@@ -395,10 +438,18 @@ func (s *Store) ClaimFeishuResourceAccessOAuth(stateHash, accountID string, now 
 		request.UpdatedAt = now
 		return request, ErrFeishuResourceAccessExpired
 	}
+	if request.OAuthStateHash == "" || request.PKCEVerifier == "" {
+		return request, ErrFeishuResourceAccessResolved
+	}
+	if validate != nil {
+		if err := validate(request); err != nil {
+			return request, err
+		}
+	}
 	result, err := tx.Exec(
 		`UPDATE feishu_resource_access_requests
 		 SET state=?, oauth_state_hash='', pkce_verifier='', updated_at_ms=?
-		 WHERE id=? AND account_id=? AND state=?`,
+		 WHERE id=? AND account_id=? AND state=? AND oauth_state_hash<>'' AND pkce_verifier<>''`,
 		FeishuResourceAccessStateExecuting, now.UnixMilli(), request.ID, request.AccountID, FeishuResourceAccessStatePending,
 	)
 	if err != nil {
