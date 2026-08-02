@@ -183,7 +183,20 @@ func TestResourceAccessManagerReusesOnlyLiveExactChatGrant(t *testing.T) {
 	}
 }
 
-func TestResourceAccessOAuthCardCallbackGrantsAndRedirects(t *testing.T) {
+func TestResourceAccessOAuthHTTPCallbackGrantsAndRedirects(t *testing.T) {
+	testResourceAccessOAuthCompletion(t, "http")
+}
+
+func TestResourceAccessOAuthCardURLHandoffGrantsWithoutListener(t *testing.T) {
+	testResourceAccessOAuthCompletion(t, "card_url")
+}
+
+func TestResourceAccessOAuthCardCodeHandoffGrantsWithoutListener(t *testing.T) {
+	testResourceAccessOAuthCompletion(t, "card_code")
+}
+
+func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
+	t.Helper()
 	var mu sync.Mutex
 	var tokenBody map[string]any
 	var permissionBody map[string]any
@@ -191,9 +204,13 @@ func TestResourceAccessOAuthCardCallbackGrantsAndRedirects(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/oauth/v3/token":
-			if err := json.NewDecoder(r.Body).Decode(&tokenBody); err != nil {
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatalf("decode OAuth token body: %v", err)
 			}
+			mu.Lock()
+			tokenBody = body
+			mu.Unlock()
 			writeResourceAccessJSON(t, w, map[string]any{
 				"access_token": "user-access-token",
 				"token_type":   "Bearer",
@@ -222,10 +239,14 @@ func TestResourceAccessOAuthCardCallbackGrantsAndRedirects(t *testing.T) {
 			if got := r.Header.Get("Authorization"); got != "Bearer user-access-token" {
 				t.Fatalf("permission Authorization = %q", got)
 			}
-			if err := json.NewDecoder(r.Body).Decode(&permissionBody); err != nil {
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatalf("decode permission body: %v", err)
 			}
-			writeResourceAccessJSON(t, w, map[string]any{"code": 0, "msg": "Success", "data": map[string]any{"member": permissionBody}})
+			mu.Lock()
+			permissionBody = body
+			mu.Unlock()
+			writeResourceAccessJSON(t, w, map[string]any{"code": 0, "msg": "Success", "data": map[string]any{"member": body}})
 		case "/open-apis/auth/v3/tenant_access_token/internal":
 			writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
 		case "/open-apis/drive/v1/permissions/doxcn_external/members/auth":
@@ -243,10 +264,12 @@ func TestResourceAccessOAuthCardCallbackGrantsAndRedirects(t *testing.T) {
 	defer server.Close()
 
 	oauth := resourceAccessOAuthConfig{
-		ClientID:              "cli_xxx",
-		BaseURL:               server.URL,
-		CallbackURL:           "https://bridge.example.com/feishu/oauth/callback",
-		CallbackListenAddress: "127.0.0.1:0",
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	}
+	if mode == "http" {
+		oauth.CallbackListenAddress = "127.0.0.1:0"
 	}
 	manager, st, sender := newTestResourceAccessManager(t, server, oauth)
 	result, err := manager.RequestAccess(approvalRequestContext(), feishutools.ResourceAccessRequest{
@@ -283,28 +306,46 @@ func TestResourceAccessOAuthCardCallbackGrantsAndRedirects(t *testing.T) {
 		t.Fatalf("stored pending request = %#v err=%v", storedPending, err)
 	}
 
-	recorder := httptest.NewRecorder()
-	callbackRequest := httptest.NewRequest(http.MethodGet, "/feishu/oauth/callback?code=auth-code&state="+url.QueryEscape(state), nil)
-	manager.HandleOAuthCallback(recorder, callbackRequest)
-	if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != result.ResourceURL {
-		t.Fatalf("callback response status/location = %d/%q", recorder.Code, recorder.Header().Get("Location"))
+	switch mode {
+	case "http":
+		recorder := httptest.NewRecorder()
+		callbackRequest := httptest.NewRequest(http.MethodGet, "/feishu/oauth/callback?code=auth-code&state="+url.QueryEscape(state), nil)
+		manager.HandleOAuthCallback(recorder, callbackRequest)
+		if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != result.ResourceURL {
+			t.Fatalf("callback response status/location = %d/%q", recorder.Code, recorder.Header().Get("Location"))
+		}
+	case "card_url":
+		callbackURL := oauth.CallbackURL + "?code=auth-code&state=" + url.QueryEscape(state)
+		response, err := manager.HandleCardAction(context.Background(), resourceAccessCardSubmitEvent(result.RequestID, "ou_requester", "oc_chat", "om_card", callbackURL))
+		if err != nil || response == nil || response.Toast == nil || response.Toast.Type != "success" {
+			t.Fatalf("card URL handoff response = %#v err=%v", response, err)
+		}
+	case "card_code":
+		response, err := manager.HandleCardAction(context.Background(), resourceAccessCardSubmitEvent(result.RequestID, "ou_requester", "oc_chat", "om_card", "auth-code"))
+		if err != nil || response == nil || response.Toast == nil || response.Toast.Type != "success" {
+			t.Fatalf("card code handoff response = %#v err=%v", response, err)
+		}
+	default:
+		t.Fatalf("unsupported OAuth completion test mode %q", mode)
 	}
-	if tokenBody["grant_type"] != "authorization_code" || tokenBody["client_id"] != "cli_xxx" || tokenBody["client_secret"] != "secret" ||
-		tokenBody["code"] != "auth-code" || tokenBody["redirect_uri"] != oauth.CallbackURL || strings.TrimSpace(stringValue(tokenBody["code_verifier"])) == "" {
-		t.Fatalf("OAuth token body = %#v", tokenBody)
-	}
-	if permissionBody["member_type"] != "openid" || permissionBody["member_id"] != "ou_bot" || permissionBody["perm"] != "edit" || permissionBody["type"] != "user" {
-		t.Fatalf("permission body = %#v", permissionBody)
-	}
+	completed := waitForResourceAccessCompletion(t, st, sender, result.RequestID)
 	mu.Lock()
+	gotTokenBody := tokenBody
+	gotPermissionBody := permissionBody
 	calls := []int{userInfoCalls, permissionCalls, verifyCalls}
 	mu.Unlock()
+	if gotTokenBody["grant_type"] != "authorization_code" || gotTokenBody["client_id"] != "cli_xxx" || gotTokenBody["client_secret"] != "secret" ||
+		gotTokenBody["code"] != "auth-code" || gotTokenBody["redirect_uri"] != oauth.CallbackURL || strings.TrimSpace(stringValue(gotTokenBody["code_verifier"])) == "" {
+		t.Fatalf("OAuth token body = %#v", gotTokenBody)
+	}
+	if gotPermissionBody["member_type"] != "openid" || gotPermissionBody["member_id"] != "ou_bot" || gotPermissionBody["perm"] != "edit" || gotPermissionBody["type"] != "user" {
+		t.Fatalf("permission body = %#v", gotPermissionBody)
+	}
 	if calls[0] != 1 || calls[1] != 1 || calls[2] != 1 {
 		t.Fatalf("user/permission/verify calls = %#v", calls)
 	}
-	completed, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
-	if err != nil || completed.State != store.FeishuResourceAccessStateSucceeded || completed.GrantSource != store.FeishuResourceGrantSourceNewlyGranted || completed.PKCEVerifier != "" || completed.OAuthStateHash != "" {
-		t.Fatalf("completed request = %#v err=%v", completed, err)
+	if completed.State != store.FeishuResourceAccessStateSucceeded || completed.GrantSource != store.FeishuResourceGrantSourceNewlyGranted || completed.PKCEVerifier != "" || completed.OAuthStateHash != "" {
+		t.Fatalf("completed request = %#v", completed)
 	}
 	grant, active, err := st.ActiveFeishuResourceGrant("feishu:cli_test", "oc_chat", "docx", "doxcn_external", store.FeishuResourcePermissionWrite)
 	if err != nil || !active || grant.SubjectID != "ou_bot" {
@@ -404,6 +445,135 @@ func TestResourceAccessCardRejectIsBoundToRequester(t *testing.T) {
 	}
 }
 
+func TestPendingResourceAccessCardContainsOAuthHandoffForm(t *testing.T) {
+	raw, err := (pendingResourceAccessCard{
+		request: store.FeishuResourceAccessRequest{
+			ID:            "req_test",
+			ResourceType:  "docx",
+			ResourceToken: "doxcn_external",
+			Permission:    store.FeishuResourcePermissionWrite,
+			ExpiresAt:     time.Date(2026, time.August, 1, 12, 10, 0, 0, time.UTC),
+		},
+		authURL: "https://accounts.feishu.cn/open-apis/authen/v1/authorize?state=secret",
+	}).JSON()
+	if err != nil {
+		t.Fatalf("pendingResourceAccessCard.JSON returned error: %v", err)
+	}
+	var card map[string]any
+	if err := json.Unmarshal([]byte(raw), &card); err != nil {
+		t.Fatalf("unmarshal resource access card: %v", err)
+	}
+	input := findCardElementByName(card, resourceAccessOAuthResultField)
+	if input == nil || input["tag"] != "input" || input["required"] != true || input["max_length"] != float64(resourceAccessOAuthResultMaxLength) {
+		t.Fatalf("OAuth result input = %#v", input)
+	}
+	submit := findCardElementByName(card, "Button_submit_oauth_result")
+	if submit == nil || submit["form_action_type"] != "submit" || cardButtonAction(submit) != resourceAccessCardActionSubmitOAuth {
+		t.Fatalf("OAuth submit button = %#v", submit)
+	}
+	reject := findCardElementByName(card, "Button_reject_resource_access")
+	if reject == nil || reject["form_action_type"] != nil || cardButtonAction(reject) != resourceAccessCardActionReject {
+		t.Fatalf("resource reject button = %#v", reject)
+	}
+}
+
+func TestParseResourceAccessOAuthSubmissionValidatesURLAndRawCode(t *testing.T) {
+	manager := &resourceAccessManager{oauth: resourceAccessOAuthConfig{
+		CallbackURL: "https://oauth.wulongxin.com/feishu/oauth/callback",
+	}}
+	submission, err := manager.parseResourceAccessOAuthSubmission("https://oauth.wulongxin.com/feishu/oauth/callback?code=auth-code&state=random-state")
+	if err != nil || submission.InputKind != "url" || submission.Response.Code != "auth-code" || submission.StateHash != hashResourceAccessState("random-state") {
+		t.Fatalf("URL submission = %#v err=%v", submission, err)
+	}
+	submission, err = manager.parseResourceAccessOAuthSubmission("raw-authorization-code")
+	if err != nil || submission.InputKind != "code" || submission.Response.Code != "raw-authorization-code" || submission.StateHash != "" {
+		t.Fatalf("raw-code submission = %#v err=%v", submission, err)
+	}
+
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "empty", value: ""},
+		{name: "wrong scheme", value: "http://oauth.wulongxin.com/feishu/oauth/callback?code=x&state=y"},
+		{name: "wrong host", value: "https://attacker.example/feishu/oauth/callback?code=x&state=y"},
+		{name: "wrong path", value: "https://oauth.wulongxin.com/other?code=x&state=y"},
+		{name: "missing state", value: "https://oauth.wulongxin.com/feishu/oauth/callback?code=x"},
+		{name: "code and error", value: "https://oauth.wulongxin.com/feishu/oauth/callback?code=x&error=denied&state=y"},
+		{name: "duplicate state", value: "https://oauth.wulongxin.com/feishu/oauth/callback?code=x&state=y&state=z"},
+		{name: "raw whitespace", value: "code with spaces"},
+		{name: "too long", value: strings.Repeat("a", resourceAccessOAuthResultMaxLength+1)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := manager.parseResourceAccessOAuthSubmission(test.value); err == nil {
+				t.Fatalf("parseResourceAccessOAuthSubmission(%q) returned no error", test.name)
+			}
+		})
+	}
+}
+
+func TestResourceAccessOAuthCardHandoffRejectsWrongUserAndState(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected Feishu API request: %s", r.URL.Path)
+	}))
+	defer server.Close()
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://oauth.wulongxin.com/feishu/oauth/callback",
+	})
+	result, err := manager.RequestAccess(approvalRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType:  "docx",
+		ResourceToken: "doxcn_external",
+		Permission:    feishutools.ResourcePermissionRead,
+	})
+	if err != nil {
+		t.Fatalf("RequestAccess returned error: %v", err)
+	}
+	cards, _, _ := sender.snapshot()
+	if len(cards) != 1 {
+		t.Fatalf("sent resource access cards = %#v", cards)
+	}
+	state := resourceAccessCardState(t, cards[0].text)
+	callbackURL := manager.oauth.CallbackURL + "?code=auth-code&state=" + url.QueryEscape(state)
+	response, err := manager.HandleCardAction(context.Background(), resourceAccessCardSubmitEvent(result.RequestID, "ou_other", "oc_chat", "om_card", callbackURL))
+	if err != nil || response == nil || response.Toast == nil || !strings.Contains(response.Toast.Content, "只有") {
+		t.Fatalf("wrong-user handoff response = %#v err=%v", response, err)
+	}
+	wrongStateURL := manager.oauth.CallbackURL + "?code=auth-code&state=wrong-state"
+	response, err = manager.HandleCardAction(context.Background(), resourceAccessCardSubmitEvent(result.RequestID, "ou_requester", "oc_chat", "om_card", wrongStateURL))
+	if err != nil || response == nil || response.Toast == nil || !strings.Contains(response.Toast.Content, "state") {
+		t.Fatalf("wrong-state handoff response = %#v err=%v", response, err)
+	}
+	pending, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
+	if err != nil || pending.State != store.FeishuResourceAccessStatePending || pending.OAuthStateHash == "" || pending.PKCEVerifier == "" {
+		t.Fatalf("rejected handoffs changed pending request = %#v err=%v", pending, err)
+	}
+}
+
+func TestResourceAccessManagerRejectsListenerWithoutCallbackURL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer server.Close()
+	st := openFeishuApprovalTestStore(t)
+	sender := &fakeApprovalSender{}
+	cards, err := newCardService(sender)
+	if err != nil {
+		t.Fatalf("newCardService returned error: %v", err)
+	}
+	client := lark.NewClient("cli_xxx", "secret", lark.WithOpenBaseUrl(server.URL), lark.WithOAuthBaseUrl(server.URL), lark.WithHttpClient(server.Client()))
+	_, err = newResourceAccessManager(context.Background(), st, client, store.Account{
+		ID: "feishu:cli_test", Name: "fsbot", Platform: store.PlatformFeishu,
+	}, "ou_bot", cards, sender, resourceAccessOAuthConfig{
+		ClientID:              "cli_xxx",
+		BaseURL:               server.URL,
+		CallbackListenAddress: "127.0.0.1:18080",
+	})
+	if err == nil || !strings.Contains(err.Error(), "requires oauth_callback_url") {
+		t.Fatalf("listener-only config error = %v", err)
+	}
+}
+
 func TestResourceAccessOAuthServerUsesConfiguredCallbackPath(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatalf("unexpected Feishu API request: %s", r.URL.Path)
@@ -484,6 +654,26 @@ func newTestResourceAccessManager(t *testing.T, server *httptest.Server, oauth r
 	return manager, st, sender
 }
 
+func waitForResourceAccessCompletion(t *testing.T, st *store.Store, sender *fakeApprovalSender, requestID string) store.FeishuResourceAccessRequest {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	var last store.FeishuResourceAccessRequest
+	var lastErr error
+	for time.Now().Before(deadline) {
+		last, lastErr = st.GetFeishuResourceAccessRequest(requestID, "feishu:cli_test")
+		_, updates, messages := sender.snapshot()
+		if lastErr == nil && last.State == store.FeishuResourceAccessStateSucceeded && len(updates) > 0 && len(messages) > 0 {
+			return last
+		}
+		if lastErr == nil && (last.State == store.FeishuResourceAccessStateFailed || last.State == store.FeishuResourceAccessStateExpired || last.State == store.FeishuResourceAccessStateDenied) {
+			t.Fatalf("resource access reached terminal state %s while waiting for success: %#v", last.State, last)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for resource access completion: request=%#v err=%v", last, lastErr)
+	return store.FeishuResourceAccessRequest{}
+}
+
 func resourceAccessCardURL(t *testing.T, raw string) string {
 	t.Helper()
 	var card map[string]any
@@ -508,6 +698,51 @@ func resourceAccessCardURL(t *testing.T, raw string) string {
 	return value
 }
 
+func resourceAccessCardState(t *testing.T, raw string) string {
+	t.Helper()
+	authURL, err := url.Parse(resourceAccessCardURL(t, raw))
+	if err != nil {
+		t.Fatalf("parse resource access authorization URL: %v", err)
+	}
+	state := authURL.Query().Get("state")
+	if state == "" {
+		t.Fatalf("resource access authorization URL has no state: %s", authURL.String())
+	}
+	return state
+}
+
+func findCardElementByName(value any, name string) map[string]any {
+	switch typed := value.(type) {
+	case map[string]any:
+		if typed["name"] == name {
+			return typed
+		}
+		for _, child := range typed {
+			if found := findCardElementByName(child, name); found != nil {
+				return found
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if found := findCardElementByName(child, name); found != nil {
+				return found
+			}
+		}
+	}
+	return nil
+}
+
+func cardButtonAction(button map[string]any) string {
+	behaviors, _ := button["behaviors"].([]any)
+	if len(behaviors) != 1 {
+		return ""
+	}
+	behavior, _ := behaviors[0].(map[string]any)
+	value, _ := behavior["value"].(map[string]any)
+	action, _ := value["action"].(string)
+	return action
+}
+
 func resourceAccessCardEvent(requestID, openID, chatID, messageID string) *callback.CardActionTriggerEvent {
 	userID := "u_requester"
 	if openID != "ou_requester" {
@@ -524,6 +759,13 @@ func resourceAccessCardEvent(requestID, openID, chatID, messageID string) *callb
 			}},
 		},
 	}
+}
+
+func resourceAccessCardSubmitEvent(requestID, openID, chatID, messageID, oauthResult string) *callback.CardActionTriggerEvent {
+	event := resourceAccessCardEvent(requestID, openID, chatID, messageID)
+	event.Event.Action.Value["action"] = resourceAccessCardActionSubmitOAuth
+	event.Event.Action.FormValue = map[string]any{resourceAccessOAuthResultField: oauthResult}
+	return event
 }
 
 func tenantTokenResponseForResourceAccess() map[string]any {

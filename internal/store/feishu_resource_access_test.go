@@ -217,6 +217,77 @@ func TestFeishuResourceAccessDenyValidatesActorAndCard(t *testing.T) {
 	}
 }
 
+func TestFeishuResourceAccessOAuthCardClaimValidatesContextStateAndExpiry(t *testing.T) {
+	st := openFeishuDocsTestStore(t)
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	request := createPendingFeishuResourceAccess(t, st, now)
+	match := FeishuResourceAccessMatch{
+		ActorOpenID:   request.ActorOpenID,
+		ActorUserID:   request.ActorUserID,
+		ChatID:        request.ChatID,
+		CardMessageID: request.CardMessageID,
+	}
+
+	wrongActor := match
+	wrongActor.ActorOpenID = "ou_other"
+	if _, err := st.ClaimFeishuResourceAccessOAuthFromCard(request.ID, request.AccountID, request.OAuthStateHash, wrongActor, now.Add(time.Second)); !errors.Is(err, ErrFeishuResourceAccessForbidden) {
+		t.Fatalf("wrong actor claim error = %v, want ErrFeishuResourceAccessForbidden", err)
+	}
+	wrongCard := match
+	wrongCard.CardMessageID = "om_other"
+	if _, err := st.ClaimFeishuResourceAccessOAuthFromCard(request.ID, request.AccountID, request.OAuthStateHash, wrongCard, now.Add(time.Second)); !errors.Is(err, ErrFeishuResourceAccessContextMismatch) {
+		t.Fatalf("wrong card claim error = %v, want ErrFeishuResourceAccessContextMismatch", err)
+	}
+	if _, err := st.ClaimFeishuResourceAccessOAuthFromCard(request.ID, request.AccountID, "wrong_state_hash", match, now.Add(time.Second)); !errors.Is(err, ErrFeishuResourceAccessOAuthStateMismatch) {
+		t.Fatalf("wrong state claim error = %v, want ErrFeishuResourceAccessOAuthStateMismatch", err)
+	}
+	pending, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil || pending.State != FeishuResourceAccessStatePending || pending.OAuthStateHash == "" || pending.PKCEVerifier == "" {
+		t.Fatalf("rejected card claims changed pending request = %#v err=%v", pending, err)
+	}
+
+	claimed, err := st.ClaimFeishuResourceAccessOAuthFromCard(request.ID, request.AccountID, request.OAuthStateHash, match, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatalf("ClaimFeishuResourceAccessOAuthFromCard returned error: %v", err)
+	}
+	if claimed.State != FeishuResourceAccessStateExecuting || claimed.PKCEVerifier != request.PKCEVerifier || claimed.OAuthStateHash != "" {
+		t.Fatalf("claimed card request = %#v", claimed)
+	}
+	stored, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil || stored.State != FeishuResourceAccessStateExecuting || stored.OAuthStateHash != "" || stored.PKCEVerifier != "" {
+		t.Fatalf("stored card claim retained one-time values = %#v err=%v", stored, err)
+	}
+	if _, err := st.ClaimFeishuResourceAccessOAuthFromCard(request.ID, request.AccountID, "", match, now.Add(3*time.Second)); !errors.Is(err, ErrFeishuResourceAccessResolved) {
+		t.Fatalf("duplicate card claim error = %v, want ErrFeishuResourceAccessResolved", err)
+	}
+
+	rawCodeRequest := createPendingFeishuResourceAccess(t, st, now.Add(time.Hour))
+	rawMatch := FeishuResourceAccessMatch{
+		ActorOpenID:   rawCodeRequest.ActorOpenID,
+		ActorUserID:   rawCodeRequest.ActorUserID,
+		ChatID:        rawCodeRequest.ChatID,
+		CardMessageID: rawCodeRequest.CardMessageID,
+	}
+	if _, err := st.ClaimFeishuResourceAccessOAuthFromCard(rawCodeRequest.ID, rawCodeRequest.AccountID, "", rawMatch, rawCodeRequest.CreatedAt.Add(time.Second)); err != nil {
+		t.Fatalf("raw-code card claim returned error: %v", err)
+	}
+
+	expiredRequest := createPendingFeishuResourceAccess(t, st, now.Add(2*time.Hour))
+	expiredMatch := FeishuResourceAccessMatch{
+		ActorOpenID:   expiredRequest.ActorOpenID,
+		ActorUserID:   expiredRequest.ActorUserID,
+		ChatID:        expiredRequest.ChatID,
+		CardMessageID: expiredRequest.CardMessageID,
+	}
+	if _, err := st.ClaimFeishuResourceAccessOAuthFromCard(expiredRequest.ID, expiredRequest.AccountID, expiredRequest.OAuthStateHash, expiredMatch, expiredRequest.ExpiresAt); !errors.Is(err, ErrFeishuResourceAccessExpired) {
+		t.Fatalf("expired card claim error = %v, want ErrFeishuResourceAccessExpired", err)
+	}
+	expired, err := st.GetFeishuResourceAccessRequest(expiredRequest.ID, expiredRequest.AccountID)
+	if err != nil || expired.State != FeishuResourceAccessStateExpired || expired.OAuthStateHash != "" || expired.PKCEVerifier != "" {
+		t.Fatalf("expired card claim = %#v err=%v", expired, err)
+	}
+}
+
 func TestFeishuResourceGrantUpgradesButDoesNotDowngrade(t *testing.T) {
 	st := openFeishuDocsTestStore(t)
 	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)

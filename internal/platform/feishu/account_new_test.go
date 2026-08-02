@@ -171,6 +171,43 @@ func TestDeleteAccountConfigMissingPlatformConfigIsNoop(t *testing.T) {
 	}
 }
 
+func TestLoadConfigUsesRenamedOAuthCallbackFieldsWithoutLegacyFallback(t *testing.T) {
+	var node yaml.Node
+	if err := yaml.Unmarshal([]byte(`accounts:
+  current:
+    app_id: cli_current
+    app_secret: secret
+    oauth_callback_url: " https://oauth.wulongxin.com/feishu/oauth/callback "
+    oauth_callback_listen_address: " 127.0.0.1:18080 "
+  legacy:
+    app_id: cli_legacy
+    app_secret: secret
+    oauth_redirect_uri: https://legacy.example.com/feishu/oauth/callback
+    oauth_listen_address: 127.0.0.1:8080
+`), &node); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	cfg := config.DefaultConfig()
+	cfg.Platforms = map[string]yaml.Node{store.PlatformFeishu: *node.Content[0]}
+	platformCtx, err := core.NewPlatformContext(store.PlatformFeishu, &cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("NewPlatformContext returned error: %v", err)
+	}
+
+	feishuConfig, err := LoadConfig(platformCtx)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	current := feishuConfig.Accounts["current"]
+	if current.OAuthCallbackURL != "https://oauth.wulongxin.com/feishu/oauth/callback" || current.OAuthCallbackListenAddress != "127.0.0.1:18080" {
+		t.Fatalf("current OAuth callback config = %#v", current)
+	}
+	legacy := feishuConfig.Accounts["legacy"]
+	if legacy.OAuthCallbackURL != "" || legacy.OAuthCallbackListenAddress != "" {
+		t.Fatalf("legacy OAuth fields were accepted as fallback: %#v", legacy)
+	}
+}
+
 func TestLoadConfigParsesEventRuns(t *testing.T) {
 	var node yaml.Node
 	if err := yaml.Unmarshal([]byte(`accounts:
