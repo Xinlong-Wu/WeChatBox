@@ -10,14 +10,13 @@ import (
 )
 
 type fakeResourceAccessController struct {
-	request     ResourceAccessRequest
-	validation  ResourceAccessValidation
-	consumption ResourceAccessValidation
-	consumedBy  string
-	result      ResourceAccessResult
-	err         error
-	actor       Actor
-	chat        ChatContext
+	request      ResourceAccessRequest
+	requirement  ResourceAccessRequirement
+	requirements []ResourceAccessRequirement
+	result       ResourceAccessResult
+	err          error
+	actor        Actor
+	chat         ChatContext
 }
 
 func (f *fakeResourceAccessController) RequestAccess(_ context.Context, request ResourceAccessRequest) (ResourceAccessResult, error) {
@@ -25,19 +24,12 @@ func (f *fakeResourceAccessController) RequestAccess(_ context.Context, request 
 	return f.result, f.err
 }
 
-func (f *fakeResourceAccessController) ValidateAccess(ctx context.Context, validation ResourceAccessValidation) (ResourceAccessResult, error) {
-	f.validation = validation
+func (f *fakeResourceAccessController) RequireResourceAccess(ctx context.Context, requirement ResourceAccessRequirement) error {
+	f.requirement = requirement
+	f.requirements = append(f.requirements, requirement)
 	f.actor, _ = ActorFromContext(ctx)
 	f.chat, _ = ChatContextFromContext(ctx)
-	return f.result, f.err
-}
-
-func (f *fakeResourceAccessController) ConsumeAccess(ctx context.Context, validation ResourceAccessValidation, consumingRequestID string) (ResourceAccessResult, error) {
-	f.consumption = validation
-	f.consumedBy = consumingRequestID
-	f.actor, _ = ActorFromContext(ctx)
-	f.chat, _ = ChatContextFromContext(ctx)
-	return f.result, f.err
+	return f.err
 }
 
 func grantedResourceAccessController(requestID string) *fakeResourceAccessController {

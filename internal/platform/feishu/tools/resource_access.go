@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -20,10 +21,11 @@ const (
 	ResourcePermissionRead  = "read"
 	ResourcePermissionWrite = "write"
 
-	ResourceAccessStatusGranted     = "granted"
-	ResourceAccessStatusPending     = "pending"
-	ResourceAccessStatusDenied      = "denied"
-	ResourceAccessStatusUnsupported = "unsupported"
+	ResourceAccessStatusGranted         = "granted"
+	ResourceAccessStatusPending         = "pending"
+	ResourceAccessStatusDenied          = "denied"
+	ResourceAccessStatusUnsupported     = "unsupported"
+	ResourceAuthorizationRequiredStatus = "resource_authorization_required"
 
 	ResourceAccessSourceBotOwner      = "bot_owner"
 	ResourceAccessSourceExistingGrant = "existing_grant"
@@ -46,7 +48,7 @@ type ResourceAccessRequest struct {
 	Reason              string `json:"reason,omitempty"`
 }
 
-// ResourceAccessResult is returned by both the public tool and create-time validation.
+// ResourceAccessResult is returned by the public resource authorization tool.
 type ResourceAccessResult struct {
 	RequestID     string    `json:"request_id"`
 	Status        string    `json:"status"`
@@ -59,7 +61,7 @@ type ResourceAccessResult struct {
 	Message       string    `json:"message,omitempty"`
 }
 
-// MarshalJSON emits an RFC3339 expiry only for pending OAuth requests.
+// MarshalJSON emits an RFC3339 expiry only for pending authorization requests.
 func (r ResourceAccessResult) MarshalJSON() ([]byte, error) {
 	type resultAlias ResourceAccessResult
 	value := struct {
@@ -72,59 +74,86 @@ func (r ResourceAccessResult) MarshalJSON() ([]byte, error) {
 	return json.Marshal(value)
 }
 
-// ResourceAccessValidation binds a create operation to one prior access request.
-type ResourceAccessValidation struct {
-	RequestID     string
+// ResourceAccessRequirement describes one side-effect-free protected-tool check.
+type ResourceAccessRequirement struct {
 	ResourceType  string
 	ResourceToken string
 	Permission    string
 }
 
-// ResourceAccessController owns resource resolution, live Feishu verification,
-// OAuth/card delivery, and create-time request validation.
+// ResourceAuthorizationRequiredError tells the model which exact resource grant
+// must be requested before retrying the protected tool.
+type ResourceAuthorizationRequiredError struct {
+	Status        string `json:"status"`
+	RequiredTool  string `json:"required_tool"`
+	ResourceType  string `json:"resource_type"`
+	ResourceToken string `json:"resource_token"`
+	Permission    string `json:"permission"`
+	Message       string `json:"message"`
+}
+
+func (e *ResourceAuthorizationRequiredError) Error() string {
+	if e == nil {
+		return "feishu resource authorization is required"
+	}
+	return e.Message
+}
+
+// ResourceAuthorizationRequiredContent returns the structured tool-error
+// payload even when callers wrapped the underlying authorization error.
+func ResourceAuthorizationRequiredContent(err error) (string, bool) {
+	var required *ResourceAuthorizationRequiredError
+	if !errors.As(err, &required) || required == nil {
+		return "", false
+	}
+	data, marshalErr := json.Marshal(required)
+	if marshalErr != nil {
+		return required.Error(), true
+	}
+	return string(data), true
+}
+
+// NewResourceAuthorizationRequiredError builds the stable structured error
+// returned by protected Feishu tools. An empty message uses the standard retry
+// instruction for the required permission.
+func NewResourceAuthorizationRequiredError(requirement ResourceAccessRequirement, message string) error {
+	permissionLabel := "读取"
+	if requirement.Permission == ResourcePermissionWrite {
+		permissionLabel = "写入"
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = fmt.Sprintf("请先调用 %s 获取该资源的%s授权，然后重试原工具", ResourceAccessToolName, permissionLabel)
+	}
+	return &ResourceAuthorizationRequiredError{
+		Status:        ResourceAuthorizationRequiredStatus,
+		RequiredTool:  ResourceAccessToolName,
+		ResourceType:  requirement.ResourceType,
+		ResourceToken: requirement.ResourceToken,
+		Permission:    requirement.Permission,
+		Message:       message,
+	}
+}
+
+// ResourceAccessController owns resource authorization workflows and
+// side-effect-free protected-tool checks.
 type ResourceAccessController interface {
 	RequestAccess(context.Context, ResourceAccessRequest) (ResourceAccessResult, error)
-	ValidateAccess(context.Context, ResourceAccessValidation) (ResourceAccessResult, error)
-	ConsumeAccess(context.Context, ResourceAccessValidation, string) (ResourceAccessResult, error)
+	RequireResourceAccess(context.Context, ResourceAccessRequirement) error
 }
 
-func validateGrantedResourceAccess(ctx context.Context, controller ResourceAccessController, validation ResourceAccessValidation) (ResourceAccessResult, error) {
-	validation.RequestID = strings.TrimSpace(validation.RequestID)
-	validation.ResourceType = NormalizeResourceType(validation.ResourceType)
-	validation.ResourceToken = strings.TrimSpace(validation.ResourceToken)
-	validation.Permission = strings.ToLower(strings.TrimSpace(validation.Permission))
+func requireResourceAccess(ctx context.Context, controller ResourceAccessController, requirement ResourceAccessRequirement) error {
+	requirement.ResourceType = NormalizeResourceType(requirement.ResourceType)
+	requirement.ResourceToken = strings.TrimSpace(requirement.ResourceToken)
+	requirement.Permission = strings.ToLower(strings.TrimSpace(requirement.Permission))
 	if controller == nil {
-		return ResourceAccessResult{}, fmt.Errorf("feishu resource access workflow is unavailable")
+		return fmt.Errorf("feishu resource access checker is unavailable")
 	}
-	if validation.RequestID == "" {
-		return ResourceAccessResult{}, fmt.Errorf("access_request_id is required; call %s before using the resource", ResourceAccessToolName)
+	if !SupportedResourceType(requirement.ResourceType) || requirement.ResourceToken == "" ||
+		(requirement.Permission != ResourcePermissionRead && requirement.Permission != ResourcePermissionWrite) {
+		return fmt.Errorf("valid feishu resource type, token, and read/write permission are required")
 	}
-	result, err := controller.ValidateAccess(ctx, validation)
-	if err != nil {
-		return ResourceAccessResult{}, err
-	}
-	if result.Status != ResourceAccessStatusGranted || strings.TrimSpace(result.RequestID) != validation.RequestID {
-		return ResourceAccessResult{}, fmt.Errorf("access_request_id is not a granted request for this operation; call %s again", ResourceAccessToolName)
-	}
-	return result, nil
-}
-
-func consumeGrantedResourceAccess(ctx context.Context, controller ResourceAccessController, validation ResourceAccessValidation, consumingRequestID string) (ResourceAccessResult, error) {
-	consumingRequestID = strings.TrimSpace(consumingRequestID)
-	if consumingRequestID == "" {
-		return ResourceAccessResult{}, fmt.Errorf("consuming workflow request_id is required")
-	}
-	if controller == nil {
-		return ResourceAccessResult{}, fmt.Errorf("feishu resource access workflow is unavailable")
-	}
-	result, err := controller.ConsumeAccess(ctx, validation, consumingRequestID)
-	if err != nil {
-		return ResourceAccessResult{}, err
-	}
-	if result.Status != ResourceAccessStatusGranted || strings.TrimSpace(result.RequestID) != strings.TrimSpace(validation.RequestID) {
-		return ResourceAccessResult{}, fmt.Errorf("access_request_id was not consumed for this operation; call %s again", ResourceAccessToolName)
-	}
-	return result, nil
+	return controller.RequireResourceAccess(ctx, requirement)
 }
 
 type resourceAccessTool struct {
@@ -235,7 +264,7 @@ func ResourceTokenAlias(token string) bool {
 func docsResourceAccessSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        ResourceAccessToolName,
-		Description: "Verify or request read/write access to one exact Feishu file or folder for the trusted current user and chat. Bot-owned resources and existing valid grants return granted immediately. Otherwise the requester chooses either a temporary 10–60 minute grant or a permanent grant in a card; once_duration_minutes is the model's suggested temporary window and is shown to the user. write also satisfies read, while read never satisfies write. If Feishu-side permission is missing, LingoBridge reuses the requester's encrypted OAuth credential or updates the same card with Feishu's official OAuth handoff. Use resource_token=bot_root for the Bot root or chat_default_folder for the current chat's default Bot folder.",
+		Description: "Verify or request read/write access to one exact Feishu file or folder for the trusted current user and chat. Call this when a protected Feishu tool returns status=resource_authorization_required, using that error's resource_type, resource_token, and permission. Bot-owned resources and existing valid grants return granted immediately. Otherwise the requester chooses either a temporary 10–60 minute grant or a permanent grant in a card; once_duration_minutes is the model's suggested temporary window and is shown to the user. write also satisfies read, while read never satisfies write. If Feishu-side permission is missing, LingoBridge reuses the requester's encrypted OAuth credential or updates the same card with Feishu's official OAuth handoff. Use resource_token=bot_root for the Bot root or chat_default_folder for the current chat's default Bot folder.",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"resource_type":{"type":"string","enum":["folder","doc","docx","sheet","file","wiki","bitable","mindnote","minutes","slides"]},"resource_token":{"type":"string","description":"Exact Feishu resource token, or bot_root/chat_default_folder for a trusted Bot folder alias."},"resource_url":{"type":"string","description":"Optional Feishu resource URL used in the authorization card and post-OAuth redirect."},"permission":{"type":"string","enum":["read","write"]},"once_duration_minutes":{"type":"integer","minimum":10,"maximum":60,"description":"Suggested temporary authorization window shown on the card; the user can instead choose permanent authorization."},"reason":{"type":"string","maxLength":500,"description":"Short user-visible reason for requesting access."}},"required":["resource_type","resource_token","permission","once_duration_minutes"],"additionalProperties":false}`),
 	}
 }

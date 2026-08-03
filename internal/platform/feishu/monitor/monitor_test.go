@@ -136,12 +136,8 @@ func (fakeResourceAccessController) RequestAccess(context.Context, feishutools.R
 	return feishutools.ResourceAccessResult{RequestID: "req_access", Status: feishutools.ResourceAccessStatusGranted}, nil
 }
 
-func (fakeResourceAccessController) ValidateAccess(context.Context, feishutools.ResourceAccessValidation) (feishutools.ResourceAccessResult, error) {
-	return feishutools.ResourceAccessResult{RequestID: "req_access", Status: feishutools.ResourceAccessStatusGranted}, nil
-}
-
-func (fakeResourceAccessController) ConsumeAccess(context.Context, feishutools.ResourceAccessValidation, string) (feishutools.ResourceAccessResult, error) {
-	return feishutools.ResourceAccessResult{RequestID: "req_access", Status: feishutools.ResourceAccessStatusGranted}, nil
+func (fakeResourceAccessController) RequireResourceAccess(context.Context, feishutools.ResourceAccessRequirement) error {
+	return nil
 }
 
 type sentText struct {

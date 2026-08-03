@@ -92,6 +92,9 @@ func (t docsTool) Execute(ctx context.Context, call tooltypes.Call) tooltypes.Re
 
 func contentOrError(content string, err error) string {
 	if err != nil {
+		if structured, ok := ResourceAuthorizationRequiredContent(err); ok {
+			return structured
+		}
 		return err.Error()
 	}
 	return content
@@ -544,28 +547,26 @@ func (t docsTool) resolveChatFolder(chatID, folderToken string) (store.FeishuCha
 }
 
 func (t docsTool) validateDocumentCreateAccess(ctx context.Context, payload approvedCreatePayload) error {
-	if _, err := validateGrantedResourceAccess(ctx, t.resourceAccess, ResourceAccessValidation{
-		RequestID:     payload.AccessRequestID,
+	if err := requireResourceAccess(ctx, t.resourceAccess, ResourceAccessRequirement{
 		ResourceType:  "folder",
 		ResourceToken: payload.FolderToken,
 		Permission:    ResourcePermissionWrite,
 	}); err != nil {
-		return fmt.Errorf("validate target folder access: %w", err)
+		return fmt.Errorf("require target folder access: %w", err)
 	}
-	feishuToolsLog.Debug(ctx, "validated feishu document create access request=%s account=%s chat=%s folder_ref=%s",
-		shortToolRequestID(payload.AccessRequestID), t.accountID, payload.ChatID, hashString(payload.FolderToken))
+	feishuToolsLog.Debug(ctx, "validated feishu document create access account=%s chat=%s folder_ref=%s",
+		t.accountID, payload.ChatID, hashString(payload.FolderToken))
 	return nil
 }
 
 func (t docsTool) createDocument(ctx context.Context, requestID string, payload approvedCreatePayload) (writeOutput, error) {
 	args := payload.createArgs
-	if _, err := consumeGrantedResourceAccess(ctx, t.resourceAccess, ResourceAccessValidation{
-		RequestID:     args.AccessRequestID,
+	if err := requireResourceAccess(ctx, t.resourceAccess, ResourceAccessRequirement{
 		ResourceType:  "folder",
 		ResourceToken: args.FolderToken,
 		Permission:    ResourcePermissionWrite,
-	}, requestID); err != nil {
-		return writeOutput{}, fmt.Errorf("consume target folder access: %w", err)
+	}); err != nil {
+		return writeOutput{}, fmt.Errorf("revalidate target folder access: %w", err)
 	}
 	req := larkdocx.NewCreateDocumentReqBuilder().
 		Body(larkdocx.NewCreateDocumentReqBodyBuilder().
@@ -627,6 +628,13 @@ func (t docsTool) authorizeDocumentAccess(ctx context.Context, chat ChatContext,
 	documentToken = strings.TrimSpace(documentToken)
 	permission = strings.ToLower(strings.TrimSpace(permission))
 	accessRequestID = strings.TrimSpace(accessRequestID)
+	if err := requireResourceAccess(ctx, t.resourceAccess, ResourceAccessRequirement{
+		ResourceType:  "docx",
+		ResourceToken: documentToken,
+		Permission:    permission,
+	}); err != nil {
+		return store.FeishuChatDocument{}, false, fmt.Errorf("require document access: %w", err)
+	}
 	document, err := t.store.GetFeishuChatDocument(t.accountID, chat.ChatID, documentToken)
 	if err == nil {
 		return document, true, nil
@@ -673,19 +681,8 @@ func (t docsTool) authorizeDocumentAccess(ctx context.Context, chat ChatContext,
 	if !errors.Is(err, store.ErrFeishuBotResourceNotFound) {
 		return store.FeishuChatDocument{}, false, fmt.Errorf("check Bot-owned document metadata: %w", err)
 	}
-	if accessRequestID == "" {
-		return store.FeishuChatDocument{}, false, fmt.Errorf("access_request_id is required for a document not bound to the current Feishu chat; call %s with docx/%s first", ResourceAccessToolName, permission)
-	}
-	if _, err := validateGrantedResourceAccess(ctx, t.resourceAccess, ResourceAccessValidation{
-		RequestID:     accessRequestID,
-		ResourceType:  "docx",
-		ResourceToken: documentToken,
-		Permission:    permission,
-	}); err != nil {
-		return store.FeishuChatDocument{}, false, fmt.Errorf("validate external document access: %w", err)
-	}
-	feishuToolsLog.Debug(ctx, "validated external feishu document access request=%s account=%s chat=%s document_ref=%s permission=%s",
-		shortToolRequestID(accessRequestID), t.accountID, chat.ChatID, hashString(documentToken), permission)
+	feishuToolsLog.Debug(ctx, "validated external feishu document access account=%s chat=%s document_ref=%s permission=%s",
+		t.accountID, chat.ChatID, hashString(documentToken), permission)
 	return store.FeishuChatDocument{}, false, nil
 }
 
@@ -858,7 +855,7 @@ func docsSearchSpec() tooltypes.Spec {
 func docsReadSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        readToolName,
-		Description: "Read plain text from a Feishu docx document. Documents already bound to the current trusted chat need no extra argument. For an external unbound document, first call feishu_docs_request_access for docx/read and pass its granted request_id as access_request_id. External access is live-checked and does not create a permanent chat binding. The result may be truncated by configuration.",
+		Description: "Read plain text from a Feishu docx document. The tool checks Bot ownership or the current trusted user's scoped docx/read grant and live Feishu capability without sending cards itself. If authorization is missing it returns resource_authorization_required; call feishu_docs_request_access with the returned resource and permission, then retry. External access does not create a permanent chat binding. The result may be truncated by configuration.",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"token":{"type":"string","description":"Feishu docx document token."},"url":{"type":"string","description":"Feishu document URL."},"type":{"type":"string","enum":["docx","wiki","file"],"description":"Document type hint."},"access_request_id":{"type":"string","description":"Granted request_id for docx/read; required only when the document is not bound to the current chat."}},"additionalProperties":false}`),
 	}
 }
@@ -886,7 +883,7 @@ func escapeFeishuLinkText(value string) string {
 func docsAppendSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        appendToolName,
-		Description: "Append plain text paragraphs to a Feishu docx document. Documents already bound to the current trusted chat need no extra authorization argument. For an external unbound document, first call feishu_docs_request_access for docx/write and pass its granted request_id as access_request_id. External access is live-checked and does not create a permanent chat binding.",
+		Description: "Append plain text paragraphs to a Feishu docx document. The tool checks Bot ownership or the current trusted user's scoped docx/write grant and live Feishu capability without sending cards itself. If authorization is missing it returns resource_authorization_required; call feishu_docs_request_access with the returned resource and permission, then retry. External access does not create a permanent chat binding.",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"token":{"type":"string"},"url":{"type":"string"},"content":{"type":"string"},"folder_token":{"type":"string","description":"Optional consistency check available only for a current-chat document binding."},"access_request_id":{"type":"string","description":"Granted request_id for docx/write; required only when the document is not bound to the current chat."}},"required":["content"],"additionalProperties":false}`),
 	}
 }

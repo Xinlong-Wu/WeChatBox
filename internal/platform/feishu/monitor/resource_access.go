@@ -397,110 +397,93 @@ func (m *resourceAccessManager) RequestAccess(ctx context.Context, input feishut
 	return result, nil
 }
 
-func (m *resourceAccessManager) ValidateAccess(ctx context.Context, validation feishutools.ResourceAccessValidation) (feishutools.ResourceAccessResult, error) {
+func (m *resourceAccessManager) RequireResourceAccess(ctx context.Context, requirement feishutools.ResourceAccessRequirement) error {
 	actor, chat, err := trustedResourceAccessScope(ctx)
 	if err != nil {
-		return feishutools.ResourceAccessResult{}, err
+		return err
 	}
-	validation.RequestID = strings.TrimSpace(validation.RequestID)
-	validation.ResourceType = feishutools.NormalizeResourceType(validation.ResourceType)
-	validation.ResourceToken = strings.TrimSpace(validation.ResourceToken)
-	validation.Permission = strings.ToLower(strings.TrimSpace(validation.Permission))
-	if validation.RequestID == "" || !feishutools.SupportedResourceType(validation.ResourceType) || validation.ResourceToken == "" ||
-		(validation.Permission != feishutools.ResourcePermissionRead && validation.Permission != feishutools.ResourcePermissionWrite) {
-		return feishutools.ResourceAccessResult{}, fmt.Errorf("valid access_request_id, resource type/token, and permission are required")
+	requirement.ResourceType = feishutools.NormalizeResourceType(requirement.ResourceType)
+	requirement.ResourceToken = strings.TrimSpace(requirement.ResourceToken)
+	requirement.Permission = strings.ToLower(strings.TrimSpace(requirement.Permission))
+	if !feishutools.SupportedResourceType(requirement.ResourceType) || requirement.ResourceToken == "" ||
+		(requirement.Permission != feishutools.ResourcePermissionRead && requirement.Permission != feishutools.ResourcePermissionWrite) {
+		return fmt.Errorf("valid feishu resource type, token, and read/write permission are required")
 	}
-	request, err := m.store.GetFeishuResourceAccessRequest(validation.RequestID, m.account.ID)
-	if err != nil {
-		if errors.Is(err, store.ErrFeishuResourceAccessNotFound) {
-			return feishutools.ResourceAccessResult{}, fmt.Errorf("access_request_id is unknown for the current Bot account")
-		}
-		return feishutools.ResourceAccessResult{}, fmt.Errorf("load feishu resource access request: %w", err)
+	if _, err := m.store.GetFeishuBotResource(m.account.ID, requirement.ResourceType, requirement.ResourceToken); err == nil {
+		feishuLog.Debug(ctx, "allowed Bot-owned feishu resource access account=%s chat=%s type=%s resource_ref=%s permission=%s",
+			m.account.ID, chat.ChatID, requirement.ResourceType, shortResourceRef(requirement.ResourceToken), requirement.Permission)
+		return nil
+	} else if !errors.Is(err, store.ErrFeishuBotResourceNotFound) {
+		return fmt.Errorf("check Bot-owned feishu resource: %w", err)
 	}
-	if request.State != store.FeishuResourceAccessStateSucceeded {
-		return feishutools.ResourceAccessResult{}, fmt.Errorf("access_request_id is not granted; current state is %s", request.State)
+	subjectType, subjectID, unsupportedMessage := m.resourceGrantSubject(chat, requirement.ResourceType)
+	if subjectType == "" || subjectID == "" {
+		return feishutools.NewResourceAuthorizationRequiredError(requirement, unsupportedMessage)
 	}
-	if request.ChatID != chat.ChatID || !resourceAccessActorMatches(request, actor) {
-		return feishutools.ResourceAccessResult{}, fmt.Errorf("access_request_id does not belong to the current Feishu user and chat")
-	}
-	if request.ResourceType != validation.ResourceType || request.ResourceToken != validation.ResourceToken {
-		return feishutools.ResourceAccessResult{}, fmt.Errorf("access_request_id does not match the requested resource")
-	}
-	if !store.FeishuResourcePermissionSatisfies(request.VerifiedPermission, validation.Permission) {
-		return feishutools.ResourceAccessResult{}, fmt.Errorf("access_request_id does not grant the required %s permission", validation.Permission)
-	}
-	if request.GrantSource == store.FeishuResourceGrantSourceBotOwner {
-		if _, err := m.store.GetFeishuBotResource(request.AccountID, request.ResourceType, request.ResourceToken); err != nil {
-			return feishutools.ResourceAccessResult{}, fmt.Errorf("Bot-owned resource record is no longer available; call %s again", feishutools.ResourceAccessToolName)
-		}
-		return m.resourceAccessResult(request, feishutools.ResourceAccessStatusGranted, request.GrantSource), nil
-	}
-	grantActorType, grantActorID, actorErr := resourceAccessGrantActor(request.ActorOpenID, request.ActorUserID)
+	grantActorType, grantActorID, actorErr := resourceAccessGrantActor(actor.OpenID, actor.UserID)
 	if actorErr != nil {
-		return feishutools.ResourceAccessResult{}, actorErr
+		return actorErr
 	}
 	_, activeGrant, grantErr := m.store.ActiveFeishuResourceGrant(
-		request.AccountID,
+		m.account.ID,
 		grantActorType,
 		grantActorID,
-		request.ChatID,
-		request.ResourceType,
-		request.ResourceToken,
-		validation.Permission,
+		chat.ChatID,
+		requirement.ResourceType,
+		requirement.ResourceToken,
+		requirement.Permission,
 		m.currentTime(),
 	)
 	if grantErr != nil {
-		return feishutools.ResourceAccessResult{}, fmt.Errorf("load feishu resource grant: %w", grantErr)
+		return fmt.Errorf("load feishu resource grant: %w", grantErr)
 	}
 	if !activeGrant {
-		return feishutools.ResourceAccessResult{}, fmt.Errorf("the local Feishu resource grant has expired or is unavailable; call %s again", feishutools.ResourceAccessToolName)
+		return feishutools.NewResourceAuthorizationRequiredError(requirement, "")
 	}
 	capability, activeCapability, capabilityErr := m.store.ActiveFeishuResourceCapability(
-		request.AccountID,
-		request.ResourceType,
-		request.ResourceToken,
-		request.SubjectType,
-		request.SubjectID,
-		validation.Permission,
+		m.account.ID,
+		requirement.ResourceType,
+		requirement.ResourceToken,
+		subjectType,
+		subjectID,
+		requirement.Permission,
 	)
 	if capabilityErr != nil {
-		return feishutools.ResourceAccessResult{}, fmt.Errorf("load feishu resource capability: %w", capabilityErr)
+		return fmt.Errorf("load feishu resource capability: %w", capabilityErr)
+	}
+	request := store.FeishuResourceAccessRequest{
+		AccountID:     m.account.ID,
+		ActorOpenID:   actor.OpenID,
+		ActorUserID:   actor.UserID,
+		ChatID:        chat.ChatID,
+		ResourceType:  requirement.ResourceType,
+		ResourceToken: requirement.ResourceToken,
+		Permission:    requirement.Permission,
+		SubjectType:   subjectType,
+		SubjectID:     subjectID,
 	}
 	if !activeCapability {
-		m.revokeResourceCapabilityAndGrantBestEffort(ctx, request, request.SubjectType, request.SubjectID, "missing create-time capability")
-		return feishutools.ResourceAccessResult{}, fmt.Errorf("Feishu capability is no longer active; call %s again", feishutools.ResourceAccessToolName)
+		m.revokeResourceCapabilityAndGrantBestEffort(ctx, request, subjectType, subjectID, "missing protected-tool capability")
+		return feishutools.NewResourceAuthorizationRequiredError(requirement, "")
 	}
-	verified, verifyErr := m.verifyTenantAccess(ctx, request.ResourceType, request.ResourceToken, validation.Permission, capability.SubjectType, capability.SubjectID)
+	verified, verifyErr := m.verifyTenantAccess(ctx, requirement.ResourceType, requirement.ResourceToken, requirement.Permission, capability.SubjectType, capability.SubjectID)
 	if verifyErr != nil {
-		return feishutools.ResourceAccessResult{}, fmt.Errorf("live-check feishu resource access: %w", verifyErr)
+		return fmt.Errorf("live-check feishu resource access: %w", verifyErr)
 	}
 	if !verified {
-		m.revokeResourceCapabilityAndGrantBestEffort(ctx, request, capability.SubjectType, capability.SubjectID, "invalid create-time access")
-		return feishutools.ResourceAccessResult{}, fmt.Errorf("Feishu no longer reports the required access; call %s again", feishutools.ResourceAccessToolName)
+		m.revokeResourceCapabilityAndGrantBestEffort(ctx, request, capability.SubjectType, capability.SubjectID, "invalid protected-tool access")
+		return feishutools.NewResourceAuthorizationRequiredError(requirement, "")
 	}
 	verifiedAt := m.currentTime()
-	capability.SourceRequestID = request.ID
 	capability.VerifiedAt = verifiedAt
 	capability.UpdatedAt = verifiedAt
 	if _, err := m.store.UpsertFeishuResourceCapability(capability); err != nil {
-		return feishutools.ResourceAccessResult{}, fmt.Errorf("refresh feishu resource capability verification: %w", err)
+		return fmt.Errorf("refresh feishu resource capability verification: %w", err)
 	}
-	return m.resourceAccessResult(request, feishutools.ResourceAccessStatusGranted, request.GrantSource), nil
-}
-
-func (m *resourceAccessManager) ConsumeAccess(ctx context.Context, validation feishutools.ResourceAccessValidation, consumingRequestID string) (feishutools.ResourceAccessResult, error) {
-	consumingRequestID = strings.TrimSpace(consumingRequestID)
-	if consumingRequestID == "" {
-		return feishutools.ResourceAccessResult{}, fmt.Errorf("consuming workflow request_id is required")
-	}
-	result, err := m.ValidateAccess(ctx, validation)
-	if err != nil {
-		return feishutools.ResourceAccessResult{}, err
-	}
-	feishuLog.Debug(ctx, "validated reusable feishu resource access request=%s operation=%s account=%s type=%s resource_ref=%s permission=%s",
-		shortRequestID(result.RequestID), shortRequestID(consumingRequestID), m.account.ID,
-		result.ResourceType, shortResourceRef(result.ResourceToken), result.Permission)
-	return result, nil
+	feishuLog.Debug(ctx, "allowed scoped feishu resource access account=%s user=%s chat=%s type=%s resource_ref=%s permission=%s subject_type=%s",
+		m.account.ID, grantActorID, chat.ChatID, requirement.ResourceType,
+		shortResourceRef(requirement.ResourceToken), requirement.Permission, capability.SubjectType)
+	return nil
 }
 
 func (m *resourceAccessManager) HandleCardAction(ctx context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {

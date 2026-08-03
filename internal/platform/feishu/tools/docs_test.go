@@ -104,40 +104,57 @@ func TestDocsReadAndAppendExternalDocumentUseResourceAccessWithoutBinding(t *tes
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
 	st, tools, access := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
 	readTool := findDocsTool(t, tools, readToolName)
-	missing := readTool.Execute(groupDocsContext(), tooltypes.Call{
-		ID:        "read_missing",
-		Name:      readToolName,
-		Arguments: json.RawMessage(`{"token":"doxcnexternal12345"}`),
-	})
-	if !missing.IsError || !strings.Contains(missing.Content, "access_request_id is required") || readCalls != 0 {
-		t.Fatalf("missing external read result=%#v read_calls=%d", missing, readCalls)
-	}
 	read := readTool.Execute(groupDocsContext(), tooltypes.Call{
 		ID:        "read_external",
 		Name:      readToolName,
-		Arguments: json.RawMessage(`{"token":"doxcnexternal12345","access_request_id":"req_access"}`),
+		Arguments: json.RawMessage(`{"token":"doxcnexternal12345"}`),
 	})
 	if read.IsError || !strings.Contains(read.Content, "external text") || readCalls != 1 {
 		t.Fatalf("external read result=%#v read_calls=%d", read, readCalls)
 	}
-	if access.validation.RequestID != "req_access" || access.validation.ResourceType != "docx" || access.validation.ResourceToken != documentToken || access.validation.Permission != ResourcePermissionRead {
-		t.Fatalf("external read validation = %#v", access.validation)
+	if access.requirement.ResourceType != "docx" || access.requirement.ResourceToken != documentToken || access.requirement.Permission != ResourcePermissionRead {
+		t.Fatalf("external read requirement = %#v", access.requirement)
 	}
 
 	appendTool := findDocsTool(t, tools, appendToolName)
 	append := appendTool.Execute(groupDocsContext(), tooltypes.Call{
 		ID:        "append_external",
 		Name:      appendToolName,
-		Arguments: json.RawMessage(`{"token":"doxcnexternal12345","content":"new paragraph","access_request_id":"req_access"}`),
+		Arguments: json.RawMessage(`{"token":"doxcnexternal12345","content":"new paragraph"}`),
 	})
 	if append.IsError || !strings.Contains(append.Content, `"appended":true`) || appendCalls != 1 {
 		t.Fatalf("external append result=%#v append_calls=%d", append, appendCalls)
 	}
-	if access.validation.RequestID != "req_access" || access.validation.ResourceToken != documentToken || access.validation.Permission != ResourcePermissionWrite {
-		t.Fatalf("external append validation = %#v", access.validation)
+	if access.requirement.ResourceToken != documentToken || access.requirement.Permission != ResourcePermissionWrite {
+		t.Fatalf("external append requirement = %#v", access.requirement)
 	}
 	if _, err := st.GetFeishuChatDocument("feishu:cli_test", "oc_chat", documentToken); !errors.Is(err, store.ErrFeishuChatDocumentNotFound) {
 		t.Fatalf("external document binding error = %v, want not found", err)
+	}
+}
+
+func TestDocsProtectedToolReturnsStructuredResourceAuthorizationRequired(t *testing.T) {
+	cfg := Config{Docs: DocsToolsConfig{Enabled: true}}
+	_, tools, access := newDocsToolsForTest(t, &lark.Client{}, cfg, nil)
+	requirement := ResourceAccessRequirement{
+		ResourceType: "docx", ResourceToken: "doxcnexternal12345", Permission: ResourcePermissionRead,
+	}
+	access.err = NewResourceAuthorizationRequiredError(requirement, "")
+	result := findDocsTool(t, tools, readToolName).Execute(groupDocsContext(), tooltypes.Call{
+		ID:        "read_requires_authorization",
+		Name:      readToolName,
+		Arguments: json.RawMessage(`{"token":"doxcnexternal12345"}`),
+	})
+	if !result.IsError {
+		t.Fatalf("protected read result = %#v, want tool error", result)
+	}
+	var payload ResourceAuthorizationRequiredError
+	if err := json.Unmarshal([]byte(result.Content), &payload); err != nil {
+		t.Fatalf("structured authorization error JSON = %q: %v", result.Content, err)
+	}
+	if payload.Status != ResourceAuthorizationRequiredStatus || payload.RequiredTool != ResourceAccessToolName ||
+		payload.ResourceType != requirement.ResourceType || payload.ResourceToken != requirement.ResourceToken || payload.Permission != requirement.Permission {
+		t.Fatalf("structured authorization error = %#v", payload)
 	}
 }
 
@@ -164,8 +181,8 @@ func TestDocsReadRejectsBotOwnedDocumentFromAnotherChat(t *testing.T) {
 	if !result.IsError || !strings.Contains(result.Content, "not available to the current Feishu chat") {
 		t.Fatalf("cross-chat read result = %#v", result)
 	}
-	if access.validation.RequestID != "" {
-		t.Fatalf("cross-chat Bot document unexpectedly used external access: %#v", access.validation)
+	if len(access.requirements) != 1 || access.requirement.ResourceToken != "doxcnotherchat123" || access.requirement.Permission != ResourcePermissionRead {
+		t.Fatalf("cross-chat Bot document requirement = %#v", access.requirements)
 	}
 }
 
@@ -218,8 +235,8 @@ func TestDocsReadRepairsBotOwnedDocumentBindingInCurrentChat(t *testing.T) {
 	if err != nil || document.FolderToken != "fld_token" || document.SourceRequestID != "req_created" {
 		t.Fatalf("repaired document binding = %#v err=%v", document, err)
 	}
-	if access.validation.RequestID != "" {
-		t.Fatalf("Bot-owned repair unexpectedly used external access: %#v", access.validation)
+	if len(access.requirements) != 1 || access.requirement.ResourceToken != documentToken || access.requirement.Permission != ResourcePermissionRead {
+		t.Fatalf("Bot-owned repair access requirement = %#v", access.requirements)
 	}
 }
 
@@ -315,8 +332,8 @@ func TestDocsCreateToolUsesActiveGrantWithoutSendingCard(t *testing.T) {
 	if output.DocumentID != "doxcnactive123" || output.Warning != "" || createCalls != 1 {
 		t.Fatalf("create output/calls = %#v/%d", output, createCalls)
 	}
-	if access.consumption.RequestID != "req_access" || access.consumption.ResourceToken != "fld_token" || access.consumedBy != output.RequestID {
-		t.Fatalf("access consumption=%#v consumed_by=%q", access.consumption, access.consumedBy)
+	if len(access.requirements) != 2 || access.requirement.ResourceToken != "fld_token" || access.requirement.Permission != ResourcePermissionWrite {
+		t.Fatalf("access requirements=%#v", access.requirements)
 	}
 	if approver.request.ToolName != "" {
 		t.Fatalf("approval request = %#v, want no card for active grant", approver.request)
@@ -461,11 +478,8 @@ func TestDocsCreateApprovedExecutionCreatesDocument(t *testing.T) {
 	if createRequest.Title != "Quarterly plan" || createRequest.FolderToken != "fld_token" {
 		t.Fatalf("create request = %#v", createRequest)
 	}
-	if access.validation.RequestID != "req_access" || access.validation.ResourceToken != "fld_token" || access.actor.OpenID != "ou_requester" || access.chat.ChatID != "oc_chat" {
-		t.Fatalf("approved access validation=%#v actor=%#v chat=%#v", access.validation, access.actor, access.chat)
-	}
-	if access.consumption.RequestID != "req_access" || access.consumption.ResourceToken != "fld_token" || access.consumedBy != "req_approved" {
-		t.Fatalf("approved access consumption=%#v consumed_by=%q", access.consumption, access.consumedBy)
+	if len(access.requirements) != 2 || access.requirement.ResourceToken != "fld_token" || access.actor.OpenID != "ou_requester" || access.chat.ChatID != "oc_chat" {
+		t.Fatalf("approved access requirements=%#v actor=%#v chat=%#v", access.requirements, access.actor, access.chat)
 	}
 }
 
@@ -591,8 +605,8 @@ func TestDocsCreateRequiresAndRevalidatesFolderAccess(t *testing.T) {
 	if result.IsError {
 		t.Fatalf("granted access result = %#v", result)
 	}
-	if access.validation.RequestID != "req_access" || access.validation.ResourceToken != "fld_token" || access.validation.Permission != ResourcePermissionWrite || access.actor.OpenID != "ou_requester" || access.chat.ChatID != "oc_chat" {
-		t.Fatalf("access validation=%#v actor=%#v chat=%#v", access.validation, access.actor, access.chat)
+	if len(access.requirements) != 1 || access.requirement.ResourceToken != "fld_token" || access.requirement.Permission != ResourcePermissionWrite || access.actor.OpenID != "ou_requester" || access.chat.ChatID != "oc_chat" {
+		t.Fatalf("access requirements=%#v actor=%#v chat=%#v", access.requirements, access.actor, access.chat)
 	}
 }
 

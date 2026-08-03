@@ -376,12 +376,22 @@ card. `write` also satisfies `read`. The aliases
 `bot_root` and `chat_default_folder` resolve to the current Bot account's root
 and the current chat's default Bot folder.
 
+Protected document and folder tools use a side-effect-free resource checker
+before calling Feishu. The checker reads the trusted runtime account, actor,
+and chat, then accepts Bot-owned resources or requires an active scoped local
+grant plus a live Feishu capability. It never sends a card, starts OAuth,
+creates a workflow, or retries the protected operation. Missing authorization
+is returned to the model as a structured `resource_authorization_required`
+tool error containing `required_tool`, `resource_type`, `resource_token`, and
+`permission`; the model can then call `feishu_docs_request_access` explicitly
+and retry the original tool after the asynchronous workflow completes.
+
 Every folder or document creation must first call
 `feishu_docs_request_access` for `folder/write` on the actual parent or target
 folder, then pass its granted `request_id` to the create tool as
 `access_request_id`. The request ID remains an interim binding argument while
-protected tools are being migrated to direct grant checks; it is not consumed
-after one operation. The actual reusable authorization is a local grant scoped
+the JSON arguments are being migrated; authorization itself no longer reads or
+consumes that ID. The actual reusable authorization is a local grant scoped
 to the exact account, requesting user, current chat, resource, and permission.
 Bot-owned resources return `granted` immediately. For other resources,
 LingoBridge checks that local grant and the separate Feishu-side capability for
@@ -405,11 +415,11 @@ The whole workflow remains bound to the original Feishu user, account, chat,
 card message, and global request ID; the model cannot provide another
 `chat_id`.
 
-`feishu_docs_read` and `feishu_docs_append` continue to work directly for a
-document already bound to the current chat. For an unbound external Docx, call
-`feishu_docs_request_access` for `docx/read` or `docx/write` respectively and
-pass the granted `request_id` as `access_request_id`. That permission is
-live-checked on each operation, and the external document is not permanently
+`feishu_docs_read` and `feishu_docs_append` run the resource checker for the
+resolved Docx before the Feishu API call. Bot-owned documents pass directly;
+an external Docx requires the current actor/chat's `docx/read` or `docx/write`
+grant and live capability. Missing access returns the structured error above
+instead of silently sending a card. External documents are not permanently
 bound to the chat. A Bot-owned document missing its local binding is repaired
 only when its recorded parent is a fully shared Bot folder in the same chat;
 Bot-owned documents from another chat are rejected even if their token is
@@ -726,7 +736,7 @@ guarded tools exposed for the current PR.
 | `platforms.feishu.tools.max_chars` | `12000` | Shared maximum character count for Feishu tools that return content, including `feishu_chat_history_get` and `feishu_docs_read` |
 | `platforms.feishu.tools.chat_history.enabled` | `false` | Enable `feishu_chat_history_get` for the current trusted Feishu `chat_id`; each call returns at most 100 messages |
 | `platforms.feishu.tools.docs.enabled` | `false` | Enable Feishu Docs tools for tool-capable LLM profiles |
-| `platforms.feishu.tools.docs.allow_write` | `false` | Register folder/document create and append tools. During the current migration, create and external append still carry an `access_request_id`, but it resolves to a reusable scoped resource grant rather than a single-use credential. Document create additionally requires requester-only operation approval unless the same user, bot account, chat, and tool have an active 24-hour grant |
+| `platforms.feishu.tools.docs.allow_write` | `false` | Register folder/document create and append tools. During the current JSON-schema migration, create still carries `access_request_id`, but protected-tool authorization ignores request IDs and checks the trusted actor/chat's reusable scoped grant directly. Document create additionally requires requester-only operation approval unless the same user, bot account, chat, and tool have an active 24-hour grant |
 | `platforms.feishu.tools.litellm.enabled` | `false` | Enable the Feishu natural-language LiteLLM account invitation tool |
 | `platforms.feishu.tools.litellm.base_url` | — | LiteLLM proxy base URL used for API calls and invitation link construction |
 | `platforms.feishu.tools.litellm.api_key` | — | LiteLLM admin/master API key used for `/user/new` and `/invitation/new` |

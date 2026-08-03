@@ -168,16 +168,15 @@ func (t docsFolderTool) createFolder(ctx context.Context, raw json.RawMessage) (
 		createParentToken = root.Token
 		feishuToolsLog.Debug(ctx, "resolved feishu application root account=%s root_id=%s owner_id=%s", t.accountID, root.ID, root.UserID)
 	}
-	if _, err := validateGrantedResourceAccess(ctx, t.resourceAccess, ResourceAccessValidation{
-		RequestID:     args.AccessRequestID,
+	if err := requireResourceAccess(ctx, t.resourceAccess, ResourceAccessRequirement{
 		ResourceType:  "folder",
 		ResourceToken: createParentToken,
 		Permission:    ResourcePermissionWrite,
 	}); err != nil {
-		return "", fmt.Errorf("validate parent folder access: %w", err)
+		return "", fmt.Errorf("require parent folder access: %w", err)
 	}
-	feishuToolsLog.Debug(ctx, "validated feishu folder create access request=%s account=%s chat=%s parent_ref=%s",
-		shortToolRequestID(args.AccessRequestID), t.accountID, chat.ChatID, hashString(createParentToken))
+	feishuToolsLog.Debug(ctx, "validated feishu folder create access account=%s chat=%s parent_ref=%s",
+		t.accountID, chat.ChatID, hashString(createParentToken))
 	shareMemberType, shareMemberID, err := folderShareTarget(actor, chat)
 	if err != nil {
 		return "", err
@@ -192,14 +191,13 @@ func (t docsFolderTool) createFolder(ctx context.Context, raw json.RawMessage) (
 	if err != nil {
 		return "", fmt.Errorf("create feishu folder workflow request: %w", err)
 	}
-	if _, err := consumeGrantedResourceAccess(ctx, t.resourceAccess, ResourceAccessValidation{
-		RequestID:     args.AccessRequestID,
+	if err := requireResourceAccess(ctx, t.resourceAccess, ResourceAccessRequirement{
 		ResourceType:  "folder",
 		ResourceToken: createParentToken,
 		Permission:    ResourcePermissionWrite,
-	}, request.ID); err != nil {
+	}); err != nil {
 		t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStateFailed)
-		return "", fmt.Errorf("consume parent folder access: %w", err)
+		return "", fmt.Errorf("revalidate parent folder access: %w", err)
 	}
 	feishuToolsLog.Info(ctx, "creating feishu application folder request=%s account=%s chat=%s parent_ref=%s name_chars=%d",
 		shortToolRequestID(request.ID), t.accountID, chat.ChatID, hashString(createParentToken), utf8.RuneCountInString(args.Name))

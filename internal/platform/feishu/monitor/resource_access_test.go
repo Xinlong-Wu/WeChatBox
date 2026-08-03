@@ -66,18 +66,17 @@ func TestResourceAccessManagerGrantsBotRootWithoutCard(t *testing.T) {
 	if _, err := st.GetWorkflowContinuation(result.RequestID, "feishu:cli_test"); !errors.Is(err, store.ErrWorkflowContinuationNotFound) {
 		t.Fatalf("Bot-owned request continuation error = %v, want ErrWorkflowContinuationNotFound", err)
 	}
-	validated, err := manager.ValidateAccess(resourceAccessRequestContext(), feishutools.ResourceAccessValidation{
-		RequestID:     result.RequestID,
+	err = manager.RequireResourceAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequirement{
 		ResourceType:  "folder",
 		ResourceToken: "fld_bot_root",
 		Permission:    feishutools.ResourcePermissionWrite,
 	})
-	if err != nil || validated.Status != feishutools.ResourceAccessStatusGranted {
-		t.Fatalf("ValidateAccess = %#v err=%v", validated, err)
+	if err != nil {
+		t.Fatalf("RequireResourceAccess returned error: %v", err)
 	}
 }
 
-func TestResourceAccessManagerValidatesBotOwnedAccessWithoutConsumption(t *testing.T) {
+func TestResourceAccessManagerRequiresBotOwnedAccessWithoutRequestBinding(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/open-apis/auth/v3/tenant_access_token/internal":
@@ -110,28 +109,174 @@ func TestResourceAccessManagerValidatesBotOwnedAccessWithoutConsumption(t *testi
 	if err != nil {
 		t.Fatalf("second RequestAccess returned error: %v", err)
 	}
-	validation := feishutools.ResourceAccessValidation{
-		RequestID:     first.RequestID,
+	requirement := feishutools.ResourceAccessRequirement{
 		ResourceType:  "folder",
 		ResourceToken: "fld_bot_root",
 		Permission:    feishutools.ResourcePermissionWrite,
 	}
-	if _, err := manager.ConsumeAccess(ctx, validation, "req_create_workflow"); err != nil {
-		t.Fatalf("ConsumeAccess returned error: %v", err)
+	if err := manager.RequireResourceAccess(ctx, requirement); err != nil {
+		t.Fatalf("RequireResourceAccess returned error: %v", err)
 	}
 	stored, err := st.GetFeishuResourceAccessRequest(first.RequestID, "feishu:cli_test")
 	if err != nil || stored.ConsumedByRequestID != "" || !stored.ConsumedAt.IsZero() {
 		t.Fatalf("resource request unexpectedly consumed = %#v err=%v", stored, err)
 	}
-	if _, err := manager.ConsumeAccess(ctx, validation, "req_create_workflow_second"); err != nil {
-		t.Fatalf("second ConsumeAccess returned error: %v", err)
-	}
 
 	baseNow := manager.currentTime()
 	manager.now = func() time.Time { return baseNow.Add(defaultResourceAccessTTL) }
-	validation.RequestID = second.RequestID
-	if _, err := manager.ValidateAccess(ctx, validation); err != nil {
+	if err := manager.RequireResourceAccess(ctx, requirement); err != nil {
 		t.Fatalf("Bot-owned access should remain valid independently of request card TTL: %v", err)
+	}
+	if first.RequestID == second.RequestID {
+		t.Fatal("separate authorization workflow IDs unexpectedly matched")
+	}
+}
+
+func TestResourceAccessManagerReturnsStructuredMissingGrantWithoutStartingWorkflow(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("missing local grant unexpectedly called Feishu API: %s", r.URL.Path)
+	}))
+	defer server.Close()
+	manager, _, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	requirement := feishutools.ResourceAccessRequirement{
+		ResourceType: "docx", ResourceToken: "doxcn_external", Permission: feishutools.ResourcePermissionWrite,
+	}
+	err := manager.RequireResourceAccess(resourceAccessRequestContext(), requirement)
+	var required *feishutools.ResourceAuthorizationRequiredError
+	if !errors.As(err, &required) {
+		t.Fatalf("RequireResourceAccess error = %v, want structured authorization required", err)
+	}
+	if required.Status != feishutools.ResourceAuthorizationRequiredStatus || required.RequiredTool != feishutools.ResourceAccessToolName ||
+		required.ResourceType != requirement.ResourceType || required.ResourceToken != requirement.ResourceToken || required.Permission != requirement.Permission {
+		t.Fatalf("structured authorization error = %#v", required)
+	}
+	if cards, updates, _ := sender.snapshot(); len(cards) != 0 || len(updates) != 0 {
+		t.Fatalf("side-effect-free check sent cards=%#v updates=%#v", cards, updates)
+	}
+}
+
+func TestResourceAccessManagerRequiresExactActorChatGrantAndInheritsWriteForRead(t *testing.T) {
+	var authCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+		case "/open-apis/drive/v1/permissions/doxcn_external/members/auth":
+			authCalls++
+			if r.URL.Query().Get("type") != "docx" || r.URL.Query().Get("action") != "view" {
+				t.Fatalf("auth query = %s", r.URL.RawQuery)
+			}
+			writeResourceAccessJSON(t, w, map[string]any{"code": 0, "msg": "Success", "data": map[string]any{"auth_result": true}})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
+	now := manager.currentTime()
+	if _, err := st.UpsertFeishuResourceCapability(store.FeishuResourceCapability{
+		AccountID: "feishu:cli_test", ResourceType: "docx", ResourceToken: "doxcn_external",
+		SubjectType: "openid", SubjectID: "ou_bot", Permission: store.FeishuResourcePermissionWrite,
+		SourceActorOpenID: "ou_requester", SourceRequestID: "req_capability", State: store.FeishuResourceCapabilityStateActive,
+		CreatedAt: now, VerifiedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed resource capability: %v", err)
+	}
+	if _, err := st.UpsertFeishuResourceGrant(store.FeishuResourceGrant{
+		AccountID: "feishu:cli_test", ActorType: store.FeishuResourceGrantActorTypeOpenID, ActorID: "ou_requester",
+		ChatID: "oc_chat", ResourceType: "docx", ResourceToken: "doxcn_external", Permission: store.FeishuResourcePermissionWrite,
+		GrantMode: store.FeishuResourceGrantModeAll, SourceRequestID: "req_grant", State: store.FeishuResourceGrantStateActive,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed resource grant: %v", err)
+	}
+	requirement := feishutools.ResourceAccessRequirement{
+		ResourceType: "docx", ResourceToken: "doxcn_external", Permission: feishutools.ResourcePermissionRead,
+	}
+	if err := manager.RequireResourceAccess(resourceAccessRequestContext(), requirement); err != nil {
+		t.Fatalf("RequireResourceAccess returned error: %v", err)
+	}
+	if authCalls != 1 {
+		t.Fatalf("live verification calls = %d, want 1", authCalls)
+	}
+
+	wrongActor := feishutools.WithActor(context.Background(), feishutools.Actor{OpenID: "ou_other"})
+	wrongActor = feishutools.WithChatContext(wrongActor, feishutools.ChatContext{ChatID: "oc_chat", IsGroup: true})
+	var required *feishutools.ResourceAuthorizationRequiredError
+	if err := manager.RequireResourceAccess(wrongActor, requirement); !errors.As(err, &required) {
+		t.Fatalf("wrong actor error = %v, want authorization required", err)
+	}
+	wrongChat := feishutools.WithActor(context.Background(), feishutools.Actor{OpenID: "ou_requester"})
+	wrongChat = feishutools.WithChatContext(wrongChat, feishutools.ChatContext{ChatID: "oc_other", IsGroup: true})
+	if err := manager.RequireResourceAccess(wrongChat, requirement); !errors.As(err, &required) {
+		t.Fatalf("wrong chat error = %v, want authorization required", err)
+	}
+	writeRequirement := requirement
+	writeRequirement.ResourceToken = "doxcn_read_only"
+	writeRequirement.Permission = feishutools.ResourcePermissionWrite
+	if _, err := st.UpsertFeishuResourceGrant(store.FeishuResourceGrant{
+		AccountID: "feishu:cli_test", ActorType: store.FeishuResourceGrantActorTypeOpenID, ActorID: "ou_requester",
+		ChatID: "oc_chat", ResourceType: "docx", ResourceToken: writeRequirement.ResourceToken, Permission: store.FeishuResourcePermissionRead,
+		GrantMode: store.FeishuResourceGrantModeAll, SourceRequestID: "req_read_only", State: store.FeishuResourceGrantStateActive,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed read-only grant: %v", err)
+	}
+	if err := manager.RequireResourceAccess(resourceAccessRequestContext(), writeRequirement); !errors.As(err, &required) {
+		t.Fatalf("read-only grant write error = %v, want authorization required", err)
+	}
+	if authCalls != 1 {
+		t.Fatalf("scope mismatch unexpectedly reached live verification; calls=%d", authCalls)
+	}
+}
+
+func TestResourceAccessManagerRevokesStaleCapabilityAndGrant(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+		case "/open-apis/drive/v1/permissions/doxcn_stale/members/auth":
+			writeResourceAccessJSON(t, w, map[string]any{"code": 0, "msg": "Success", "data": map[string]any{"auth_result": false}})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
+	now := manager.currentTime()
+	capability := store.FeishuResourceCapability{
+		AccountID: "feishu:cli_test", ResourceType: "docx", ResourceToken: "doxcn_stale",
+		SubjectType: "openid", SubjectID: "ou_bot", Permission: store.FeishuResourcePermissionWrite,
+		SourceActorOpenID: "ou_requester", SourceRequestID: "req_stale", State: store.FeishuResourceCapabilityStateActive,
+		CreatedAt: now, VerifiedAt: now, UpdatedAt: now,
+	}
+	if _, err := st.UpsertFeishuResourceCapability(capability); err != nil {
+		t.Fatalf("seed stale capability: %v", err)
+	}
+	if _, err := st.UpsertFeishuResourceGrant(store.FeishuResourceGrant{
+		AccountID: capability.AccountID, ActorType: store.FeishuResourceGrantActorTypeOpenID, ActorID: "ou_requester",
+		ChatID: "oc_chat", ResourceType: capability.ResourceType, ResourceToken: capability.ResourceToken,
+		Permission: store.FeishuResourcePermissionWrite, GrantMode: store.FeishuResourceGrantModeAll,
+		SourceRequestID: capability.SourceRequestID, State: store.FeishuResourceGrantStateActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed stale grant: %v", err)
+	}
+	requirement := feishutools.ResourceAccessRequirement{
+		ResourceType: capability.ResourceType, ResourceToken: capability.ResourceToken, Permission: feishutools.ResourcePermissionWrite,
+	}
+	var required *feishutools.ResourceAuthorizationRequiredError
+	if err := manager.RequireResourceAccess(resourceAccessRequestContext(), requirement); !errors.As(err, &required) {
+		t.Fatalf("stale capability error = %v, want authorization required", err)
+	}
+	if _, active, err := st.ActiveFeishuResourceCapability(capability.AccountID, capability.ResourceType, capability.ResourceToken, capability.SubjectType, capability.SubjectID, capability.Permission); err != nil || active {
+		t.Fatalf("stale capability active=%t err=%v", active, err)
+	}
+	if _, active, err := st.ActiveFeishuResourceGrant(capability.AccountID, store.FeishuResourceGrantActorTypeOpenID, "ou_requester", "oc_chat", capability.ResourceType, capability.ResourceToken, capability.Permission, now); err != nil || active {
+		t.Fatalf("stale grant active=%t err=%v", active, err)
 	}
 }
 

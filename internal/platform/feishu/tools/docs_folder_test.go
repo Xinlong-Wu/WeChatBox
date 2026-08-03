@@ -109,11 +109,8 @@ func TestDocsFolderCreateUsesApplicationRootAndSharesGroup(t *testing.T) {
 	if rootCalls != 1 || createCalls != 1 || shareCalls != 1 || createBody.Name != "Team Docs" || createBody.FolderToken != "fld_root" {
 		t.Fatalf("root/create/share calls=%d/%d/%d create=%#v", rootCalls, createCalls, shareCalls, createBody)
 	}
-	if access.validation.RequestID != "req_access" || access.validation.ResourceType != "folder" || access.validation.ResourceToken != "fld_root" || access.validation.Permission != ResourcePermissionWrite {
-		t.Fatalf("access validation = %#v", access.validation)
-	}
-	if access.consumption != access.validation || access.consumedBy != output.RequestID {
-		t.Fatalf("access consumption=%#v consumed_by=%q, want workflow %q", access.consumption, access.consumedBy, output.RequestID)
+	if len(access.requirements) != 2 || access.requirement.ResourceType != "folder" || access.requirement.ResourceToken != "fld_root" || access.requirement.Permission != ResourcePermissionWrite {
+		t.Fatalf("access requirements = %#v", access.requirements)
 	}
 	if shareBody.MemberType != "openchat" || shareBody.MemberID != "oc_chat" || shareBody.Perm != "full_access" || shareBody.Type != "chat" {
 		t.Fatalf("share body = %#v", shareBody)
@@ -250,8 +247,8 @@ func TestDocsFolderCreatePrivateUsesBoundParentAndOpenID(t *testing.T) {
 	if createParent != "fld_parent" || shareMemberType != "openid" || shareMemberID != "ou_private" {
 		t.Fatalf("parent/share = %q/%q/%q", createParent, shareMemberType, shareMemberID)
 	}
-	if access.validation.ResourceToken != "fld_parent" || access.actor.OpenID != "ou_private" || access.chat.ChatID != "oc_private" {
-		t.Fatalf("private access validation=%#v actor=%#v chat=%#v", access.validation, access.actor, access.chat)
+	if len(access.requirements) != 2 || access.requirement.ResourceToken != "fld_parent" || access.actor.OpenID != "ou_private" || access.chat.ChatID != "oc_private" {
+		t.Fatalf("private access requirements=%#v actor=%#v chat=%#v", access.requirements, access.actor, access.chat)
 	}
 	defaultFolder, err := st.DefaultFeishuChatFolder(parent.AccountID, parent.ChatID)
 	if err != nil || defaultFolder.FolderToken != "fld_child" {
@@ -304,8 +301,8 @@ func TestDocsFolderCreateRequiresGrantedParentAccessBeforeFeishuAPI(t *testing.T
 	if !missing.IsError || !strings.Contains(missing.Content, "access_request_id is required") {
 		t.Fatalf("missing access result = %#v", missing)
 	}
-	if access.validation.RequestID != "" {
-		t.Fatalf("unexpected access validation = %#v", access.validation)
+	if len(access.requirements) != 0 {
+		t.Fatalf("unexpected access requirements = %#v", access.requirements)
 	}
 }
 
