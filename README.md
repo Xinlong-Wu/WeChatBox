@@ -423,7 +423,8 @@ folder in a group chat, the collaborator is the current `openchat`; a private
 chat cannot directly grant an external folder to the Bot and returns an
 `unsupported` result. LingoBridge does not request `offline_access` and never
 stores a callback URL, authorization code, user access token, or refresh token.
-It updates the original card and notifies the chat. In direct HTTP mode the
+It updates the original card with the terminal result and does not send a
+separate success/failure text message to the chat. In direct HTTP mode the
 browser is additionally redirected to the Feishu resource; in manual mode the
 requester stays in control of returning to the original Feishu chat. No custom
 H5 callback page, clipboard automation, or AppLink return is implemented.
