@@ -76,10 +76,10 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 		return fmt.Errorf("resolve feishu bot identity for account %s: %w", acc.Name, err)
 	}
 	sender := &sdkSender{client: restClient}
-	var approvals *approvalManager
+	var approvals *operationApprovalService
 	var resourceAccess *resourceAccessManager
 	var cards CardService
-	var approver feishutools.ApprovalRequester
+	var operationApprovals feishutools.OperationApprovalService
 	if docsToolsEnabled(p.config.Tools) {
 		cards, err = newCardService(sender)
 		if err != nil {
@@ -100,16 +100,16 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 		}
 	}
 	if docsCreateApprovalRequired(p.config.Tools) {
-		approvals, err = newApprovalManager(ctx, p.store, acc, cards)
+		approvals, err = newOperationApprovalService(ctx, p.store, acc, cards)
 		if err != nil {
 			return fmt.Errorf("initialize feishu tool approvals for account %s: %w", acc.Name, err)
 		}
 		if err := approvals.recoverPersistedApprovals(ctx); err != nil {
 			return fmt.Errorf("recover feishu tool approvals for account %s: %w", acc.Name, err)
 		}
-		approver = approvals
+		operationApprovals = approvals
 	}
-	tools := newFeishuTools(restClient, p.store, acc.ID, p.config.Tools, approver, resourceAccess)
+	tools := newFeishuTools(restClient, p.store, acc.ID, p.config.Tools, operationApprovals, resourceAccess)
 	if approvals != nil {
 		if err := registerApprovalExecutors(approvals, tools); err != nil {
 			return fmt.Errorf("register feishu tool approval executors for account %s: %w", acc.Name, err)
@@ -184,10 +184,10 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 	return runClient(ctx, wsClient, oauthServer)
 }
 
-func newFeishuTools(client *lark.Client, st *store.Store, accountID string, cfg feishutools.Config, approver feishutools.ApprovalRequester, resourceAccess feishutools.ResourceAccessController) []tooltypes.Tool {
+func newFeishuTools(client *lark.Client, st *store.Store, accountID string, cfg feishutools.Config, approvals feishutools.OperationApprovalService, resourceAccess feishutools.ResourceAccessController) []tooltypes.Tool {
 	tools := feishutools.NewChatHistoryTools(client, cfg)
 	tools = append(tools, feishutools.NewDocsResourceAccessTools(resourceAccess, cfg)...)
-	tools = append(tools, feishutools.NewDocsTools(client, st, accountID, cfg, approver, resourceAccess)...)
+	tools = append(tools, feishutools.NewDocsTools(client, st, accountID, cfg, approvals, resourceAccess)...)
 	tools = append(tools, feishutools.NewDocsFolderTools(client, st, accountID, cfg, resourceAccess)...)
 	tools = append(tools, feishutools.NewLiteLLMAccountTools(client, cfg)...)
 	return tools
@@ -203,11 +203,15 @@ func docsCreateApprovalRequired(cfg feishutools.Config) bool {
 	return cfg.Docs.Enabled && cfg.Docs.AllowWrite
 }
 
-func registerApprovalExecutors(approvals *approvalManager, tools []tooltypes.Tool) error {
+func registerApprovalExecutors(approvals *operationApprovalService, tools []tooltypes.Tool) error {
 	registered := 0
 	for _, tool := range tools {
-		executor, ok := tool.(feishutools.ApprovalExecutor)
-		if !ok || strings.TrimSpace(executor.ApprovalToolName()) == "" {
+		executor, ok := tool.(feishutools.OperationApprovalExecutor)
+		if !ok {
+			continue
+		}
+		policy := executor.OperationApprovalPolicy()
+		if strings.TrimSpace(policy.ToolName) == "" || strings.TrimSpace(policy.ActionKey) == "" {
 			continue
 		}
 		if err := approvals.registerExecutor(executor); err != nil {

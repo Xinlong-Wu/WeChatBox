@@ -128,6 +128,16 @@ func TestWorkflowMigrationBackfillsApprovalsAndRenamesGrantSource(t *testing.T) 
 	if err != nil || workflow.Kind != WorkflowRequestKindToolApproval || workflow.State != WorkflowRequestStatePending {
 		t.Fatalf("backfilled workflow = %#v err=%v", workflow, err)
 	}
+	var actionKey, resourceType, resourceToken string
+	var supportsAll int
+	if err := st.db.QueryRow(
+		`SELECT action_key, resource_type, resource_token, supports_all FROM tool_approvals WHERE id='legacy_request'`,
+	).Scan(&actionKey, &resourceType, &resourceToken, &supportsAll); err != nil {
+		t.Fatalf("query migrated operation approval columns: %v", err)
+	}
+	if actionKey != "" || resourceType != "" || resourceToken != "" || supportsAll != 0 {
+		t.Fatalf("legacy operation scope = %q/%q/%q/%d, want fail-closed empty defaults", actionKey, resourceType, resourceToken, supportsAll)
+	}
 	var sourceRequestID string
 	if err := st.db.QueryRow(`SELECT source_request_id FROM tool_approval_grants`).Scan(&sourceRequestID); err != nil {
 		t.Fatalf("query renamed grant source: %v", err)

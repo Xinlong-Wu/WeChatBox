@@ -65,13 +65,16 @@ func (f *fakeApprovalSender) snapshot() (cards []sentText, updates []updatedText
 }
 
 type fakeApprovalExecutor struct {
-	mu      sync.Mutex
-	name    string
-	result  feishutools.ApprovalExecution
-	err     error
-	payload json.RawMessage
-	calls   int
-	done    chan struct{}
+	mu         sync.Mutex
+	name       string
+	actionKey  string
+	action     string
+	disableAll bool
+	result     feishutools.OperationApprovalExecution
+	err        error
+	payload    json.RawMessage
+	calls      int
+	done       chan struct{}
 }
 
 type failingGrantStore struct {
@@ -93,11 +96,24 @@ func (s *recordingToolApprovalStore) CancelWorkflowContinuation(requestID, accou
 	return s.toolApprovalStore.CancelWorkflowContinuation(requestID, accountID, reason, now)
 }
 
-func (f *fakeApprovalExecutor) ApprovalToolName() string {
-	return f.name
+func (f *fakeApprovalExecutor) OperationApprovalPolicy() feishutools.OperationApprovalPolicy {
+	actionKey := f.actionKey
+	if actionKey == "" {
+		actionKey = "create"
+	}
+	action := f.action
+	if action == "" {
+		action = "创建飞书文档"
+	}
+	return feishutools.OperationApprovalPolicy{
+		ToolName:    f.name,
+		ActionKey:   actionKey,
+		Action:      action,
+		SupportsAll: !f.disableAll,
+	}
 }
 
-func (f *fakeApprovalExecutor) ExecuteApproved(_ context.Context, _ string, payload json.RawMessage) (feishutools.ApprovalExecution, error) {
+func (f *fakeApprovalExecutor) ExecuteApproved(_ context.Context, _ string, payload json.RawMessage) (feishutools.OperationApprovalExecution, error) {
 	f.mu.Lock()
 	f.calls++
 	f.payload = append(json.RawMessage(nil), payload...)
@@ -131,9 +147,11 @@ func TestApprovalManagerRequestsBoundCardWithoutDisplayingPayload(t *testing.T) 
 	}
 
 	payload := json.RawMessage(`{"title":"Quarterly plan","content":"private document body"}`)
-	pending, err := manager.RequestApproval(approvalRequestContext(), feishutools.ApprovalRequest{
-		ToolName: "feishu_docs_create",
-		Action:   "创建飞书文档",
+	pending, err := manager.CheckOrRequest(approvalRequestContext(), feishutools.OperationApprovalRequest{
+		ToolName:      "feishu_docs_create",
+		ActionKey:     "create",
+		ResourceType:  "folder",
+		ResourceToken: "fld_token",
 		Fields: []feishutools.ApprovalField{
 			{Label: "文档标题", Value: "Quarterly plan"},
 			{Label: "目标文件夹", Value: "fld_token"},
@@ -141,9 +159,9 @@ func TestApprovalManagerRequestsBoundCardWithoutDisplayingPayload(t *testing.T) 
 		Payload: payload,
 	})
 	if err != nil {
-		t.Fatalf("RequestApproval returned error: %v", err)
+		t.Fatalf("CheckOrRequest returned error: %v", err)
 	}
-	if pending.RequestID == "" || !pending.ExpiresAt.Equal(manager.currentTime().Add(manager.ttl)) {
+	if pending.Status != feishutools.OperationApprovalStatusPending || pending.RequestID == "" || !pending.ExpiresAt.Equal(manager.currentTime().Add(manager.ttl)) {
 		t.Fatalf("pending = %#v, want generated ID and configured expiry", pending)
 	}
 	cards, _, _ := sender.snapshot()
@@ -162,7 +180,7 @@ func TestApprovalManagerRequestsBoundCardWithoutDisplayingPayload(t *testing.T) 
 	if err != nil {
 		t.Fatalf("GetToolApproval returned error: %v", err)
 	}
-	if record.State != store.ToolApprovalStatePending || record.ActorOpenID != "ou_requester" || record.ChatID != "oc_chat" || record.CardMessageID != "om_card" || record.Payload != string(payload) {
+	if record.State != store.ToolApprovalStatePending || record.ActionKey != "create" || record.ResourceType != "folder" || record.ResourceToken != "fld_token" || !record.SupportsAll || record.ActorOpenID != "ou_requester" || record.ChatID != "oc_chat" || record.CardMessageID != "om_card" || record.Payload != string(payload) {
 		t.Fatalf("stored approval = %#v, want actor/chat/card-bound pending record", record)
 	}
 	continuation, err := st.GetWorkflowContinuation(pending.RequestID, "feishu:cli_test")
@@ -190,9 +208,42 @@ func TestApprovalCardActionParsesFormCallbackAndReason(t *testing.T) {
 	}
 }
 
+func TestOperationApprovalPolicyCanDisableReusableGrant(t *testing.T) {
+	st := openFeishuApprovalTestStore(t)
+	sender := &fakeApprovalSender{}
+	manager := newTestApprovalManager(t, st, sender)
+	executor := &fakeApprovalExecutor{name: "feishu_docs_create", disableAll: true}
+	if err := manager.registerExecutor(executor); err != nil {
+		t.Fatalf("registerExecutor returned error: %v", err)
+	}
+	pending := requestTestApproval(t, manager)
+	cards, _, _ := sender.snapshot()
+	if len(cards) != 1 || strings.Contains(cards[0].text, approvalCardActionApproveAll) || strings.Contains(cards[0].text, "全部同意") {
+		t.Fatalf("single-use approval card = %#v", cards)
+	}
+
+	response, err := manager.HandleCardAction(t.Context(), approvalCardEvent(
+		pending.RequestID, approvalCardActionApproveAll, "ou_requester", "oc_chat", "om_card", "",
+	))
+	if err != nil || response == nil || response.Toast == nil || response.Toast.Type != "error" || !strings.Contains(response.Toast.Content, "不支持永久授权") {
+		t.Fatalf("forged approve-all response = %#v err=%v", response, err)
+	}
+	record, err := st.GetToolApproval(pending.RequestID, "feishu:cli_test")
+	if err != nil || record.State != store.ToolApprovalStatePending || record.SupportsAll {
+		t.Fatalf("single-use approval record = %#v err=%v", record, err)
+	}
+	if calls, _ := executor.snapshot(); calls != 0 {
+		t.Fatalf("executor calls = %d, want 0", calls)
+	}
+}
+
 func TestApprovalManagerActiveGrantRequiresExactUserChatAndTool(t *testing.T) {
 	st := openFeishuApprovalTestStore(t)
-	manager := newTestApprovalManager(t, st, &fakeApprovalSender{})
+	sender := &fakeApprovalSender{}
+	manager := newTestApprovalManager(t, st, sender)
+	if err := manager.registerExecutor(&fakeApprovalExecutor{name: "feishu_docs_create"}); err != nil {
+		t.Fatalf("registerExecutor returned error: %v", err)
+	}
 	now := manager.currentTime()
 	if _, err := st.UpsertToolApprovalGrant(store.ToolApprovalGrant{
 		ToolApprovalGrantScope: store.ToolApprovalGrantScope{
@@ -209,26 +260,33 @@ func TestApprovalManagerActiveGrantRequiresExactUserChatAndTool(t *testing.T) {
 		t.Fatalf("UpsertToolApprovalGrant returned error: %v", err)
 	}
 
-	active, err := manager.HasActiveGrant(approvalRequestContext(), "feishu_docs_create")
+	active, err := manager.hasActiveGrant(approvalRequestContext(), "feishu_docs_create")
 	if err != nil || !active {
 		t.Fatalf("exact grant returned active=%v err=%v", active, err)
 	}
+	decision, err := manager.CheckOrRequest(approvalRequestContext(), testOperationApprovalRequest())
+	if err != nil || decision.Status != feishutools.OperationApprovalStatusGranted || decision.RequestID != "" {
+		t.Fatalf("CheckOrRequest decision = %#v err=%v", decision, err)
+	}
+	if cards, _, _ := sender.snapshot(); len(cards) != 0 {
+		t.Fatalf("active operation grant sent cards = %#v", cards)
+	}
 	wrongUser := feishutools.WithActor(context.Background(), feishutools.Actor{OpenID: "ou_other", UserID: "u_requester"})
 	wrongUser = feishutools.WithChatContext(wrongUser, feishutools.ChatContext{ChatID: "oc_chat"})
-	if active, err := manager.HasActiveGrant(wrongUser, "feishu_docs_create"); err != nil || active {
+	if active, err := manager.hasActiveGrant(wrongUser, "feishu_docs_create"); err != nil || active {
 		t.Fatalf("wrong-user grant returned active=%v err=%v", active, err)
 	}
 	wrongChat := feishutools.WithActor(context.Background(), feishutools.Actor{OpenID: "ou_requester"})
 	wrongChat = feishutools.WithChatContext(wrongChat, feishutools.ChatContext{ChatID: "oc_other"})
-	if active, err := manager.HasActiveGrant(wrongChat, "feishu_docs_create"); err != nil || active {
+	if active, err := manager.hasActiveGrant(wrongChat, "feishu_docs_create"); err != nil || active {
 		t.Fatalf("wrong-chat grant returned active=%v err=%v", active, err)
 	}
-	if active, err := manager.HasActiveGrant(approvalRequestContext(), "other_tool"); err != nil || active {
+	if active, err := manager.hasActiveGrant(approvalRequestContext(), "other_tool"); err != nil || active {
 		t.Fatalf("wrong-tool grant returned active=%v err=%v", active, err)
 	}
 
 	manager.now = func() time.Time { return now.Add(24 * time.Hour) }
-	if active, err := manager.HasActiveGrant(approvalRequestContext(), "feishu_docs_create"); err != nil || active {
+	if active, err := manager.hasActiveGrant(approvalRequestContext(), "feishu_docs_create"); err != nil || active {
 		t.Fatalf("expired grant returned active=%v err=%v", active, err)
 	}
 }
@@ -268,7 +326,7 @@ func TestApprovalManagerApprovesExecutesUpdatesCardAndStoresResult(t *testing.T)
 	manager := newTestApprovalManager(t, st, sender)
 	executor := &fakeApprovalExecutor{
 		name:   "feishu_docs_create",
-		result: feishutools.ApprovalExecution{Message: "✅ 文档已创建：[Quarterly plan](https://docs.feishu.cn/docx/doc123)"},
+		result: feishutools.OperationApprovalExecution{Message: "✅ 文档已创建：[Quarterly plan](https://docs.feishu.cn/docx/doc123)"},
 		done:   make(chan struct{}),
 	}
 	if err := manager.registerExecutor(executor); err != nil {
@@ -324,7 +382,7 @@ func TestApprovalManagerApprovesExecutesUpdatesCardAndStoresResult(t *testing.T)
 	if calls, _ := executor.snapshot(); calls != 1 {
 		t.Fatalf("executor calls after duplicate click = %d, want 1", calls)
 	}
-	if active, err := manager.HasActiveGrant(approvalRequestContext(), "feishu_docs_create"); err != nil || active {
+	if active, err := manager.hasActiveGrant(approvalRequestContext(), "feishu_docs_create"); err != nil || active {
 		t.Fatalf("approve-once grant returned active=%v err=%v", active, err)
 	}
 }
@@ -413,7 +471,7 @@ func TestApprovalManagerApproveAllCreates24HourScopedGrant(t *testing.T) {
 	manager := newTestApprovalManager(t, st, sender)
 	executor := &fakeApprovalExecutor{
 		name:   "feishu_docs_create",
-		result: feishutools.ApprovalExecution{Message: "✅ 文档已创建"},
+		result: feishutools.OperationApprovalExecution{Message: "✅ 文档已创建"},
 		done:   make(chan struct{}),
 	}
 	if err := manager.registerExecutor(executor); err != nil {
@@ -454,12 +512,12 @@ func TestApprovalManagerApproveAllCreates24HourScopedGrant(t *testing.T) {
 	if !active || grant.SourceRequestID != pending.RequestID || !grant.CreatedAt.Equal(clickedAt) || !grant.ExpiresAt.Equal(clickedAt.Add(24*time.Hour)) {
 		t.Fatalf("grant = %#v active=%v, want 24 hours from click", grant, active)
 	}
-	if active, err := manager.HasActiveGrant(approvalRequestContext(), "feishu_docs_create"); err != nil || !active {
+	if active, err := manager.hasActiveGrant(approvalRequestContext(), "feishu_docs_create"); err != nil || !active {
 		t.Fatalf("same scope returned active=%v err=%v", active, err)
 	}
 	otherChat := feishutools.WithActor(context.Background(), feishutools.Actor{OpenID: "ou_requester", UserID: "u_requester"})
 	otherChat = feishutools.WithChatContext(otherChat, feishutools.ChatContext{ChatID: "oc_other"})
-	if active, err := manager.HasActiveGrant(otherChat, "feishu_docs_create"); err != nil || active {
+	if active, err := manager.hasActiveGrant(otherChat, "feishu_docs_create"); err != nil || active {
 		t.Fatalf("other chat returned active=%v err=%v", active, err)
 	}
 }
@@ -470,7 +528,7 @@ func TestApprovalManagerApproveAllFallsBackToCurrentRequestWhenGrantSaveFails(t 
 	manager := newTestApprovalManager(t, st, sender)
 	executor := &fakeApprovalExecutor{
 		name:   "feishu_docs_create",
-		result: feishutools.ApprovalExecution{Message: "✅ 文档已创建"},
+		result: feishutools.OperationApprovalExecution{Message: "✅ 文档已创建"},
 		done:   make(chan struct{}),
 	}
 	if err := manager.registerExecutor(executor); err != nil {
@@ -499,7 +557,7 @@ func TestApprovalManagerApproveAllFallsBackToCurrentRequestWhenGrantSaveFails(t 
 		t.Fatal("executor was not called after grant save failure")
 	}
 	waitForApprovalState(t, st, pending.RequestID, store.ToolApprovalStateSucceeded)
-	if active, err := manager.HasActiveGrant(approvalRequestContext(), "feishu_docs_create"); err != nil || active {
+	if active, err := manager.hasActiveGrant(approvalRequestContext(), "feishu_docs_create"); err != nil || active {
 		t.Fatalf("failed grant returned active=%v err=%v", active, err)
 	}
 }
@@ -552,13 +610,15 @@ func TestApprovalManagerFailsRequestWhenCardCannotBeSent(t *testing.T) {
 		t.Fatalf("registerExecutor returned error: %v", err)
 	}
 
-	_, err := manager.RequestApproval(approvalRequestContext(), feishutools.ApprovalRequest{
-		ToolName: "feishu_docs_create",
-		Action:   "创建飞书文档",
-		Payload:  json.RawMessage(`{"title":"Quarterly plan"}`),
+	_, err := manager.CheckOrRequest(approvalRequestContext(), feishutools.OperationApprovalRequest{
+		ToolName:      "feishu_docs_create",
+		ActionKey:     "create",
+		ResourceType:  "folder",
+		ResourceToken: "fld_token",
+		Payload:       json.RawMessage(`{"title":"Quarterly plan"}`),
 	})
 	if err == nil || !strings.Contains(err.Error(), "send feishu tool approval card") {
-		t.Fatalf("RequestApproval error = %v, want card send error", err)
+		t.Fatalf("CheckOrRequest error = %v, want card send error", err)
 	}
 	if len(recordingStore.canceled) != 1 || recordingStore.canceled[0] == "" {
 		t.Fatalf("canceled continuations = %#v, want one request", recordingStore.canceled)
@@ -599,19 +659,19 @@ func openFeishuApprovalTestStore(t *testing.T) *store.Store {
 	return st
 }
 
-func newTestApprovalManager(t *testing.T, st *store.Store, sender *fakeApprovalSender) *approvalManager {
+func newTestApprovalManager(t *testing.T, st *store.Store, sender *fakeApprovalSender) *operationApprovalService {
 	t.Helper()
 	cards, err := newCardService(sender)
 	if err != nil {
 		t.Fatalf("newCardService returned error: %v", err)
 	}
-	manager, err := newApprovalManager(context.Background(), st, store.Account{
+	manager, err := newOperationApprovalService(context.Background(), st, store.Account{
 		ID:       "feishu:cli_test",
 		Name:     "fsbot",
 		Platform: store.PlatformFeishu,
 	}, cards)
 	if err != nil {
-		t.Fatalf("newApprovalManager returned error: %v", err)
+		t.Fatalf("newOperationApprovalService returned error: %v", err)
 	}
 	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
 	manager.now = func() time.Time { return now }
@@ -644,18 +704,27 @@ func workflowRequestContext(toolName string) context.Context {
 	})
 }
 
-func requestTestApproval(t *testing.T, manager *approvalManager) feishutools.PendingApproval {
+func requestTestApproval(t *testing.T, manager *operationApprovalService) feishutools.OperationApprovalResult {
 	t.Helper()
-	pending, err := manager.RequestApproval(approvalRequestContext(), feishutools.ApprovalRequest{
-		ToolName: "feishu_docs_create",
-		Action:   "创建飞书文档",
-		Fields:   []feishutools.ApprovalField{{Label: "文档标题", Value: "Quarterly plan"}},
-		Payload:  json.RawMessage(`{"title":"Quarterly plan"}`),
-	})
+	pending, err := manager.CheckOrRequest(approvalRequestContext(), testOperationApprovalRequest())
 	if err != nil {
-		t.Fatalf("RequestApproval returned error: %v", err)
+		t.Fatalf("CheckOrRequest returned error: %v", err)
+	}
+	if pending.Status != feishutools.OperationApprovalStatusPending {
+		t.Fatalf("CheckOrRequest result = %#v, want pending", pending)
 	}
 	return pending
+}
+
+func testOperationApprovalRequest() feishutools.OperationApprovalRequest {
+	return feishutools.OperationApprovalRequest{
+		ToolName:      "feishu_docs_create",
+		ActionKey:     "create",
+		ResourceType:  "folder",
+		ResourceToken: "fld_token",
+		Fields:        []feishutools.ApprovalField{{Label: "文档标题", Value: "Quarterly plan"}},
+		Payload:       json.RawMessage(`{"title":"Quarterly plan"}`),
+	}
 }
 
 func approvalCardEvent(requestID, action, openID, chatID, messageID, reason string) *callback.CardActionTriggerEvent {

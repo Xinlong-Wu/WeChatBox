@@ -17,24 +17,16 @@ import (
 )
 
 type fakeApprovalRequester struct {
-	request     ApprovalRequest
-	pending     PendingApproval
-	err         error
-	active      bool
-	activeErr   error
-	checkedTool string
-	checks      int
+	request OperationApprovalRequest
+	result  OperationApprovalResult
+	err     error
+	checks  int
 }
 
-func (f *fakeApprovalRequester) HasActiveGrant(_ context.Context, toolName string) (bool, error) {
-	f.checkedTool = toolName
-	f.checks++
-	return f.active, f.activeErr
-}
-
-func (f *fakeApprovalRequester) RequestApproval(_ context.Context, request ApprovalRequest) (PendingApproval, error) {
+func (f *fakeApprovalRequester) CheckOrRequest(_ context.Context, request OperationApprovalRequest) (OperationApprovalResult, error) {
 	f.request = request
-	return f.pending, f.err
+	f.checks++
+	return f.result, f.err
 }
 
 func TestDocsToolConfigDefaultsAndRegistration(t *testing.T) {
@@ -242,7 +234,7 @@ func TestDocsReadRepairsBotOwnedDocumentBindingInCurrentChat(t *testing.T) {
 
 func TestDocsCreateToolReturnsPendingApprovalWithoutCallingFeishuDocs(t *testing.T) {
 	expiresAt := time.Date(2026, time.August, 1, 12, 10, 0, 0, time.UTC)
-	approver := &fakeApprovalRequester{pending: PendingApproval{RequestID: "req_123", ExpiresAt: expiresAt}}
+	approver := &fakeApprovalRequester{result: OperationApprovalResult{Status: OperationApprovalStatusPending, RequestID: "req_123", ExpiresAt: expiresAt}}
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
 	_, tools, _ := newDocsToolsForTest(t, &lark.Client{}, cfg, approver)
 	tool := findDocsTool(t, tools, createToolName)
@@ -264,10 +256,10 @@ func TestDocsCreateToolReturnsPendingApprovalWithoutCallingFeishuDocs(t *testing
 	if output.Status != "pending_approval" || output.RequestID != "req_123" || output.ExpiresAt != expiresAt.Format(time.RFC3339) || !strings.Contains(output.Message, "24 小时") || !strings.Contains(output.Message, "请勿重复调用") {
 		t.Fatalf("pending output = %#v", output)
 	}
-	if approver.checks != 1 || approver.checkedTool != createToolName {
-		t.Fatalf("approval grant checks = %d tool=%q, want one create check", approver.checks, approver.checkedTool)
+	if approver.checks != 1 {
+		t.Fatalf("operation approval checks = %d, want one", approver.checks)
 	}
-	if approver.request.ToolName != createToolName || approver.request.Action != "创建飞书文档" {
+	if approver.request.ToolName != createToolName || approver.request.ActionKey != "create" || approver.request.ResourceType != "folder" || approver.request.ResourceToken != "fld_token" {
 		t.Fatalf("approval request = %#v", approver.request)
 	}
 	var approvedArgs approvedCreatePayload
@@ -313,7 +305,7 @@ func TestDocsCreateToolUsesActiveGrantWithoutSendingCard(t *testing.T) {
 		lark.WithOAuthBaseUrl(server.URL),
 		lark.WithHttpClient(server.Client()),
 	)
-	approver := &fakeApprovalRequester{active: true}
+	approver := &fakeApprovalRequester{result: OperationApprovalResult{Status: OperationApprovalStatusGranted}}
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
 	st, tools, access := newDocsToolsForTest(t, client, cfg, approver)
 	tool := findDocsTool(t, tools, createToolName)
@@ -335,8 +327,8 @@ func TestDocsCreateToolUsesActiveGrantWithoutSendingCard(t *testing.T) {
 	if len(access.requirements) != 2 || access.requirement.ResourceToken != "fld_token" || access.requirement.Permission != ResourcePermissionWrite {
 		t.Fatalf("access requirements=%#v", access.requirements)
 	}
-	if approver.request.ToolName != "" {
-		t.Fatalf("approval request = %#v, want no card for active grant", approver.request)
+	if approver.checks != 1 || approver.request.ToolName != createToolName || approver.request.ActionKey != "create" {
+		t.Fatalf("operation approval request = %#v checks=%d", approver.request, approver.checks)
 	}
 	if _, err := st.GetFeishuChatDocument("feishu:cli_test", "oc_chat", output.DocumentID); err != nil {
 		t.Fatalf("created document was not bound to chat: %v", err)
@@ -377,7 +369,7 @@ func TestDocsCreateToolActiveGrantReportsPartialSuccessWithoutRetrySignal(t *tes
 		lark.WithHttpClient(server.Client()),
 	)
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
-	st, tools, _ := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{active: true})
+	st, tools, _ := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{result: OperationApprovalResult{Status: OperationApprovalStatusGranted}})
 	tool := findDocsTool(t, tools, createToolName)
 	result := tool.Execute(groupDocsContext(), tooltypes.Call{
 		ID:        "call_1",
@@ -400,7 +392,7 @@ func TestDocsCreateToolActiveGrantReportsPartialSuccessWithoutRetrySignal(t *tes
 }
 
 func TestDocsCreateToolRejectsTitleLongerThanFeishuLimit(t *testing.T) {
-	approver := &fakeApprovalRequester{}
+	approver := &fakeApprovalRequester{result: OperationApprovalResult{Status: OperationApprovalStatusPending, RequestID: "req_pending", ExpiresAt: time.Now().UTC().Add(10 * time.Minute)}}
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
 	_, tools, _ := newDocsToolsForTest(t, &lark.Client{}, cfg, approver)
 	tool := findDocsTool(t, tools, createToolName)
@@ -463,9 +455,9 @@ func TestDocsCreateApprovedExecutionCreatesDocument(t *testing.T) {
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
 	_, tools, access := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
 	tool := findDocsTool(t, tools, createToolName)
-	executor, ok := tool.(ApprovalExecutor)
+	executor, ok := tool.(OperationApprovalExecutor)
 	if !ok {
-		t.Fatalf("create tool %T does not implement ApprovalExecutor", tool)
+		t.Fatalf("create tool %T does not implement OperationApprovalExecutor", tool)
 	}
 	result, err := executor.ExecuteApproved(context.Background(), "req_approved", json.RawMessage(`{"title":"Quarterly plan","folder_token":"fld_token","chat_id":"oc_chat","actor_open_id":"ou_requester"}`))
 	if err != nil {
@@ -514,7 +506,7 @@ func TestDocsCreateApprovedExecutionReportsPartialSuccessWithoutRetryingCreate(t
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
 	_, tools, _ := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
 	tool := findDocsTool(t, tools, createToolName)
-	executor := tool.(ApprovalExecutor)
+	executor := tool.(OperationApprovalExecutor)
 	result, err := executor.ExecuteApproved(context.Background(), "req_approved", json.RawMessage(`{"title":"Quarterly plan","content":"body","folder_token":"fld_token","chat_id":"oc_chat","actor_open_id":"ou_requester"}`))
 	if err != nil {
 		t.Fatalf("ExecuteApproved returned error after document creation: %v", err)
@@ -528,7 +520,7 @@ func TestDocsCreateApprovedExecutionStopsWhenAccessWasRevoked(t *testing.T) {
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
 	_, tools, access := newDocsToolsForTest(t, &lark.Client{}, cfg, &fakeApprovalRequester{})
 	access.err = errors.New("permission revoked")
-	executor := findDocsTool(t, tools, createToolName).(ApprovalExecutor)
+	executor := findDocsTool(t, tools, createToolName).(OperationApprovalExecutor)
 
 	_, err := executor.ExecuteApproved(context.Background(), "req_approved", json.RawMessage(`{"title":"Quarterly plan","folder_token":"fld_token","chat_id":"oc_chat","actor_open_id":"ou_requester"}`))
 	if err == nil || !strings.Contains(err.Error(), "revalidate approved document target access") || !strings.Contains(err.Error(), "permission revoked") {
@@ -575,7 +567,9 @@ func TestTruncateRunes(t *testing.T) {
 }
 
 func TestDocsCreateRequiresAndRevalidatesFolderAccess(t *testing.T) {
-	approver := &fakeApprovalRequester{}
+	approver := &fakeApprovalRequester{result: OperationApprovalResult{
+		Status: OperationApprovalStatusPending, RequestID: "req_pending", ExpiresAt: time.Now().UTC().Add(10 * time.Minute),
+	}}
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
 	st := openDocsFolderTestStore(t)
 	if _, err := st.SaveFeishuChatFolder(store.FeishuChatFolder{
@@ -628,7 +622,7 @@ func findDocsTool(t *testing.T, tools []tooltypes.Tool, name string) tooltypes.T
 	return nil
 }
 
-func newDocsToolsForTest(t *testing.T, client *lark.Client, cfg Config, approver ApprovalRequester) (*store.Store, []tooltypes.Tool, *fakeResourceAccessController) {
+func newDocsToolsForTest(t *testing.T, client *lark.Client, cfg Config, approver OperationApprovalService) (*store.Store, []tooltypes.Tool, *fakeResourceAccessController) {
 	t.Helper()
 	st := openDocsFolderTestStore(t)
 	if _, err := st.SaveFeishuChatFolder(store.FeishuChatFolder{

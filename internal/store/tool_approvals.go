@@ -40,6 +40,10 @@ type ToolApproval struct {
 	ID              string
 	AccountID       string
 	ToolName        string
+	ActionKey       string
+	ResourceType    string
+	ResourceToken   string
+	SupportsAll     bool
 	ActorOpenID     string
 	ActorUserID     string
 	ChatID          string
@@ -93,13 +97,18 @@ func (s *Store) CreateToolApproval(approval ToolApproval) (ToolApproval, error) 
 	}
 	_, err = tx.Exec(
 		`INSERT INTO tool_approvals (
-			id, account_id, tool_name, actor_open_id, actor_user_id, chat_id,
+			id, account_id, tool_name, action_key, resource_type, resource_token,
+			supports_all, actor_open_id, actor_user_id, chat_id,
 			source_message_id, card_message_id, payload, state,
 			created_at_ms, expires_at_ms, updated_at_ms
-		) VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)`,
 		approval.ID,
 		approval.AccountID,
 		approval.ToolName,
+		approval.ActionKey,
+		approval.ResourceType,
+		approval.ResourceToken,
+		boolToInt(approval.SupportsAll),
 		approval.ActorOpenID,
 		approval.ActorUserID,
 		approval.ChatID,
@@ -439,7 +448,8 @@ func toolApprovalByID(queryer interface {
 	QueryRow(query string, args ...any) *sql.Row
 }, id, accountID string) (ToolApproval, error) {
 	return scanToolApproval(queryer.QueryRow(
-		`SELECT id, account_id, tool_name, actor_open_id, actor_user_id, chat_id,
+		`SELECT id, account_id, tool_name, action_key, resource_type, resource_token,
+		 supports_all, actor_open_id, actor_user_id, chat_id,
 		 source_message_id, card_message_id, payload, state,
 		 created_at_ms, expires_at_ms, updated_at_ms
 		 FROM tool_approvals WHERE id=? AND account_id=?`,
@@ -449,11 +459,16 @@ func toolApprovalByID(queryer interface {
 
 func scanToolApproval(row toolApprovalScanner) (ToolApproval, error) {
 	var approval ToolApproval
+	var supportsAll int
 	var createdAtMS, expiresAtMS, updatedAtMS int64
 	err := row.Scan(
 		&approval.ID,
 		&approval.AccountID,
 		&approval.ToolName,
+		&approval.ActionKey,
+		&approval.ResourceType,
+		&approval.ResourceToken,
+		&supportsAll,
 		&approval.ActorOpenID,
 		&approval.ActorUserID,
 		&approval.ChatID,
@@ -474,6 +489,7 @@ func scanToolApproval(row toolApprovalScanner) (ToolApproval, error) {
 	approval.CreatedAt = time.UnixMilli(createdAtMS).UTC()
 	approval.ExpiresAt = time.UnixMilli(expiresAtMS).UTC()
 	approval.UpdatedAt = time.UnixMilli(updatedAtMS).UTC()
+	approval.SupportsAll = supportsAll != 0
 	return approval, nil
 }
 
@@ -481,6 +497,9 @@ func normalizeToolApproval(approval ToolApproval) ToolApproval {
 	approval.ID = strings.TrimSpace(approval.ID)
 	approval.AccountID = strings.TrimSpace(approval.AccountID)
 	approval.ToolName = strings.TrimSpace(approval.ToolName)
+	approval.ActionKey = strings.TrimSpace(approval.ActionKey)
+	approval.ResourceType = strings.ToLower(strings.TrimSpace(approval.ResourceType))
+	approval.ResourceToken = strings.TrimSpace(approval.ResourceToken)
 	approval.ActorOpenID = strings.TrimSpace(approval.ActorOpenID)
 	approval.ActorUserID = strings.TrimSpace(approval.ActorUserID)
 	approval.ChatID = strings.TrimSpace(approval.ChatID)
@@ -500,8 +519,9 @@ func normalizeToolApprovalMatch(match ToolApprovalMatch) ToolApprovalMatch {
 }
 
 func validateNewToolApproval(approval ToolApproval) error {
-	if approval.ID == "" || approval.AccountID == "" || approval.ToolName == "" || approval.ChatID == "" || approval.Payload == "" {
-		return fmt.Errorf("tool approval id, account_id, tool_name, chat_id, and payload are required")
+	if approval.ID == "" || approval.AccountID == "" || approval.ToolName == "" || approval.ActionKey == "" ||
+		approval.ResourceType == "" || approval.ResourceToken == "" || approval.ChatID == "" || approval.Payload == "" {
+		return fmt.Errorf("tool approval id, account_id, tool_name, action_key, resource, chat_id, and payload are required")
 	}
 	if approval.ActorOpenID == "" && approval.ActorUserID == "" {
 		return fmt.Errorf("tool approval actor identity is required")

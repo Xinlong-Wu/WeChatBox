@@ -473,12 +473,25 @@ create-in-Bot-folder, copy-to-target, then delete-temporary-resource flow.
 Successful folder and document creation is immediately recorded as Bot-owned
 resource metadata.
 
-`feishu_docs_create` is also protected by a durable operation-approval
-workflow. A call first checks `folder/write` from trusted runtime context.
-Without an active operation grant it then stores the exact request, sends the
-built-in raw Feishu Card V2 form to the current chat, and immediately returns
-`pending_approval` to the model. The form offers **同意一次**, **全部同意**, and
-**拒绝**, plus an optional suggestion field. Callback values carry
+Approval-gated tools use one shared operation-approval service. Each tool owns
+its immutable tool/action policy, user-visible fields, exact resource scope,
+persisted payload, whether reusable approval is supported, and the executor
+that revalidates and performs the operation. The shared service exposes one
+`CheckOrRequest` path and owns trusted actor/chat validation, reusable-grant
+lookup, global request IDs, SQLite state transitions, card transport and
+routing, continuation, terminal results, and restart reconciliation. Approval
+rows persist `action_key`, `resource_type`, `resource_token`, and
+`supports_all`; older rows receive empty fail-closed scope fields rather than a
+compatibility authorization.
+
+`feishu_docs_create` declares the `create` action on its exact parent folder. A
+call first checks `folder/write` from trusted runtime context, then invokes the
+shared operation service. Without an active operation grant the service stores
+the exact request, sends the built-in raw Feishu Card V2 form to the current
+chat, and immediately returns `pending_approval` to the model. The form offers
+**同意一次**, **全部同意**, and **拒绝**, plus an optional suggestion field.
+Tools that disable reusable authorization do not receive an **全部同意** button,
+and a forged approve-all callback is rejected. Callback values carry
 LingoBridge's approval kind, approval ID, and action; the suggestion text is not
 persisted or written to logs (only whether it was present and its character
 count may be logged). No card ID or `template_id` configuration is required.

@@ -88,13 +88,17 @@ func TestDeleteAccountClearsPendingToolApprovalsAndDocsBindings(t *testing.T) {
 	account := store.Account{ID: "feishu:cli_xxx", Name: "fsbot", Platform: store.PlatformFeishu}
 	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
 	approval, err := st.CreateToolApproval(store.ToolApproval{
-		AccountID:   account.ID,
-		ToolName:    "feishu_docs_create",
-		ActorOpenID: "ou_requester",
-		ChatID:      "oc_chat",
-		Payload:     `{}`,
-		CreatedAt:   now,
-		ExpiresAt:   now.Add(10 * time.Minute),
+		AccountID:     account.ID,
+		ToolName:      "feishu_docs_create",
+		ActionKey:     "create",
+		ResourceType:  "folder",
+		ResourceToken: "fld_token",
+		SupportsAll:   true,
+		ActorOpenID:   "ou_requester",
+		ChatID:        "oc_chat",
+		Payload:       `{}`,
+		CreatedAt:     now,
+		ExpiresAt:     now.Add(10 * time.Minute),
 	})
 	if err != nil {
 		t.Fatalf("CreateToolApproval returned error: %v", err)

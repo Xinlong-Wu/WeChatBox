@@ -76,6 +76,10 @@ func (s *Store) migrate() error {
 			id TEXT PRIMARY KEY,
 			account_id TEXT NOT NULL,
 			tool_name TEXT NOT NULL,
+			action_key TEXT NOT NULL,
+			resource_type TEXT NOT NULL,
+			resource_token TEXT NOT NULL,
+			supports_all INTEGER NOT NULL DEFAULT 0,
 			actor_open_id TEXT NOT NULL DEFAULT '',
 			actor_user_id TEXT NOT NULL DEFAULT '',
 			chat_id TEXT NOT NULL,
@@ -229,6 +233,9 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if err := s.renameToolApprovalGrantRequestIDColumn(); err != nil {
+		return err
+	}
+	if err := s.ensureToolApprovalOperationColumns(); err != nil {
 		return err
 	}
 	if err := s.removeFeishuResourceAccessConsumptionColumns(); err != nil {
@@ -573,6 +580,31 @@ func (s *Store) ensureWorkflowContinuationContextColumns() error {
 	}
 	if _, err := s.db.Exec(`ALTER TABLE workflow_continuations ADD COLUMN chat_is_group INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return fmt.Errorf("add workflow continuation chat type column: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ensureToolApprovalOperationColumns() error {
+	columns := []struct {
+		name       string
+		definition string
+	}{
+		{name: "action_key", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "resource_type", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "resource_token", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "supports_all", definition: "INTEGER NOT NULL DEFAULT 0"},
+	}
+	for _, column := range columns {
+		hasColumn, err := s.tableHasColumn("tool_approvals", column.name)
+		if err != nil {
+			return fmt.Errorf("inspect tool approval %s column: %w", column.name, err)
+		}
+		if hasColumn {
+			continue
+		}
+		if _, err := s.db.Exec(`ALTER TABLE tool_approvals ADD COLUMN ` + column.name + ` ` + column.definition); err != nil {
+			return fmt.Errorf("add tool approval %s column: %w", column.name, err)
+		}
 	}
 	return nil
 }

@@ -23,7 +23,8 @@ const (
 )
 
 type pendingApprovalCard struct {
-	request  feishutools.ApprovalRequest
+	policy   feishutools.OperationApprovalPolicy
+	request  feishutools.OperationApprovalRequest
 	approval store.ToolApproval
 }
 
@@ -31,18 +32,17 @@ func (c pendingApprovalCard) JSON() (string, error) {
 	lines := []string{
 		"机器人请求执行以下操作：",
 		"",
-		"**操作**：" + escapeApprovalMarkdown(c.request.Action),
+		"**操作**：" + escapeApprovalMarkdown(c.policy.Action),
 		"**工具**：" + escapeApprovalMarkdown(c.request.ToolName),
 	}
 	for _, field := range c.request.Fields {
 		lines = append(lines, "**"+escapeApprovalMarkdown(field.Label)+"**："+escapeApprovalMarkdown(field.Value))
 	}
-	lines = append(lines,
-		"",
-		"- **同意一次**：仅执行当前请求。",
-		"- **全部同意**：从点击起 24 小时内，同一飞书用户、机器人账号、当前对话和该工具的后续请求免审批。",
-		fmt.Sprintf("本卡片将于 %s 过期。", c.approval.ExpiresAt.UTC().Format("2006-01-02 15:04 UTC")),
-	)
+	lines = append(lines, "", "- **同意一次**：仅执行当前请求。")
+	if c.policy.SupportsAll {
+		lines = append(lines, "- **全部同意**：从点击起 24 小时内，同一飞书用户、机器人账号、当前对话和该工具的后续请求免审批。")
+	}
+	lines = append(lines, fmt.Sprintf("本卡片将于 %s 过期。", c.approval.ExpiresAt.UTC().Format("2006-01-02 15:04 UTC")))
 	value := func(action string) map[string]interface{} {
 		return map[string]interface{}{
 			"kind":       approvalCardActionKind,
@@ -50,12 +50,27 @@ func (c pendingApprovalCard) JSON() (string, error) {
 			"action":     action,
 		}
 	}
+	formElements := []interface{}{
+		map[string]interface{}{
+			"tag":        "markdown",
+			"content":    strings.Join(lines, "\n"),
+			"text_align": "left",
+			"text_size":  "normal",
+			"margin":     "0px 0px 0px 0px",
+			"element_id": "SnLSJiYBwzi2qzhJsFPP",
+		},
+		approvalFormButton("同意一次", "primary_filled", "Button_ruivkstdali", value(approvalCardActionApproveOnce)),
+	}
+	if c.policy.SupportsAll {
+		formElements = append(formElements, approvalFormButton("全部同意", "primary", "Button_zrwjazvut3f", value(approvalCardActionApproveAll)))
+	}
+	formElements = append(formElements, approvalReasonRow(value(approvalCardActionReject)))
 	card := map[string]interface{}{
 		"schema": "2.0",
 		"config": map[string]interface{}{"update_multi": true},
 		"header": map[string]interface{}{
 			"title":    map[string]interface{}{"tag": "plain_text", "content": "权限申请审批"},
-			"subtitle": map[string]interface{}{"tag": "plain_text", "content": c.request.Action},
+			"subtitle": map[string]interface{}{"tag": "plain_text", "content": c.policy.Action},
 			"text_tag_list": []interface{}{
 				map[string]interface{}{
 					"tag":   "text_tag",
@@ -74,20 +89,8 @@ func (c pendingApprovalCard) JSON() (string, error) {
 			"vertical_align":     "top",
 			"elements": []interface{}{
 				map[string]interface{}{
-					"tag": "form",
-					"elements": []interface{}{
-						map[string]interface{}{
-							"tag":        "markdown",
-							"content":    strings.Join(lines, "\n"),
-							"text_align": "left",
-							"text_size":  "normal",
-							"margin":     "0px 0px 0px 0px",
-							"element_id": "SnLSJiYBwzi2qzhJsFPP",
-						},
-						approvalFormButton("同意一次", "primary_filled", "Button_ruivkstdali", value(approvalCardActionApproveOnce)),
-						approvalFormButton("全部同意", "primary", "Button_zrwjazvut3f", value(approvalCardActionApproveAll)),
-						approvalReasonRow(value(approvalCardActionReject)),
-					},
+					"tag":              "form",
+					"elements":         formElements,
 					"direction":        "vertical",
 					"horizontal_align": "left",
 					"vertical_align":   "top",

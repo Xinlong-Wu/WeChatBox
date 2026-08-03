@@ -13,6 +13,10 @@ func TestToolApprovalApproveAndCompleteIsSingleUse(t *testing.T) {
 	created, err := st.CreateToolApproval(ToolApproval{
 		AccountID:       "feishu:cli_test",
 		ToolName:        "feishu_docs_create",
+		ActionKey:       "create",
+		ResourceType:    "folder",
+		ResourceToken:   "fld_token",
+		SupportsAll:     true,
 		ActorOpenID:     "ou_requester",
 		ActorUserID:     "u_requester",
 		ChatID:          "oc_chat",
@@ -24,7 +28,8 @@ func TestToolApprovalApproveAndCompleteIsSingleUse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateToolApproval returned error: %v", err)
 	}
-	if !strings.HasPrefix(created.ID, "req_") || created.State != ToolApprovalStatePending {
+	if !strings.HasPrefix(created.ID, "req_") || created.State != ToolApprovalStatePending || created.ActionKey != "create" ||
+		created.ResourceType != "folder" || created.ResourceToken != "fld_token" || !created.SupportsAll {
 		t.Fatalf("created approval = %#v, want generated pending approval", created)
 	}
 	workflow, err := st.GetWorkflowRequest(created.ID, created.AccountID)
@@ -142,13 +147,16 @@ func TestToolApprovalDenyAndExpiryClearPayload(t *testing.T) {
 	}
 
 	expiring, err := st.CreateToolApproval(ToolApproval{
-		AccountID:   "feishu:cli_test",
-		ToolName:    "feishu_docs_create",
-		ActorOpenID: "ou_requester",
-		ChatID:      "oc_chat",
-		Payload:     `{"title":"Expired"}`,
-		CreatedAt:   now,
-		ExpiresAt:   now.Add(time.Minute),
+		AccountID:     "feishu:cli_test",
+		ToolName:      "feishu_docs_create",
+		ActionKey:     "create",
+		ResourceType:  "folder",
+		ResourceToken: "fld_token",
+		ActorOpenID:   "ou_requester",
+		ChatID:        "oc_chat",
+		Payload:       `{"title":"Expired"}`,
+		CreatedAt:     now,
+		ExpiresAt:     now.Add(time.Minute),
 	})
 	if err != nil {
 		t.Fatalf("CreateToolApproval expiring returned error: %v", err)
@@ -177,25 +185,31 @@ func TestDeleteToolApprovalsRemovesOnlyMatchingAccount(t *testing.T) {
 	st := openTestStore(t)
 	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
 	first, err := st.CreateToolApproval(ToolApproval{
-		AccountID:   "feishu:first",
-		ToolName:    "tool",
-		ActorOpenID: "ou_first",
-		ChatID:      "oc_first",
-		Payload:     `{}`,
-		CreatedAt:   now,
-		ExpiresAt:   now.Add(time.Minute),
+		AccountID:     "feishu:first",
+		ToolName:      "tool",
+		ActionKey:     "execute",
+		ResourceType:  "resource",
+		ResourceToken: "first",
+		ActorOpenID:   "ou_first",
+		ChatID:        "oc_first",
+		Payload:       `{}`,
+		CreatedAt:     now,
+		ExpiresAt:     now.Add(time.Minute),
 	})
 	if err != nil {
 		t.Fatalf("CreateToolApproval first returned error: %v", err)
 	}
 	second, err := st.CreateToolApproval(ToolApproval{
-		AccountID:   "feishu:second",
-		ToolName:    "tool",
-		ActorOpenID: "ou_second",
-		ChatID:      "oc_second",
-		Payload:     `{}`,
-		CreatedAt:   now,
-		ExpiresAt:   now.Add(time.Minute),
+		AccountID:     "feishu:second",
+		ToolName:      "tool",
+		ActionKey:     "execute",
+		ResourceType:  "resource",
+		ResourceToken: "second",
+		ActorOpenID:   "ou_second",
+		ChatID:        "oc_second",
+		Payload:       `{}`,
+		CreatedAt:     now,
+		ExpiresAt:     now.Add(time.Minute),
 	})
 	if err != nil {
 		t.Fatalf("CreateToolApproval second returned error: %v", err)
@@ -274,13 +288,17 @@ func TestFailExecutingToolApprovalsClearsInterruptedPayload(t *testing.T) {
 func createBoundToolApproval(t *testing.T, st *Store, now time.Time) ToolApproval {
 	t.Helper()
 	approval, err := st.CreateToolApproval(ToolApproval{
-		AccountID:   "feishu:cli_test",
-		ToolName:    "feishu_docs_create",
-		ActorOpenID: "ou_requester",
-		ChatID:      "oc_chat",
-		Payload:     `{"title":"Quarterly plan"}`,
-		CreatedAt:   now,
-		ExpiresAt:   now.Add(10 * time.Minute),
+		AccountID:     "feishu:cli_test",
+		ToolName:      "feishu_docs_create",
+		ActionKey:     "create",
+		ResourceType:  "folder",
+		ResourceToken: "fld_token",
+		SupportsAll:   true,
+		ActorOpenID:   "ou_requester",
+		ChatID:        "oc_chat",
+		Payload:       `{"title":"Quarterly plan"}`,
+		CreatedAt:     now,
+		ExpiresAt:     now.Add(10 * time.Minute),
 	})
 	if err != nil {
 		t.Fatalf("CreateToolApproval returned error: %v", err)

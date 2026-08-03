@@ -36,13 +36,13 @@ type docsTool struct {
 	store          *store.Store
 	accountID      string
 	cfg            Config
-	approver       ApprovalRequester
+	approvals      OperationApprovalService
 	resourceAccess ResourceAccessController
 	now            func() time.Time
 }
 
 // NewDocsTools returns Feishu document tools for tool-capable LLM providers.
-func NewDocsTools(client *lark.Client, st *store.Store, accountID string, cfg Config, approver ApprovalRequester, resourceAccess ResourceAccessController) []tooltypes.Tool {
+func NewDocsTools(client *lark.Client, st *store.Store, accountID string, cfg Config, approvals OperationApprovalService, resourceAccess ResourceAccessController) []tooltypes.Tool {
 	cfg = NormalizeConfig(cfg)
 	accountID = strings.TrimSpace(accountID)
 	if client == nil || st == nil || st.PlatformID() != store.PlatformFeishu || accountID == "" || !cfg.Docs.Enabled {
@@ -53,8 +53,8 @@ func NewDocsTools(client *lark.Client, st *store.Store, accountID string, cfg Co
 		docsTool{name: readToolName, spec: docsReadSpec(), client: client, store: st, accountID: accountID, cfg: cfg, resourceAccess: resourceAccess, now: time.Now},
 	}
 	if cfg.Docs.AllowWrite {
-		if approver != nil && resourceAccess != nil {
-			tools = append(tools, docsTool{name: createToolName, spec: docsCreateSpec(), client: client, store: st, accountID: accountID, cfg: cfg, approver: approver, resourceAccess: resourceAccess, now: time.Now})
+		if approvals != nil && resourceAccess != nil {
+			tools = append(tools, docsTool{name: createToolName, spec: docsCreateSpec(), client: client, store: st, accountID: accountID, cfg: cfg, approvals: approvals, resourceAccess: resourceAccess, now: time.Now})
 		}
 		tools = append(tools, docsTool{name: appendToolName, spec: docsAppendSpec(), client: client, store: st, accountID: accountID, cfg: cfg, resourceAccess: resourceAccess, now: time.Now})
 	}
@@ -349,14 +349,29 @@ func (t docsTool) create(ctx context.Context, raw json.RawMessage) (string, stri
 	if err != nil {
 		return "", "", err
 	}
-	if t.approver == nil {
+	if t.approvals == nil {
 		return "", "", fmt.Errorf("feishu document creation approval workflow is unavailable")
 	}
-	granted, err := t.approver.HasActiveGrant(ctx, createToolName)
+	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
-		return "", "", fmt.Errorf("check feishu document creation approval: %w", err)
+		return "", "", fmt.Errorf("marshal approved document request: %w", err)
 	}
-	if granted {
+	approval, err := t.approvals.CheckOrRequest(ctx, OperationApprovalRequest{
+		ToolName:      createToolName,
+		ActionKey:     "create",
+		ResourceType:  "folder",
+		ResourceToken: payload.FolderToken,
+		Fields: []ApprovalField{
+			{Label: "文档标题", Value: payload.Title},
+			{Label: "目标文件夹", Value: payload.FolderToken},
+			{Label: "初始内容", Value: fmt.Sprintf("%d 个字符", utf8.RuneCountInString(payload.Content))},
+		},
+		Payload: payloadJSON,
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("check or request feishu document creation approval: %w", err)
+	}
+	if approval.Status == OperationApprovalStatusGranted {
 		request, requestErr := t.store.CreateWorkflowRequest(store.WorkflowRequest{
 			AccountID: t.accountID,
 			Kind:      store.WorkflowRequestKindFeishuDocsCreate,
@@ -381,66 +396,58 @@ func (t docsTool) create(ctx context.Context, raw json.RawMessage) (string, stri
 		content, marshalErr := marshalToolOutput(out)
 		return content, "", marshalErr
 	}
-	payloadJSON, err := json.Marshal(payload)
-	if err != nil {
-		return "", "", fmt.Errorf("marshal approved document request: %w", err)
-	}
-	pending, err := t.approver.RequestApproval(ctx, ApprovalRequest{
-		ToolName: createToolName,
-		Action:   "创建飞书文档",
-		Fields: []ApprovalField{
-			{Label: "文档标题", Value: payload.Title},
-			{Label: "目标文件夹", Value: payload.FolderToken},
-			{Label: "初始内容", Value: fmt.Sprintf("%d 个字符", utf8.RuneCountInString(payload.Content))},
-		},
-		Payload: payloadJSON,
-	})
-	if err != nil {
-		return "", "", fmt.Errorf("request feishu document creation approval: %w", err)
+	if approval.Status != OperationApprovalStatusPending {
+		return "", "", fmt.Errorf("unsupported feishu document creation approval status %q", approval.Status)
 	}
 	content, marshalErr := marshalToolOutput(pendingApprovalOutput{
 		Status:    "pending_approval",
-		RequestID: pending.RequestID,
-		ExpiresAt: pending.ExpiresAt.UTC().Format(time.RFC3339),
+		RequestID: approval.RequestID,
+		ExpiresAt: approval.ExpiresAt.UTC().Format(time.RFC3339),
 		Message:   "已向本次请求的飞书用户发送授权卡片；可同意本次，或为相同用户、机器人账号、对话和 feishu_docs_create 授权 24 小时。批准后会异步创建文档，请勿重复调用。",
 	})
-	return content, pending.RequestID, marshalErr
+	return content, approval.RequestID, marshalErr
 }
 
-// ApprovalToolName identifies the document create operation handled after card approval.
-func (t docsTool) ApprovalToolName() string {
+// OperationApprovalPolicy identifies the document create operation handled by
+// the shared approval service.
+func (t docsTool) OperationApprovalPolicy() OperationApprovalPolicy {
 	if t.name == createToolName {
-		return createToolName
+		return OperationApprovalPolicy{
+			ToolName:    createToolName,
+			ActionKey:   "create",
+			Action:      "创建飞书文档",
+			SupportsAll: true,
+		}
 	}
-	return ""
+	return OperationApprovalPolicy{}
 }
 
 // ExecuteApproved creates the exact document payload persisted before authorization.
-func (t docsTool) ExecuteApproved(ctx context.Context, requestID string, payload json.RawMessage) (ApprovalExecution, error) {
+func (t docsTool) ExecuteApproved(ctx context.Context, requestID string, payload json.RawMessage) (OperationApprovalExecution, error) {
 	if t.name != createToolName {
-		return ApprovalExecution{}, fmt.Errorf("tool %q does not support approved execution", t.name)
+		return OperationApprovalExecution{}, fmt.Errorf("tool %q does not support approved execution", t.name)
 	}
 	args, err := t.parseApprovedCreatePayload(payload)
 	if err != nil {
-		return ApprovalExecution{}, err
+		return OperationApprovalExecution{}, err
 	}
 	executionCtx := WithActor(ctx, Actor{OpenID: args.ActorOpenID, UserID: args.ActorUserID})
 	executionCtx = WithChatContext(executionCtx, ChatContext{ChatID: args.ChatID})
 	if err := t.validateDocumentCreateAccess(executionCtx, args); err != nil {
-		return ApprovalExecution{}, fmt.Errorf("revalidate approved document target access: %w", err)
+		return OperationApprovalExecution{}, fmt.Errorf("revalidate approved document target access: %w", err)
 	}
 	out, err := t.createDocument(executionCtx, requestID, args)
 	if err != nil {
 		if out.DocumentID != "" {
-			return ApprovalExecution{
+			return OperationApprovalExecution{
 				Message:       fmt.Sprintf("⚠️ 文档已创建，但后续处理失败：[%s](%s)。请勿重复创建，可稍后继续处理。", escapeFeishuLinkText(out.Title), out.URL),
 				Warning:       true,
 				WarningReason: err.Error(),
 			}, nil
 		}
-		return ApprovalExecution{}, err
+		return OperationApprovalExecution{}, err
 	}
-	return ApprovalExecution{
+	return OperationApprovalExecution{
 		Message: fmt.Sprintf("✅ 飞书文档已创建：[%s](%s)", escapeFeishuLinkText(out.Title), out.URL),
 	}, nil
 }

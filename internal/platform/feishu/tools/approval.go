@@ -13,35 +13,56 @@ type ApprovalField struct {
 	Value string
 }
 
-// ApprovalRequest asks the Feishu frontend to authorize one exact tool payload.
-type ApprovalRequest struct {
-	ToolName string
-	Action   string
-	Fields   []ApprovalField
-	Payload  json.RawMessage
+const (
+	OperationApprovalStatusGranted = "granted"
+	OperationApprovalStatusPending = "pending"
+)
+
+// OperationApprovalPolicy is owned by one tool action and controls how the
+// shared approval service presents and routes that operation.
+type OperationApprovalPolicy struct {
+	ToolName    string
+	ActionKey   string
+	Action      string
+	SupportsAll bool
 }
 
-// PendingApproval identifies a durable approval request sent to Feishu.
-type PendingApproval struct {
+// OperationApprovalRequest asks the shared service to check reusable approval
+// or create one durable card workflow for an exact resource and payload.
+type OperationApprovalRequest struct {
+	ToolName      string
+	ActionKey     string
+	ResourceType  string
+	ResourceToken string
+	Fields        []ApprovalField
+	Payload       json.RawMessage
+}
+
+// OperationApprovalResult reports whether the operation may execute now or is
+// waiting for a durable Feishu card decision.
+type OperationApprovalResult struct {
+	Status    string
 	RequestID string
 	ExpiresAt time.Time
 }
 
-// ApprovalExecution is the user-facing result of an approved asynchronous tool operation.
-type ApprovalExecution struct {
+// OperationApprovalExecution is the user-facing result of an approved
+// asynchronous tool operation.
+type OperationApprovalExecution struct {
 	Message       string
 	Warning       bool
 	WarningReason string
 }
 
-// ApprovalRequester checks reusable authorization and creates a Feishu approval request when needed.
-type ApprovalRequester interface {
-	HasActiveGrant(ctx context.Context, toolName string) (bool, error)
-	RequestApproval(ctx context.Context, request ApprovalRequest) (PendingApproval, error)
+// OperationApprovalService is the single tool-facing entry point for reusable
+// operation authorization and durable approval-card creation.
+type OperationApprovalService interface {
+	CheckOrRequest(ctx context.Context, request OperationApprovalRequest) (OperationApprovalResult, error)
 }
 
-// ApprovalExecutor executes a previously validated payload after the requesting user approves it.
-type ApprovalExecutor interface {
-	ApprovalToolName() string
-	ExecuteApproved(ctx context.Context, requestID string, payload json.RawMessage) (ApprovalExecution, error)
+// OperationApprovalExecutor owns one operation policy and executes the exact
+// payload persisted before the requesting user approved it.
+type OperationApprovalExecutor interface {
+	OperationApprovalPolicy() OperationApprovalPolicy
+	ExecuteApproved(ctx context.Context, requestID string, payload json.RawMessage) (OperationApprovalExecution, error)
 }

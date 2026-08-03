@@ -122,12 +122,8 @@ func (fakeCoreTool) Execute(ctx context.Context, call tooltypes.Call) tooltypes.
 
 type fakeToolApprovalRequester struct{}
 
-func (fakeToolApprovalRequester) HasActiveGrant(context.Context, string) (bool, error) {
-	return false, nil
-}
-
-func (fakeToolApprovalRequester) RequestApproval(context.Context, feishutools.ApprovalRequest) (feishutools.PendingApproval, error) {
-	return feishutools.PendingApproval{RequestID: "req_approval"}, nil
+func (fakeToolApprovalRequester) CheckOrRequest(context.Context, feishutools.OperationApprovalRequest) (feishutools.OperationApprovalResult, error) {
+	return feishutools.OperationApprovalResult{Status: feishutools.OperationApprovalStatusPending, RequestID: "req_approval"}, nil
 }
 
 type fakeResourceAccessController struct{}

@@ -30,7 +30,7 @@ type bot struct {
 	account       store.Account
 	botOpenID     string
 	eventCommands map[string][]string
-	approvals     *approvalManager
+	approvals     *operationApprovalService
 	cards         CardService
 	deduper       *eventDeduper
 	runCtx        context.Context
