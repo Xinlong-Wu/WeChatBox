@@ -780,6 +780,9 @@ func TestReviewPullRequestPassesAccountModel(t *testing.T) {
 		if handler.model != "claude" {
 			t.Fatalf("msg.Model = %q, want claude", handler.model)
 		}
+		if handler.userKey != pullRequestUserKey(pr) {
+			t.Fatalf("msg.UserKey = %q, want shared PR key %q", handler.userKey, pullRequestUserKey(pr))
+		}
 	})
 
 	t.Run("empty model stays empty", func(t *testing.T) {
@@ -940,8 +943,8 @@ type fakeAPIClient struct {
 	instructionsOK    bool
 	instructionsCalls int
 
-	issueComments  []IssueComment
-	reviewComments []ReviewComment
+	issueComments   []IssueComment
+	reviewComments  []ReviewComment
 	createdComments []string
 	createdReplies  []struct {
 		CommentID int64
@@ -998,11 +1001,13 @@ func (fakeHandler) Handle(ctx context.Context, msg core.InboundMessage, sender c
 }
 
 type recordingHandler struct {
-	model string
+	model   string
+	userKey string
 }
 
 func (h *recordingHandler) Handle(ctx context.Context, msg core.InboundMessage, sender core.Sender) error {
 	h.model = msg.Model
+	h.userKey = msg.UserKey
 	return nil
 }
 
@@ -1245,8 +1250,21 @@ func TestPollCommentsBotCommand(t *testing.T) {
 	if !strings.Contains(handler.systemPrompt, "helpful assistant") {
 		t.Fatalf("SystemPromptSuffix = %q, want chat prompt", handler.systemPrompt)
 	}
-	if handler.userKey != chatUserKey(pr) {
-		t.Fatalf("UserKey = %q, want chat key %q", handler.userKey, chatUserKey(pr))
+	if handler.userKey != pullRequestUserKey(pr) {
+		t.Fatalf("UserKey = %q, want shared PR key %q", handler.userKey, pullRequestUserKey(pr))
+	}
+}
+
+func TestPullRequestUserKeyIsStableAcrossReviewsAndHeadChanges(t *testing.T) {
+	pr := testPullRequest()
+	want := "github:base:repo:pr:7"
+	if got := pullRequestUserKey(pr); got != want {
+		t.Fatalf("pullRequestUserKey() = %q, want %q", got, want)
+	}
+
+	pr.Head.SHA = "new-head-sha"
+	if got := pullRequestUserKey(pr); got != want {
+		t.Fatalf("pullRequestUserKey() after head change = %q, want %q", got, want)
 	}
 }
 

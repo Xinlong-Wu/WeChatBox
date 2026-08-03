@@ -344,6 +344,13 @@ repositories for open pull requests. Draft PRs are skipped. A PR is reviewed
 when it first appears or when its `head.sha` changes; unchanged PRs are tracked
 through the platform `sync_cursors` buffer and are not reviewed again.
 
+All automated reviews and comment-triggered interactions for the same PR share
+one conversation session keyed by the base repository and PR number. The
+session is preserved when the PR head SHA changes. A human comment beginning
+with `/review` triggers another review, while `/bot <message>` continues the
+same PR conversation and posts the response back to the issue or review-comment
+thread. Different PRs use separate sessions.
+
 Review instructions are read only from `.github/review_instructions.md` in the
 base repository at the PR base SHA. Instructions from the head branch are never
 trusted or used as fallback. If the base file is missing and
