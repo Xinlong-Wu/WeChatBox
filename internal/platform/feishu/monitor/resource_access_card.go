@@ -40,7 +40,7 @@ func (c pendingResourceAccessCard) JSON() (string, error) {
 	}
 	lines = append(lines,
 		"",
-		"[前往飞书官方授权页面]("+c.authURL+")",
+		"点击下方“前往飞书官方授权页面”按钮完成授权。",
 		"LingoBridge 仅使用本次返回的 user_access_token 完成授权，不保存 user_access_token 或 refresh_token。",
 		"如果授权后浏览器无法返回 LingoBridge，请复制地址栏中的完整回调 URL，返回本卡片粘贴并提交；也可以只粘贴授权码。",
 		fmt.Sprintf("本请求将于 %s 过期。", c.request.ExpiresAt.UTC().Format("2006-01-02 15:04 UTC")),
@@ -103,6 +103,23 @@ func (c pendingResourceAccessCard) JSON() (string, error) {
 					"text_size":  "normal_v2",
 					"margin":     "0px 0px 0px 0px",
 					"element_id": "KNJPSduXTksKaRe28qq6",
+				},
+				map[string]interface{}{
+					"tag":   "button",
+					"text":  map[string]interface{}{"tag": "plain_text", "content": "前往飞书官方授权页面"},
+					"type":  "primary",
+					"width": "default",
+					"size":  "medium",
+					"behaviors": []interface{}{
+						map[string]interface{}{
+							"type":        "open_url",
+							"default_url": c.authURL,
+							"android_url": "",
+							"ios_url":     "",
+							"pc_url":      "",
+						},
+					},
+					"margin": "0px 0px 0px 0px",
 				},
 				map[string]interface{}{
 					"tag": "form",

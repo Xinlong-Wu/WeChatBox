@@ -485,7 +485,7 @@ func TestPendingResourceAccessCardContainsOAuthHandoffForm(t *testing.T) {
 	}
 	body, _ := card["body"].(map[string]any)
 	elements, _ := body["elements"].([]any)
-	if body["direction"] != "vertical" || len(elements) != 3 {
+	if body["direction"] != "vertical" || len(elements) != 4 {
 		t.Fatalf("resource card body = %#v", body)
 	}
 	intro, _ := elements[0].(map[string]any)
@@ -496,10 +496,22 @@ func TestPendingResourceAccessCardContainsOAuthHandoffForm(t *testing.T) {
 	markdown, _ := elements[1].(map[string]any)
 	markdownContent, _ := markdown["content"].(string)
 	if markdown["tag"] != "markdown" || markdown["element_id"] != "KNJPSduXTksKaRe28qq6" || markdown["text_size"] != "normal_v2" ||
-		!strings.Contains(markdownContent, "为了更好地为您提供服务") || !strings.Contains(markdownContent, "创建项目计划文档") || !strings.Contains(markdownContent, authURL) {
+		!strings.Contains(markdownContent, "为了更好地为您提供服务") || !strings.Contains(markdownContent, "创建项目计划文档") ||
+		!strings.Contains(markdownContent, "点击下方“前往飞书官方授权页面”按钮") || strings.Contains(markdownContent, authURL) {
 		t.Fatalf("resource card description = %#v", markdown)
 	}
-	form, _ := elements[2].(map[string]any)
+	openButton, _ := elements[2].(map[string]any)
+	openButtonText, _ := openButton["text"].(map[string]any)
+	openBehaviors, _ := openButton["behaviors"].([]any)
+	if openButton["tag"] != "button" || openButtonText["content"] != "前往飞书官方授权页面" || openButton["type"] != "primary" ||
+		openButton["width"] != "default" || openButton["size"] != "medium" || openButton["margin"] != "0px 0px 0px 0px" || len(openBehaviors) != 1 {
+		t.Fatalf("resource card OAuth button = %#v", openButton)
+	}
+	openBehavior, _ := openBehaviors[0].(map[string]any)
+	if openBehavior["type"] != "open_url" || openBehavior["default_url"] != authURL || openBehavior["android_url"] != "" || openBehavior["ios_url"] != "" || openBehavior["pc_url"] != "" {
+		t.Fatalf("resource card OAuth button behavior = %#v", openBehavior)
+	}
+	form, _ := elements[3].(map[string]any)
 	if form["tag"] != "form" || form["name"] != "privacy_form" || form["element_id"] != "STIJ_lgxwvFvn9xFUnT8" || form["padding"] != "12px 12px 12px 12px" {
 		t.Fatalf("resource card form = %#v", form)
 	}
@@ -729,22 +741,20 @@ func resourceAccessCardURL(t *testing.T, raw string) string {
 	}
 	body, _ := card["body"].(map[string]any)
 	elements, _ := body["elements"].([]any)
-	if len(elements) < 2 {
+	if len(elements) < 3 {
 		t.Fatalf("resource access card elements = %#v", elements)
 	}
-	markdown, _ := elements[1].(map[string]any)
-	content, _ := markdown["content"].(string)
-	const prefix = "[前往飞书官方授权页面]("
-	start := strings.Index(content, prefix)
-	if start < 0 {
-		t.Fatalf("resource access OAuth link missing from markdown: %#v", markdown)
+	button, _ := elements[2].(map[string]any)
+	behaviors, _ := button["behaviors"].([]any)
+	if len(behaviors) != 1 {
+		t.Fatalf("resource access OAuth button behaviors = %#v", behaviors)
 	}
-	start += len(prefix)
-	end := strings.Index(content[start:], ")")
-	if end < 0 {
-		t.Fatalf("resource access OAuth link is malformed: %#v", markdown)
+	behavior, _ := behaviors[0].(map[string]any)
+	value, _ := behavior["default_url"].(string)
+	if behavior["type"] != "open_url" || value == "" {
+		t.Fatalf("resource access OAuth button behavior = %#v", behavior)
 	}
-	return content[start : start+end]
+	return value
 }
 
 func resourceAccessCardState(t *testing.T, raw string) string {
