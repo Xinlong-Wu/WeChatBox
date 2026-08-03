@@ -146,15 +146,20 @@ func (t resourceAccessTool) Execute(ctx context.Context, call tooltypes.Call) to
 		return tooltypes.Result{CallID: call.ID, Name: ResourceAccessToolName, Content: err.Error(), IsError: true}
 	}
 	result, err := t.controller.RequestAccess(ctx, request)
+	pendingWorkflowID := ""
+	if result.Status == ResourceAccessStatusPending {
+		pendingWorkflowID = result.RequestID
+	}
 	content := ""
 	if err == nil {
 		content, err = marshalToolOutput(result)
 	}
 	return tooltypes.Result{
-		CallID:  call.ID,
-		Name:    ResourceAccessToolName,
-		Content: contentOrError(content, err),
-		IsError: err != nil,
+		CallID:            call.ID,
+		Name:              ResourceAccessToolName,
+		Content:           contentOrError(content, err),
+		IsError:           err != nil,
+		PendingWorkflowID: pendingWorkflowID,
 	}
 }
 

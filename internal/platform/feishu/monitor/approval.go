@@ -26,6 +26,8 @@ const (
 type toolApprovalStore interface {
 	PlatformID() string
 	CreateToolApproval(approval store.ToolApproval) (store.ToolApproval, error)
+	CreateWorkflowContinuation(store.WorkflowContinuation) (store.WorkflowContinuation, error)
+	CancelWorkflowContinuation(requestID, accountID, reason string, now time.Time) error
 	SetToolApprovalCardMessageID(id, accountID, messageID string, now time.Time) error
 	DecideToolApproval(id, accountID, decision string, match store.ToolApprovalMatch, now time.Time) (store.ToolApproval, error)
 	CompleteToolApproval(id, accountID, state string, now time.Time) error
@@ -174,6 +176,10 @@ func (m *approvalManager) RequestApproval(ctx context.Context, request feishutoo
 	if !ok || chat.ChatID == "" {
 		return feishutools.PendingApproval{}, fmt.Errorf("feishu tool approval requires the trusted current chat")
 	}
+	execution, err := trustedWorkflowExecutionContext(ctx, m.account.ID, request.ToolName)
+	if err != nil {
+		return feishutools.PendingApproval{}, err
+	}
 
 	now := m.currentTime()
 	if count, err := m.store.ExpireToolApprovals(m.account.ID, now); err != nil {
@@ -195,13 +201,19 @@ func (m *approvalManager) RequestApproval(ctx context.Context, request feishutoo
 	if err != nil {
 		return feishutools.PendingApproval{}, fmt.Errorf("persist feishu tool approval: %w", err)
 	}
+	if _, err := persistWorkflowContinuation(m.store, execution, approval.ID, m.currentTime()); err != nil {
+		m.failApprovalBestEffort(ctx, approval.ID)
+		return feishutools.PendingApproval{}, err
+	}
 	cardMessageID, err := m.cards.Send(ctx, approval.ChatID, pendingApprovalCard{request: request, approval: approval})
 	if err != nil {
 		m.failApprovalBestEffort(ctx, approval.ID)
+		cancelWorkflowContinuationBestEffort(ctx, m.store, approval.ID, approval.AccountID, "approval card send failed", m.currentTime())
 		return feishutools.PendingApproval{}, fmt.Errorf("send feishu tool approval card: %w", err)
 	}
 	if err := m.store.SetToolApprovalCardMessageID(approval.ID, approval.AccountID, cardMessageID, m.currentTime()); err != nil {
 		m.failApprovalBestEffort(ctx, approval.ID)
+		cancelWorkflowContinuationBestEffort(ctx, m.store, approval.ID, approval.AccountID, "approval card binding failed", m.currentTime())
 		m.updateCardBestEffort(ctx, cardMessageID, statusCard{title: "授权请求失败", template: "red", message: "授权请求未能保存，请重新发起操作。"})
 		return feishutools.PendingApproval{}, fmt.Errorf("bind feishu tool approval card: %w", err)
 	}

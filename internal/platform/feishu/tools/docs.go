@@ -67,6 +67,7 @@ func (t docsTool) Spec() tooltypes.Spec {
 
 func (t docsTool) Execute(ctx context.Context, call tooltypes.Call) tooltypes.Result {
 	var content string
+	var pendingWorkflowID string
 	var err error
 	switch t.name {
 	case searchToolName:
@@ -74,17 +75,18 @@ func (t docsTool) Execute(ctx context.Context, call tooltypes.Call) tooltypes.Re
 	case readToolName:
 		content, err = t.read(ctx, call.Arguments)
 	case createToolName:
-		content, err = t.create(ctx, call.Arguments)
+		content, pendingWorkflowID, err = t.create(ctx, call.Arguments)
 	case appendToolName:
 		content, err = t.append(ctx, call.Arguments)
 	default:
 		err = fmt.Errorf("unsupported feishu docs tool %q", t.name)
 	}
 	return tooltypes.Result{
-		CallID:  call.ID,
-		Name:    t.name,
-		Content: contentOrError(content, err),
-		IsError: err != nil,
+		CallID:            call.ID,
+		Name:              t.name,
+		Content:           contentOrError(content, err),
+		IsError:           err != nil,
+		PendingWorkflowID: pendingWorkflowID,
 	}
 }
 
@@ -342,17 +344,17 @@ func (t docsTool) read(ctx context.Context, raw json.RawMessage) (string, error)
 	return marshalToolOutput(readOutput{Token: ref.Token, Type: ref.Kind, Content: content, Truncated: truncated})
 }
 
-func (t docsTool) create(ctx context.Context, raw json.RawMessage) (string, error) {
+func (t docsTool) create(ctx context.Context, raw json.RawMessage) (string, string, error) {
 	payload, err := t.resolveCreatePayload(ctx, raw)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if t.approver == nil {
-		return "", fmt.Errorf("feishu document creation approval workflow is unavailable")
+		return "", "", fmt.Errorf("feishu document creation approval workflow is unavailable")
 	}
 	granted, err := t.approver.HasActiveGrant(ctx, createToolName)
 	if err != nil {
-		return "", fmt.Errorf("check feishu document creation approval: %w", err)
+		return "", "", fmt.Errorf("check feishu document creation approval: %w", err)
 	}
 	if granted {
 		request, requestErr := t.store.CreateWorkflowRequest(store.WorkflowRequest{
@@ -362,24 +364,26 @@ func (t docsTool) create(ctx context.Context, raw json.RawMessage) (string, erro
 			CreatedAt: t.currentTime(),
 		})
 		if requestErr != nil {
-			return "", fmt.Errorf("create feishu document workflow request: %w", requestErr)
+			return "", "", fmt.Errorf("create feishu document workflow request: %w", requestErr)
 		}
 		out, createErr := t.createDocument(ctx, request.ID, payload)
 		if createErr != nil {
 			if out.DocumentID == "" {
 				t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStateFailed)
-				return "", createErr
+				return "", "", createErr
 			}
 			t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStatePartial)
 			out.Warning = fmt.Sprintf("文档已创建，但后续处理失败：%v。请勿重复创建，可稍后继续处理。", createErr)
-			return marshalToolOutput(out)
+			content, marshalErr := marshalToolOutput(out)
+			return content, "", marshalErr
 		}
 		t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStateSucceeded)
-		return marshalToolOutput(out)
+		content, marshalErr := marshalToolOutput(out)
+		return content, "", marshalErr
 	}
 	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
-		return "", fmt.Errorf("marshal approved document request: %w", err)
+		return "", "", fmt.Errorf("marshal approved document request: %w", err)
 	}
 	pending, err := t.approver.RequestApproval(ctx, ApprovalRequest{
 		ToolName: createToolName,
@@ -392,14 +396,15 @@ func (t docsTool) create(ctx context.Context, raw json.RawMessage) (string, erro
 		Payload: payloadJSON,
 	})
 	if err != nil {
-		return "", fmt.Errorf("request feishu document creation approval: %w", err)
+		return "", "", fmt.Errorf("request feishu document creation approval: %w", err)
 	}
-	return marshalToolOutput(pendingApprovalOutput{
+	content, marshalErr := marshalToolOutput(pendingApprovalOutput{
 		Status:    "pending_approval",
 		RequestID: pending.RequestID,
 		ExpiresAt: pending.ExpiresAt.UTC().Format(time.RFC3339),
 		Message:   "已向本次请求的飞书用户发送授权卡片；可同意本次，或为相同用户、机器人账号、对话和 feishu_docs_create 授权 24 小时。批准后会异步创建文档，请勿重复调用。",
 	})
+	return content, pending.RequestID, marshalErr
 }
 
 // ApprovalToolName identifies the document create operation handled after card approval.

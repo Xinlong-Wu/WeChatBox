@@ -600,6 +600,7 @@ func (r *runtimeState) updateConfig(ctx context.Context, cfg config.Config) erro
 		handler.TextChunkLimit = def.TextChunkLimit
 		handler.EnableTextStreaming = def.EnableTextStreaming
 		handler.ToolProvider = r.mcpHost
+		handler.Workflows = st
 		runtimes[platformID] = platformRuntime{
 			store:   st,
 			sm:      sm,

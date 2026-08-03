@@ -40,6 +40,8 @@ type resourceAccessStore interface {
 	GetFeishuBotResource(accountID, resourceType, resourceToken string) (store.FeishuBotResource, error)
 	DefaultFeishuChatFolder(accountID, chatID string) (store.FeishuChatFolder, error)
 	CreateFeishuResourceAccessRequest(store.FeishuResourceAccessRequest) (store.FeishuResourceAccessRequest, error)
+	CreateWorkflowContinuation(store.WorkflowContinuation) (store.WorkflowContinuation, error)
+	CancelWorkflowContinuation(requestID, accountID, reason string, now time.Time) error
 	PrepareFeishuResourceAccessOAuth(id, accountID, stateHash, verifier, subjectType, subjectID string, now time.Time) error
 	SetFeishuResourceAccessCardMessageID(id, accountID, messageID string, now time.Time) error
 	GetFeishuResourceAccessRequest(id, accountID string) (store.FeishuResourceAccessRequest, error)
@@ -252,6 +254,11 @@ func (m *resourceAccessManager) RequestAccess(ctx context.Context, input feishut
 		result.Message = "当前机器人账号未配置 OAuth 回调；只能直接使用 Bot 自有资源或已经可以实时验证的授权。"
 		return result, nil
 	}
+	execution, err := trustedWorkflowExecutionContext(ctx, m.account.ID, feishutools.ResourceAccessToolName)
+	if err != nil {
+		m.failResourceAccessBestEffort(ctx, request.ID)
+		return feishutools.ResourceAccessResult{}, err
+	}
 	state, stateHash, err := newResourceAccessOAuthValues()
 	if err != nil {
 		m.failResourceAccessBestEffort(ctx, request.ID)
@@ -286,13 +293,19 @@ func (m *resourceAccessManager) RequestAccess(ctx context.Context, input feishut
 		authTrace.CodeChallengePresent, authTrace.CodeChallengeMethodPresent,
 		authTrace.RedirectRef, authTrace.RedirectRef == shortResourceRef(m.oauth.CallbackURL),
 		authTrace.RedirectScheme, authTrace.RedirectHost, authTrace.RedirectPath, authTrace.RedirectLength, authTrace.ScopeCount)
+	if _, err := persistWorkflowContinuation(m.store, execution, request.ID, m.currentTime()); err != nil {
+		m.failResourceAccessBestEffort(ctx, request.ID)
+		return feishutools.ResourceAccessResult{}, err
+	}
 	messageID, err := m.cards.Send(ctx, request.ChatID, pendingResourceAccessCard{request: request, authURL: authURL})
 	if err != nil {
 		m.failResourceAccessBestEffort(ctx, request.ID)
+		cancelWorkflowContinuationBestEffort(ctx, m.store, request.ID, request.AccountID, "resource access card send failed", m.currentTime())
 		return feishutools.ResourceAccessResult{}, fmt.Errorf("send feishu resource access card: %w", err)
 	}
 	if err := m.store.SetFeishuResourceAccessCardMessageID(request.ID, request.AccountID, messageID, m.currentTime()); err != nil {
 		m.failResourceAccessBestEffort(ctx, request.ID)
+		cancelWorkflowContinuationBestEffort(ctx, m.store, request.ID, request.AccountID, "resource access card binding failed", m.currentTime())
 		m.updateResourceCardBestEffort(ctx, messageID, statusCard{title: "授权请求失败", template: "red", message: "授权请求未能保存，请重新发起。"})
 		return feishutools.ResourceAccessResult{}, fmt.Errorf("bind feishu resource access card: %w", err)
 	}

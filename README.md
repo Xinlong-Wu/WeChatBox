@@ -779,6 +779,13 @@ names, OAuth codes, callback URLs, access tokens, refresh tokens, or card callba
 tokens. Deleting a Feishu account's Docs or approval data also deletes the
 matching workflow results and continuations.
 
+An asynchronous tool returns its request ID to core as runtime-only result
+metadata; that ID is not part of the model-visible tool JSON. The Feishu manager
+creates the waiting continuation from the trusted execution context after the
+card is durably bound. Core commits the continuation to the new conversation
+revision only after `SaveHistoryCAS` succeeds, and cancels it when the tool loop,
+assistant conversion, or conversation save fails.
+
 ## Internal Architecture
 
 LingoBridge uses a multi-platform frontend, shared middle layer, and multi-provider backend structure:

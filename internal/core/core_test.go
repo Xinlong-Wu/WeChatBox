@@ -36,6 +36,7 @@ type fakeSessions struct {
 	saved      *store.Conversation
 	model      string
 	commandHit bool
+	saveErr    error
 }
 
 func (f *fakeSessions) GetOrCreateCurrentSession(userID string) (*store.Session, error) {
@@ -53,6 +54,9 @@ func (f *fakeSessions) LoadHistory(userID, sessionID string) (*store.Conversatio
 }
 
 func (f *fakeSessions) SaveHistoryCAS(userID, sessionID string, expectedRevision int64, conv *store.Conversation) (int64, error) {
+	if f.saveErr != nil {
+		return 0, f.saveErr
+	}
 	conv.Revision = expectedRevision + 1
 	f.saved = conv
 	f.conv = conv
@@ -256,12 +260,13 @@ func (f *fakeToolLLM) ChatStreamWithTools(systemPrompt string, messages []store.
 }
 
 type fakeTool struct {
-	spec       tooltypes.Spec
-	result     string
-	err        string
-	block      bool
-	calls      []tooltypes.Call
-	executions []tooltypes.ExecutionContext
+	spec              tooltypes.Spec
+	result            string
+	err               string
+	pendingWorkflowID string
+	block             bool
+	calls             []tooltypes.Call
+	executions        []tooltypes.ExecutionContext
 }
 
 func (f *fakeTool) Spec() tooltypes.Spec {
@@ -282,7 +287,39 @@ func (f *fakeTool) Execute(ctx context.Context, call tooltypes.Call) tooltypes.R
 	if f.err != "" {
 		return tooltypes.Result{CallID: call.ID, Name: call.Name, Content: f.err, IsError: true}
 	}
-	return tooltypes.Result{CallID: call.ID, Name: call.Name, Content: f.result}
+	return tooltypes.Result{CallID: call.ID, Name: call.Name, Content: f.result, PendingWorkflowID: f.pendingWorkflowID}
+}
+
+type workflowCommitCall struct {
+	requestID         string
+	accountID         string
+	committedRevision int64
+}
+
+type workflowCancelCall struct {
+	requestID string
+	accountID string
+	reason    string
+}
+
+type fakeWorkflowContinuationManager struct {
+	commits   []workflowCommitCall
+	cancels   []workflowCancelCall
+	commitErr error
+	cancelErr error
+}
+
+func (f *fakeWorkflowContinuationManager) CommitWorkflowContinuation(requestID, accountID string, committedRevision int64, now time.Time) (store.WorkflowContinuation, bool, error) {
+	f.commits = append(f.commits, workflowCommitCall{requestID: requestID, accountID: accountID, committedRevision: committedRevision})
+	if f.commitErr != nil {
+		return store.WorkflowContinuation{}, false, f.commitErr
+	}
+	return store.WorkflowContinuation{RequestID: requestID, AccountID: accountID, SessionID: "session", State: store.WorkflowContinuationStateWaiting}, false, nil
+}
+
+func (f *fakeWorkflowContinuationManager) CancelWorkflowContinuation(requestID, accountID, reason string, now time.Time) error {
+	f.cancels = append(f.cancels, workflowCancelCall{requestID: requestID, accountID: accountID, reason: reason})
+	return f.cancelErr
 }
 
 type cancelingTool struct {
@@ -759,6 +796,134 @@ func TestHandleTextBindsTrustedExecutionContextOutsideToolArguments(t *testing.T
 	}
 	if !strings.HasPrefix(execution.TurnID, "turn_") || execution.ToolCallID != "call_1" || execution.ToolName != "fake_tool" || execution.ConversationRevision != 7 {
 		t.Fatalf("call scope = %#v, want generated turn and runtime-bound call", execution)
+	}
+}
+
+func TestHandleCommitsPendingWorkflowAfterConversationCAS(t *testing.T) {
+	sessions := &fakeSessions{
+		sess: &store.Session{ID: "session", UserID: "user", Name: "default", Current: true},
+		conv: &store.Conversation{Revision: 7},
+	}
+	client := &fakeToolLLM{
+		calls:     []tooltypes.Call{{ID: "call_1", Name: "fake_tool", Arguments: json.RawMessage(`{}`)}},
+		finalText: "authorization pending",
+	}
+	tool := &fakeTool{result: `{"status":"pending"}`, pendingWorkflowID: "req_pending"}
+	workflows := &fakeWorkflowContinuationManager{}
+	bot := New(sessions, testLLMConfig())
+	bot.NewLLM = func(config.ResolvedModel) llm.Client { return client }
+	bot.Workflows = workflows
+
+	err := bot.Handle(context.Background(), InboundMessage{
+		Platform:  store.PlatformFeishu,
+		AccountID: "feishu:cli_test",
+		UserKey:   "user",
+		LLMText:   "request access",
+		Tools:     []tooltypes.Tool{tool},
+	}, &fakeSender{})
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if sessions.saved == nil || sessions.saved.Revision != 8 {
+		t.Fatalf("saved conversation = %#v, want revision 8", sessions.saved)
+	}
+	if len(workflows.commits) != 1 || workflows.commits[0] != (workflowCommitCall{
+		requestID:         "req_pending",
+		accountID:         "feishu:cli_test",
+		committedRevision: 8,
+	}) {
+		t.Fatalf("workflow commits = %#v", workflows.commits)
+	}
+	if len(workflows.cancels) != 0 {
+		t.Fatalf("workflow cancels = %#v, want none", workflows.cancels)
+	}
+}
+
+func TestHandleCancelsPendingWorkflowWhenConversationCASFails(t *testing.T) {
+	saveErr := errors.New("conversation save failed")
+	sessions := &fakeSessions{
+		sess:    &store.Session{ID: "session", UserID: "user", Name: "default", Current: true},
+		conv:    &store.Conversation{Revision: 4},
+		saveErr: saveErr,
+	}
+	client := &fakeToolLLM{
+		calls:     []tooltypes.Call{{ID: "call_1", Name: "fake_tool", Arguments: json.RawMessage(`{}`)}},
+		finalText: "authorization pending",
+	}
+	workflows := &fakeWorkflowContinuationManager{}
+	bot := New(sessions, testLLMConfig())
+	bot.NewLLM = func(config.ResolvedModel) llm.Client { return client }
+	bot.Workflows = workflows
+
+	err := bot.Handle(context.Background(), InboundMessage{
+		Platform:  store.PlatformFeishu,
+		AccountID: "feishu:cli_test",
+		UserKey:   "user",
+		LLMText:   "request access",
+		Tools:     []tooltypes.Tool{&fakeTool{result: `{"status":"pending"}`, pendingWorkflowID: "req_pending"}},
+	}, &fakeSender{})
+	if !errors.Is(err, saveErr) {
+		t.Fatalf("Handle error = %v, want conversation save error", err)
+	}
+	if len(workflows.commits) != 0 {
+		t.Fatalf("workflow commits = %#v, want none", workflows.commits)
+	}
+	if len(workflows.cancels) != 1 || workflows.cancels[0].requestID != "req_pending" || workflows.cancels[0].accountID != "feishu:cli_test" {
+		t.Fatalf("workflow cancels = %#v", workflows.cancels)
+	}
+}
+
+func TestHandleCancelsPendingWorkflowWhenToolLoopCannotFinish(t *testing.T) {
+	turnErr := errors.New("tool follow-up failed")
+	sessions := &fakeSessions{sess: &store.Session{ID: "session", UserID: "user", Name: "default", Current: true}}
+	client := &fakeToolLLM{
+		calls:    []tooltypes.Call{{ID: "call_1", Name: "fake_tool", Arguments: json.RawMessage(`{}`)}},
+		turnErrs: map[int]error{1: turnErr},
+	}
+	workflows := &fakeWorkflowContinuationManager{}
+	bot := New(sessions, testLLMConfig())
+	bot.NewLLM = func(config.ResolvedModel) llm.Client { return client }
+	bot.Workflows = workflows
+
+	err := bot.Handle(context.Background(), InboundMessage{
+		Platform:  store.PlatformFeishu,
+		AccountID: "feishu:cli_test",
+		UserKey:   "user",
+		LLMText:   "request access",
+		Tools:     []tooltypes.Tool{&fakeTool{result: `{"status":"pending"}`, pendingWorkflowID: "req_pending"}},
+	}, &fakeSender{})
+	if !errors.Is(err, turnErr) {
+		t.Fatalf("Handle error = %v, want tool follow-up error", err)
+	}
+	if len(workflows.commits) != 0 || len(workflows.cancels) != 1 || workflows.cancels[0].requestID != "req_pending" {
+		t.Fatalf("workflow commits=%#v cancels=%#v", workflows.commits, workflows.cancels)
+	}
+}
+
+func TestHandleCancelsPendingWorkflowWhenContinuationCommitFails(t *testing.T) {
+	commitErr := errors.New("continuation commit failed")
+	sessions := &fakeSessions{sess: &store.Session{ID: "session", UserID: "user", Name: "default", Current: true}}
+	client := &fakeToolLLM{
+		calls:     []tooltypes.Call{{ID: "call_1", Name: "fake_tool", Arguments: json.RawMessage(`{}`)}},
+		finalText: "authorization pending",
+	}
+	workflows := &fakeWorkflowContinuationManager{commitErr: commitErr}
+	bot := New(sessions, testLLMConfig())
+	bot.NewLLM = func(config.ResolvedModel) llm.Client { return client }
+	bot.Workflows = workflows
+
+	err := bot.Handle(context.Background(), InboundMessage{
+		Platform:  store.PlatformFeishu,
+		AccountID: "feishu:cli_test",
+		UserKey:   "user",
+		LLMText:   "request access",
+		Tools:     []tooltypes.Tool{&fakeTool{result: `{"status":"pending"}`, pendingWorkflowID: "req_pending"}},
+	}, &fakeSender{})
+	if !errors.Is(err, commitErr) {
+		t.Fatalf("Handle error = %v, want continuation commit error", err)
+	}
+	if len(workflows.commits) != 1 || len(workflows.cancels) != 1 || workflows.cancels[0].requestID != "req_pending" {
+		t.Fatalf("workflow commits=%#v cancels=%#v", workflows.commits, workflows.cancels)
 	}
 }
 

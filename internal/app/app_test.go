@@ -490,6 +490,9 @@ func TestRuntimeStateEnablesTextStreamingOnlyForFeishu(t *testing.T) {
 	if feishuRuntime.handler.ToolProvider != state.mcpHost {
 		t.Fatal("feishu ToolProvider is not the runtime MCP host")
 	}
+	if feishuRuntime.handler.Workflows != feishuStore {
+		t.Fatal("feishu workflow continuation manager is not the platform store")
+	}
 	if err := state.Close(context.Background()); err != nil {
 		t.Fatalf("Close returned error: %v", err)
 	}

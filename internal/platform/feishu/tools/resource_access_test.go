@@ -82,6 +82,28 @@ func TestDocsResourceAccessToolRegistrationAndNormalization(t *testing.T) {
 	if !strings.Contains(result.Content, `"request_id":"req_access"`) || !strings.Contains(result.Content, `"source":"bot_owner"`) {
 		t.Fatalf("result content = %s", result.Content)
 	}
+	if result.PendingWorkflowID != "" {
+		t.Fatalf("granted PendingWorkflowID = %q, want empty", result.PendingWorkflowID)
+	}
+}
+
+func TestDocsResourceAccessToolReturnsPendingWorkflowID(t *testing.T) {
+	controller := &fakeResourceAccessController{result: ResourceAccessResult{
+		RequestID:     "req_pending",
+		Status:        ResourceAccessStatusPending,
+		Permission:    ResourcePermissionWrite,
+		ResourceType:  "docx",
+		ResourceToken: "doxcn_pending",
+	}}
+	tool := NewDocsResourceAccessTools(controller, Config{Docs: DocsToolsConfig{Enabled: true}})[0]
+	result := tool.Execute(context.Background(), tooltypes.Call{
+		ID:        "call_access",
+		Name:      ResourceAccessToolName,
+		Arguments: json.RawMessage(`{"resource_type":"docx","resource_token":"doxcn_pending","permission":"write"}`),
+	})
+	if result.IsError || result.PendingWorkflowID != "req_pending" {
+		t.Fatalf("Execute result = %#v, want pending workflow req_pending", result)
+	}
 }
 
 func TestDocsResourceAccessToolRejectsInvalidPermissionAndAliasType(t *testing.T) {

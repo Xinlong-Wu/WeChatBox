@@ -254,10 +254,11 @@ func runTool(ctx context.Context, tool tooltypes.Tool, call tooltypes.Call, time
 	case result = <-done:
 		if err := ctx.Err(); err != nil {
 			result = tooltypes.Result{
-				CallID:  call.ID,
-				Name:    call.Name,
-				Content: err.Error(),
-				IsError: true,
+				CallID:            call.ID,
+				Name:              call.Name,
+				Content:           err.Error(),
+				IsError:           true,
+				PendingWorkflowID: result.PendingWorkflowID,
 			}
 			trace.Status = "error"
 			trace.Error = result.Content

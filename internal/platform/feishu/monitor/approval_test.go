@@ -14,6 +14,7 @@ import (
 
 	feishutools "lingobridge/internal/platform/feishu/tools"
 	"lingobridge/internal/store"
+	tooltypes "lingobridge/internal/tools"
 )
 
 type fakeApprovalSender struct {
@@ -80,6 +81,16 @@ type failingGrantStore struct {
 
 func (f failingGrantStore) UpsertToolApprovalGrant(store.ToolApprovalGrant) (store.ToolApprovalGrant, error) {
 	return store.ToolApprovalGrant{}, f.err
+}
+
+type recordingToolApprovalStore struct {
+	toolApprovalStore
+	canceled []string
+}
+
+func (s *recordingToolApprovalStore) CancelWorkflowContinuation(requestID, accountID, reason string, now time.Time) error {
+	s.canceled = append(s.canceled, requestID)
+	return s.toolApprovalStore.CancelWorkflowContinuation(requestID, accountID, reason, now)
 }
 
 func (f *fakeApprovalExecutor) ApprovalToolName() string {
@@ -153,6 +164,18 @@ func TestApprovalManagerRequestsBoundCardWithoutDisplayingPayload(t *testing.T) 
 	}
 	if record.State != store.ToolApprovalStatePending || record.ActorOpenID != "ou_requester" || record.ChatID != "oc_chat" || record.CardMessageID != "om_card" || record.Payload != string(payload) {
 		t.Fatalf("stored approval = %#v, want actor/chat/card-bound pending record", record)
+	}
+	continuation, err := st.GetWorkflowContinuation(pending.RequestID, "feishu:cli_test")
+	if err != nil {
+		t.Fatalf("GetWorkflowContinuation returned error: %v", err)
+	}
+	if continuation.State != store.WorkflowContinuationStateWaiting || continuation.CommittedRevision != -1 ||
+		continuation.UserKey != "feishu:ou_requester" || continuation.SessionID != "session-work" ||
+		continuation.ChatID != "oc_chat" || continuation.SourceMessageID != "om_source" ||
+		continuation.ActorOpenID != "ou_requester" || continuation.OriginRevision != 7 ||
+		continuation.OriginTurnID != "turn-test" || continuation.ToolCallID != "call-test" ||
+		continuation.ToolName != "feishu_docs_create" {
+		t.Fatalf("stored continuation = %#v", continuation)
 	}
 }
 
@@ -437,6 +460,8 @@ func TestApprovalManagerFailsRequestWhenCardCannotBeSent(t *testing.T) {
 	st := openFeishuApprovalTestStore(t)
 	sender := &fakeApprovalSender{createErr: errors.New("send failed")}
 	manager := newTestApprovalManager(t, st, sender)
+	recordingStore := &recordingToolApprovalStore{toolApprovalStore: manager.store}
+	manager.store = recordingStore
 	if err := manager.registerExecutor(&fakeApprovalExecutor{name: "feishu_docs_create"}); err != nil {
 		t.Fatalf("registerExecutor returned error: %v", err)
 	}
@@ -448,6 +473,13 @@ func TestApprovalManagerFailsRequestWhenCardCannotBeSent(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "send feishu tool approval card") {
 		t.Fatalf("RequestApproval error = %v, want card send error", err)
+	}
+	if len(recordingStore.canceled) != 1 || recordingStore.canceled[0] == "" {
+		t.Fatalf("canceled continuations = %#v, want one request", recordingStore.canceled)
+	}
+	continuation, loadErr := st.GetWorkflowContinuation(recordingStore.canceled[0], "feishu:cli_test")
+	if loadErr != nil || continuation.State != store.WorkflowContinuationStateCanceled {
+		t.Fatalf("failed approval continuation = %#v err=%v, want canceled", continuation, loadErr)
 	}
 }
 
@@ -501,8 +533,29 @@ func newTestApprovalManager(t *testing.T, st *store.Store, sender *fakeApprovalS
 }
 
 func approvalRequestContext() context.Context {
-	ctx := feishutools.WithActor(context.Background(), feishutools.Actor{OpenID: "ou_requester", UserID: "u_requester"})
-	return feishutools.WithChatContext(ctx, feishutools.ChatContext{ChatID: "oc_chat", MessageID: "om_source", IsGroup: true})
+	return workflowRequestContext("feishu_docs_create")
+}
+
+func resourceAccessRequestContext() context.Context {
+	return workflowRequestContext(feishutools.ResourceAccessToolName)
+}
+
+func workflowRequestContext(toolName string) context.Context {
+	return tooltypes.WithExecutionContext(context.Background(), tooltypes.ExecutionContext{
+		Platform:             store.PlatformFeishu,
+		AccountID:            "feishu:cli_test",
+		UserKey:              "feishu:ou_requester",
+		SessionID:            "session-work",
+		ChatID:               "oc_chat",
+		SourceMessageID:      "om_source",
+		ActorOpenID:          "ou_requester",
+		ActorUserID:          "u_requester",
+		ChatIsGroup:          true,
+		ConversationRevision: 7,
+		TurnID:               "turn-test",
+		ToolCallID:           "call-test",
+		ToolName:             toolName,
+	})
 }
 
 func requestTestApproval(t *testing.T, manager *approvalManager) feishutools.PendingApproval {

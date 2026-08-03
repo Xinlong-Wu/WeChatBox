@@ -237,6 +237,9 @@ func TestDocsCreateToolReturnsPendingApprovalWithoutCallingFeishuDocs(t *testing
 	if result.IsError {
 		t.Fatalf("Execute result = %#v, want pending approval success", result)
 	}
+	if result.PendingWorkflowID != "req_123" {
+		t.Fatalf("PendingWorkflowID = %q, want req_123", result.PendingWorkflowID)
+	}
 	var output pendingApprovalOutput
 	if err := json.Unmarshal([]byte(result.Content), &output); err != nil {
 		t.Fatalf("unmarshal pending output: %v", err)

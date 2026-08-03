@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -39,7 +40,7 @@ func TestResourceAccessManagerGrantsBotRootWithoutCard(t *testing.T) {
 	defer server.Close()
 
 	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
-	result, err := manager.RequestAccess(approvalRequestContext(), feishutools.ResourceAccessRequest{
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
 		ResourceType:  "folder",
 		ResourceToken: feishutools.BotRootResourceAlias,
 		Permission:    feishutools.ResourcePermissionWrite,
@@ -61,7 +62,10 @@ func TestResourceAccessManagerGrantsBotRootWithoutCard(t *testing.T) {
 	if _, err := st.GetFeishuBotResource("feishu:cli_test", "folder", "fld_bot_root"); err != nil {
 		t.Fatalf("Bot root ownership was not stored: %v", err)
 	}
-	validated, err := manager.ValidateAccess(approvalRequestContext(), feishutools.ResourceAccessValidation{
+	if _, err := st.GetWorkflowContinuation(result.RequestID, "feishu:cli_test"); !errors.Is(err, store.ErrWorkflowContinuationNotFound) {
+		t.Fatalf("Bot-owned request continuation error = %v, want ErrWorkflowContinuationNotFound", err)
+	}
+	validated, err := manager.ValidateAccess(resourceAccessRequestContext(), feishutools.ResourceAccessValidation{
 		RequestID:     result.RequestID,
 		ResourceType:  "folder",
 		ResourceToken: "fld_bot_root",
@@ -90,7 +94,7 @@ func TestResourceAccessManagerConsumesOnceAndRejectsExpiredGrant(t *testing.T) {
 	defer server.Close()
 
 	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
-	ctx := approvalRequestContext()
+	ctx := resourceAccessRequestContext()
 	request := feishutools.ResourceAccessRequest{
 		ResourceType:  "folder",
 		ResourceToken: feishutools.BotRootResourceAlias,
@@ -164,7 +168,7 @@ func TestResourceAccessManagerReusesOnlyLiveExactChatGrant(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertFeishuResourceGrant returned error: %v", err)
 	}
-	result, err := manager.RequestAccess(approvalRequestContext(), feishutools.ResourceAccessRequest{
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
 		ResourceType:  "docx",
 		ResourceToken: "doxcn_external",
 		Permission:    feishutools.ResourcePermissionRead,
@@ -219,7 +223,7 @@ func TestResourceAccessOAuthTokenErrorDoesNotExposeSupportInstructions(t *testin
 		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
 	}
 	manager, st, sender := newTestResourceAccessManager(t, server, oauth)
-	result, err := manager.RequestAccess(approvalRequestContext(), feishutools.ResourceAccessRequest{
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
 		ResourceType:  "docx",
 		ResourceToken: "doxcn_external",
 		Permission:    feishutools.ResourcePermissionWrite,
@@ -424,7 +428,7 @@ func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 		oauth.CallbackListenAddress = "127.0.0.1:0"
 	}
 	manager, st, sender := newTestResourceAccessManager(t, server, oauth)
-	result, err := manager.RequestAccess(approvalRequestContext(), feishutools.ResourceAccessRequest{
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
 		ResourceType:  "docx",
 		ResourceToken: "doxcn_external",
 		ResourceURL:   "https://docs.feishu.cn/docx/doxcn_external",
@@ -456,6 +460,18 @@ func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 	storedPending, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
 	if err != nil || storedPending.OAuthStateHash == "" || storedPending.OAuthStateHash == state || storedPending.PKCEVerifier != "" {
 		t.Fatalf("stored pending request = %#v err=%v", storedPending, err)
+	}
+	continuation, err := st.GetWorkflowContinuation(result.RequestID, "feishu:cli_test")
+	if err != nil {
+		t.Fatalf("GetWorkflowContinuation returned error: %v", err)
+	}
+	if continuation.State != store.WorkflowContinuationStateWaiting || continuation.CommittedRevision != -1 ||
+		continuation.UserKey != "feishu:ou_requester" || continuation.SessionID != "session-work" ||
+		continuation.ChatID != "oc_chat" || continuation.SourceMessageID != "om_source" ||
+		continuation.ActorOpenID != "ou_requester" || continuation.OriginRevision != 7 ||
+		continuation.OriginTurnID != "turn-test" || continuation.ToolCallID != "call-test" ||
+		continuation.ToolName != feishutools.ResourceAccessToolName {
+		t.Fatalf("stored continuation = %#v", continuation)
 	}
 
 	expectedCode := "auth-code"
@@ -601,7 +617,7 @@ func TestResourceAccessManagerRejectsNonFeishuRedirectURL(t *testing.T) {
 	}))
 	defer server.Close()
 	manager, _, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
-	_, err := manager.RequestAccess(approvalRequestContext(), feishutools.ResourceAccessRequest{
+	_, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
 		ResourceType:  "docx",
 		ResourceToken: "doxcn_external",
 		ResourceURL:   "https://example.com/doxcn_external",
@@ -623,7 +639,7 @@ func TestResourceAccessCardRejectIsBoundToRequester(t *testing.T) {
 		CallbackURL:           "https://bridge.example.com/feishu/oauth/callback",
 		CallbackListenAddress: "127.0.0.1:0",
 	})
-	result, err := manager.RequestAccess(approvalRequestContext(), feishutools.ResourceAccessRequest{
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
 		ResourceType:  "docx",
 		ResourceToken: "doxcn_external",
 		Permission:    feishutools.ResourcePermissionRead,
@@ -800,7 +816,7 @@ func TestResourceAccessOAuthCardHandoffRejectsWrongUserAndState(t *testing.T) {
 		BaseURL:     server.URL,
 		CallbackURL: "https://oauth.wulongxin.com/feishu/oauth/callback",
 	})
-	result, err := manager.RequestAccess(approvalRequestContext(), feishutools.ResourceAccessRequest{
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
 		ResourceType:  "docx",
 		ResourceToken: "doxcn_external",
 		Permission:    feishutools.ResourcePermissionRead,
