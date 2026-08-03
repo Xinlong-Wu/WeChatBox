@@ -108,12 +108,9 @@ type FeishuResourceGrant struct {
 	ResourceType    string
 	ResourceToken   string
 	Permission      string
-	SubjectType     string
-	SubjectID       string
 	SourceRequestID string
 	State           string
 	CreatedAt       time.Time
-	VerifiedAt      time.Time
 	UpdatedAt       time.Time
 }
 
@@ -531,9 +528,15 @@ func (s *Store) DenyFeishuResourceAccessRequest(id, accountID string, match Feis
 	return request, nil
 }
 
-// CompleteFeishuResourceAccessRequest marks a request as verified and optionally
-// upserts the durable chat-scoped grant in the same transaction.
-func (s *Store) CompleteFeishuResourceAccessRequest(id, accountID, source, verifiedPermission string, grant *FeishuResourceGrant, now time.Time) error {
+// CompleteFeishuResourceAccessRequest marks a request as verified and
+// optionally upserts the Feishu-side capability and chat-scoped LingoBridge
+// grant in the same transaction.
+func (s *Store) CompleteFeishuResourceAccessRequest(
+	id, accountID, source, verifiedPermission string,
+	capability *FeishuResourceCapability,
+	grant *FeishuResourceGrant,
+	now time.Time,
+) error {
 	if err := s.requireFeishuDocsStore(); err != nil {
 		return err
 	}
@@ -545,9 +548,24 @@ func (s *Store) CompleteFeishuResourceAccessRequest(id, accountID, source, verif
 		return fmt.Errorf("feishu resource access id, account, source, and verified permission are required")
 	}
 	now = normalizedWorkflowTime(now)
+	var normalizedCapability FeishuResourceCapability
 	var normalizedGrant FeishuResourceGrant
 	subjectType := ""
 	subjectID := ""
+	if capability != nil {
+		normalizedCapability = normalizeFeishuResourceCapability(*capability)
+		if err := validateFeishuResourceCapability(normalizedCapability); err != nil {
+			return err
+		}
+		if normalizedCapability.AccountID != accountID || normalizedCapability.SourceRequestID != id {
+			return fmt.Errorf("feishu resource capability account and source request must match the access request")
+		}
+		if !FeishuResourcePermissionSatisfies(normalizedCapability.Permission, verifiedPermission) {
+			return fmt.Errorf("feishu resource capability does not satisfy the verified permission")
+		}
+		subjectType = normalizedCapability.SubjectType
+		subjectID = normalizedCapability.SubjectID
+	}
 	if grant != nil {
 		normalizedGrant = normalizeFeishuResourceGrant(*grant)
 		if err := validateFeishuResourceGrant(normalizedGrant); err != nil {
@@ -556,8 +574,15 @@ func (s *Store) CompleteFeishuResourceAccessRequest(id, accountID, source, verif
 		if normalizedGrant.AccountID != accountID || normalizedGrant.SourceRequestID != id {
 			return fmt.Errorf("feishu resource grant account and source request must match the access request")
 		}
-		subjectType = normalizedGrant.SubjectType
-		subjectID = normalizedGrant.SubjectID
+		if !FeishuResourcePermissionSatisfies(normalizedGrant.Permission, verifiedPermission) {
+			return fmt.Errorf("feishu resource grant does not satisfy the verified permission")
+		}
+	}
+	if capability != nil && grant != nil {
+		if normalizedCapability.ResourceType != normalizedGrant.ResourceType ||
+			normalizedCapability.ResourceToken != normalizedGrant.ResourceToken {
+			return fmt.Errorf("feishu resource capability and grant must describe the same resource")
+		}
 	}
 
 	s.mu.Lock()
@@ -583,6 +608,11 @@ func (s *Store) CompleteFeishuResourceAccessRequest(id, accountID, source, verif
 	}
 	if err := requireOneFeishuResourceAccessRow(result); err != nil {
 		return err
+	}
+	if capability != nil {
+		if err := upsertFeishuResourceCapability(tx, normalizedCapability); err != nil {
+			return err
+		}
 	}
 	if grant != nil {
 		if err := upsertFeishuResourceGrant(tx, normalizedGrant); err != nil {
@@ -750,8 +780,7 @@ func (s *Store) ActiveFeishuResourceGrant(accountID, chatID, resourceType, resou
 	}
 	grant, err := scanFeishuResourceGrant(s.db.QueryRow(
 		`SELECT account_id, chat_id, resource_type, resource_token, permission,
-		 subject_type, subject_id, source_request_id, state,
-		 created_at_ms, verified_at_ms, updated_at_ms
+		 source_request_id, state, created_at_ms, updated_at_ms
 		 FROM feishu_resource_grants
 		 WHERE account_id=? AND chat_id=? AND resource_type=? AND resource_token=? AND state=?`,
 		strings.TrimSpace(accountID), strings.TrimSpace(chatID), strings.TrimSpace(resourceType), strings.TrimSpace(resourceToken), FeishuResourceGrantStateActive,
@@ -882,19 +911,16 @@ func scanFeishuResourceAccessRequest(row feishuResourceAccessScanner) (FeishuRes
 
 func scanFeishuResourceGrant(row feishuResourceAccessScanner) (FeishuResourceGrant, error) {
 	var grant FeishuResourceGrant
-	var createdAtMS, verifiedAtMS, updatedAtMS int64
+	var createdAtMS, updatedAtMS int64
 	if err := row.Scan(
 		&grant.AccountID,
 		&grant.ChatID,
 		&grant.ResourceType,
 		&grant.ResourceToken,
 		&grant.Permission,
-		&grant.SubjectType,
-		&grant.SubjectID,
 		&grant.SourceRequestID,
 		&grant.State,
 		&createdAtMS,
-		&verifiedAtMS,
 		&updatedAtMS,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -903,7 +929,6 @@ func scanFeishuResourceGrant(row feishuResourceAccessScanner) (FeishuResourceGra
 		return FeishuResourceGrant{}, fmt.Errorf("get feishu resource grant: %w", err)
 	}
 	grant.CreatedAt = time.UnixMilli(createdAtMS).UTC()
-	grant.VerifiedAt = time.UnixMilli(verifiedAtMS).UTC()
 	grant.UpdatedAt = time.UnixMilli(updatedAtMS).UTC()
 	return grant, nil
 }
@@ -974,23 +999,24 @@ func normalizeFeishuResourceGrant(grant FeishuResourceGrant) FeishuResourceGrant
 	grant.ResourceType = strings.TrimSpace(grant.ResourceType)
 	grant.ResourceToken = strings.TrimSpace(grant.ResourceToken)
 	grant.Permission = strings.TrimSpace(grant.Permission)
-	grant.SubjectType = strings.TrimSpace(grant.SubjectType)
-	grant.SubjectID = strings.TrimSpace(grant.SubjectID)
 	grant.SourceRequestID = strings.TrimSpace(grant.SourceRequestID)
 	grant.State = strings.TrimSpace(grant.State)
 	if grant.State == "" {
 		grant.State = FeishuResourceGrantStateActive
 	}
 	grant.CreatedAt = normalizedWorkflowTime(grant.CreatedAt)
-	grant.VerifiedAt = normalizedWorkflowTime(grant.VerifiedAt)
-	grant.UpdatedAt = grant.VerifiedAt
+	if grant.UpdatedAt.IsZero() {
+		grant.UpdatedAt = grant.CreatedAt
+	} else {
+		grant.UpdatedAt = grant.UpdatedAt.UTC()
+	}
 	return grant
 }
 
 func validateFeishuResourceGrant(grant FeishuResourceGrant) error {
 	if grant.AccountID == "" || grant.ChatID == "" || grant.ResourceType == "" || grant.ResourceToken == "" ||
-		grant.SubjectType == "" || grant.SubjectID == "" || grant.SourceRequestID == "" || !validFeishuResourcePermission(grant.Permission) {
-		return fmt.Errorf("feishu resource grant account, chat, resource, permission, subject, and source request are required")
+		grant.SourceRequestID == "" || !validFeishuResourcePermission(grant.Permission) {
+		return fmt.Errorf("feishu resource grant account, chat, resource, permission, and source request are required")
 	}
 	if grant.State != FeishuResourceGrantStateActive && grant.State != FeishuResourceGrantStateRevoked {
 		return fmt.Errorf("unsupported feishu resource grant state %q", grant.State)
@@ -1054,32 +1080,25 @@ func upsertFeishuResourceGrant(execer feishuResourceGrantExecer, grant FeishuRes
 	_, err := execer.Exec(
 		`INSERT INTO feishu_resource_grants (
 			account_id, chat_id, resource_type, resource_token, permission,
-			subject_type, subject_id, source_request_id, state,
-			created_at_ms, verified_at_ms, updated_at_ms
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			source_request_id, state, created_at_ms, updated_at_ms
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(account_id, chat_id, resource_type, resource_token) DO UPDATE SET
 			permission=CASE
 				WHEN (feishu_resource_grants.state='active' AND feishu_resource_grants.permission='write')
 					OR excluded.permission='write' THEN 'write'
 				ELSE 'read'
 			END,
-			subject_type=excluded.subject_type,
-			subject_id=excluded.subject_id,
 			source_request_id=excluded.source_request_id,
 			state=excluded.state,
-			verified_at_ms=excluded.verified_at_ms,
 			updated_at_ms=excluded.updated_at_ms`,
 		grant.AccountID,
 		grant.ChatID,
 		grant.ResourceType,
 		grant.ResourceToken,
 		grant.Permission,
-		grant.SubjectType,
-		grant.SubjectID,
 		grant.SourceRequestID,
 		grant.State,
 		grant.CreatedAt.UnixMilli(),
-		grant.VerifiedAt.UnixMilli(),
 		grant.UpdatedAt.UnixMilli(),
 	)
 	if err != nil {

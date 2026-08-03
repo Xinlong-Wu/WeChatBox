@@ -173,14 +173,27 @@ func (s *Store) migrate() error {
 			resource_type TEXT NOT NULL,
 			resource_token TEXT NOT NULL,
 			permission TEXT NOT NULL,
+			source_request_id TEXT NOT NULL,
+			state TEXT NOT NULL,
+			created_at_ms INTEGER NOT NULL,
+			updated_at_ms INTEGER NOT NULL,
+			PRIMARY KEY (account_id, chat_id, resource_type, resource_token)
+		)`,
+		`CREATE TABLE IF NOT EXISTS feishu_resource_capabilities (
+			account_id TEXT NOT NULL,
+			resource_type TEXT NOT NULL,
+			resource_token TEXT NOT NULL,
 			subject_type TEXT NOT NULL,
 			subject_id TEXT NOT NULL,
+			permission TEXT NOT NULL,
+			source_actor_open_id TEXT NOT NULL DEFAULT '',
+			source_actor_user_id TEXT NOT NULL DEFAULT '',
 			source_request_id TEXT NOT NULL,
 			state TEXT NOT NULL,
 			created_at_ms INTEGER NOT NULL,
 			verified_at_ms INTEGER NOT NULL,
 			updated_at_ms INTEGER NOT NULL,
-			PRIMARY KEY (account_id, chat_id, resource_type, resource_token)
+			PRIMARY KEY (account_id, resource_type, resource_token, subject_type, subject_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS feishu_user_oauth_credentials (
 			id TEXT PRIMARY KEY,
@@ -217,6 +230,9 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if err := s.ensureWorkflowContinuationContextColumns(); err != nil {
+		return err
+	}
+	if err := s.migrateFeishuResourceCapabilities(); err != nil {
 		return err
 	}
 	if _, err := s.db.Exec(
@@ -263,6 +279,8 @@ func (s *Store) migrate() error {
 			 ON feishu_resource_access_requests(account_id, state, expires_at_ms)`,
 		`CREATE INDEX IF NOT EXISTS idx_feishu_resource_grants_account_chat
 			 ON feishu_resource_grants(account_id, chat_id, state, updated_at_ms)`,
+		`CREATE INDEX IF NOT EXISTS idx_feishu_resource_capabilities_account_resource
+			 ON feishu_resource_capabilities(account_id, resource_type, resource_token, state, updated_at_ms)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_feishu_user_oauth_open_id
 			 ON feishu_user_oauth_credentials(account_id, actor_open_id) WHERE actor_open_id<>''`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_feishu_user_oauth_user_id
@@ -346,6 +364,78 @@ func (s *Store) tableHasColumn(tableName, columnName string) (bool, error) {
 		return false, err
 	}
 	return false, nil
+}
+
+func (s *Store) migrateFeishuResourceCapabilities() error {
+	hasLegacySubject, err := s.tableHasColumn("feishu_resource_grants", "subject_type")
+	if err != nil {
+		return fmt.Errorf("inspect legacy feishu resource grant schema: %w", err)
+	}
+	if !hasLegacySubject {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin feishu resource capability migration: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
+		`INSERT OR IGNORE INTO feishu_resource_capabilities (
+			account_id, resource_type, resource_token, subject_type, subject_id,
+			permission, source_actor_open_id, source_actor_user_id, source_request_id,
+			state, created_at_ms, verified_at_ms, updated_at_ms
+		) SELECT grants.account_id, grants.resource_type, grants.resource_token,
+			grants.subject_type, grants.subject_id, grants.permission,
+			COALESCE(requests.actor_open_id, ''), COALESCE(requests.actor_user_id, ''),
+			grants.source_request_id, grants.state, grants.created_at_ms,
+			grants.verified_at_ms, grants.updated_at_ms
+		  FROM feishu_resource_grants AS grants
+		  LEFT JOIN feishu_resource_access_requests AS requests
+		    ON requests.id=grants.source_request_id AND requests.account_id=grants.account_id
+		 WHERE grants.subject_type<>'' AND grants.subject_id<>''`,
+	); err != nil {
+		return fmt.Errorf("backfill feishu resource capabilities: %w", err)
+	}
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS feishu_resource_grants_migrated`); err != nil {
+		return fmt.Errorf("remove stale migrated feishu resource grant table: %w", err)
+	}
+	if _, err := tx.Exec(
+		`CREATE TABLE feishu_resource_grants_migrated (
+			account_id TEXT NOT NULL,
+			chat_id TEXT NOT NULL,
+			resource_type TEXT NOT NULL,
+			resource_token TEXT NOT NULL,
+			permission TEXT NOT NULL,
+			source_request_id TEXT NOT NULL,
+			state TEXT NOT NULL,
+			created_at_ms INTEGER NOT NULL,
+			updated_at_ms INTEGER NOT NULL,
+			PRIMARY KEY (account_id, chat_id, resource_type, resource_token)
+		)`,
+	); err != nil {
+		return fmt.Errorf("create migrated feishu resource grant table: %w", err)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO feishu_resource_grants_migrated (
+			account_id, chat_id, resource_type, resource_token, permission,
+			source_request_id, state, created_at_ms, updated_at_ms
+		) SELECT account_id, chat_id, resource_type, resource_token, permission,
+			source_request_id, state, created_at_ms, updated_at_ms
+		  FROM feishu_resource_grants`,
+	); err != nil {
+		return fmt.Errorf("copy migrated feishu resource grants: %w", err)
+	}
+	if _, err := tx.Exec(`DROP TABLE feishu_resource_grants`); err != nil {
+		return fmt.Errorf("drop legacy feishu resource grant table: %w", err)
+	}
+	if _, err := tx.Exec(`ALTER TABLE feishu_resource_grants_migrated RENAME TO feishu_resource_grants`); err != nil {
+		return fmt.Errorf("activate migrated feishu resource grant table: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit feishu resource capability migration: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) ensureFeishuResourceAccessConsumptionColumns() error {

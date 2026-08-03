@@ -153,18 +153,31 @@ func TestResourceAccessManagerReusesOnlyLiveExactChatGrant(t *testing.T) {
 
 	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
 	now := manager.currentTime()
+	if _, err := st.UpsertFeishuResourceCapability(store.FeishuResourceCapability{
+		AccountID:         "feishu:cli_test",
+		ResourceType:      "docx",
+		ResourceToken:     "doxcn_external",
+		Permission:        store.FeishuResourcePermissionWrite,
+		SubjectType:       "openid",
+		SubjectID:         "ou_bot",
+		SourceActorOpenID: "ou_requester",
+		SourceRequestID:   "req_original",
+		State:             store.FeishuResourceCapabilityStateActive,
+		CreatedAt:         now,
+		VerifiedAt:        now,
+	}); err != nil {
+		t.Fatalf("UpsertFeishuResourceCapability returned error: %v", err)
+	}
 	if _, err := st.UpsertFeishuResourceGrant(store.FeishuResourceGrant{
 		AccountID:       "feishu:cli_test",
 		ChatID:          "oc_chat",
 		ResourceType:    "docx",
 		ResourceToken:   "doxcn_external",
 		Permission:      store.FeishuResourcePermissionWrite,
-		SubjectType:     "openid",
-		SubjectID:       "ou_bot",
 		SourceRequestID: "req_original",
 		State:           store.FeishuResourceGrantStateActive,
 		CreatedAt:       now,
-		VerifiedAt:      now,
+		UpdatedAt:       now,
 	}); err != nil {
 		t.Fatalf("UpsertFeishuResourceGrant returned error: %v", err)
 	}
@@ -185,6 +198,112 @@ func TestResourceAccessManagerReusesOnlyLiveExactChatGrant(t *testing.T) {
 	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
 	if err != nil || request.SubjectType != "openid" || request.SubjectID != "ou_bot" || request.VerifiedPermission != store.FeishuResourcePermissionWrite {
 		t.Fatalf("existing grant request = %#v err=%v", request, err)
+	}
+}
+
+func TestResourceAccessManagerDoesNotReuseGrantWithoutActiveCapability(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected Feishu API request without active capability: %s", r.URL.Path)
+	}))
+	defer server.Close()
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
+	now := manager.currentTime()
+	if _, err := st.UpsertFeishuResourceGrant(store.FeishuResourceGrant{
+		AccountID:       "feishu:cli_test",
+		ChatID:          "oc_chat",
+		ResourceType:    "docx",
+		ResourceToken:   "doxcn_external",
+		Permission:      store.FeishuResourcePermissionWrite,
+		SourceRequestID: "req_original",
+		State:           store.FeishuResourceGrantStateActive,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}); err != nil {
+		t.Fatalf("UpsertFeishuResourceGrant returned error: %v", err)
+	}
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType:  "docx",
+		ResourceToken: "doxcn_external",
+		Permission:    feishutools.ResourcePermissionRead,
+	})
+	if err != nil {
+		t.Fatalf("RequestAccess returned error: %v", err)
+	}
+	if result.Status != feishutools.ResourceAccessStatusUnsupported || result.Source != "" {
+		t.Fatalf("missing-capability result = %#v", result)
+	}
+	if _, active, err := st.ActiveFeishuResourceGrant(
+		"feishu:cli_test", "oc_chat", "docx", "doxcn_external", store.FeishuResourcePermissionRead,
+	); err != nil || active {
+		t.Fatalf("stale local grant active=%t err=%v, want false", active, err)
+	}
+	if cards, _, _ := sender.snapshot(); len(cards) != 0 {
+		t.Fatalf("missing-capability cards = %#v, want none without OAuth", cards)
+	}
+}
+
+func TestResourceAccessManagerKeepsCapabilityOnTransientLiveCheckError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+		case "/open-apis/drive/v1/permissions/doxcn_external/members/auth":
+			w.WriteHeader(http.StatusInternalServerError)
+			writeResourceAccessJSON(t, w, map[string]any{"code": 99999, "msg": "temporary failure"})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
+	now := manager.currentTime()
+	if _, err := st.UpsertFeishuResourceCapability(store.FeishuResourceCapability{
+		AccountID:         "feishu:cli_test",
+		ResourceType:      "docx",
+		ResourceToken:     "doxcn_external",
+		Permission:        store.FeishuResourcePermissionWrite,
+		SubjectType:       "openid",
+		SubjectID:         "ou_bot",
+		SourceActorOpenID: "ou_requester",
+		SourceRequestID:   "req_original",
+		State:             store.FeishuResourceCapabilityStateActive,
+		CreatedAt:         now,
+		VerifiedAt:        now,
+	}); err != nil {
+		t.Fatalf("UpsertFeishuResourceCapability returned error: %v", err)
+	}
+	if _, err := st.UpsertFeishuResourceGrant(store.FeishuResourceGrant{
+		AccountID:       "feishu:cli_test",
+		ChatID:          "oc_chat",
+		ResourceType:    "docx",
+		ResourceToken:   "doxcn_external",
+		Permission:      store.FeishuResourcePermissionWrite,
+		SourceRequestID: "req_original",
+		State:           store.FeishuResourceGrantStateActive,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}); err != nil {
+		t.Fatalf("UpsertFeishuResourceGrant returned error: %v", err)
+	}
+	if _, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType:  "docx",
+		ResourceToken: "doxcn_external",
+		Permission:    feishutools.ResourcePermissionRead,
+	}); err == nil || !strings.Contains(err.Error(), "live-check existing feishu resource capability") {
+		t.Fatalf("transient live-check error = %v", err)
+	}
+	if _, active, err := st.ActiveFeishuResourceCapability(
+		"feishu:cli_test", "docx", "doxcn_external", "openid", "ou_bot", store.FeishuResourcePermissionRead,
+	); err != nil || !active {
+		t.Fatalf("capability after transient error active=%t err=%v, want true", active, err)
+	}
+	if _, active, err := st.ActiveFeishuResourceGrant(
+		"feishu:cli_test", "oc_chat", "docx", "doxcn_external", store.FeishuResourcePermissionRead,
+	); err != nil || !active {
+		t.Fatalf("grant after transient error active=%t err=%v, want true", active, err)
+	}
+	if cards, _, _ := sender.snapshot(); len(cards) != 0 {
+		t.Fatalf("transient live-check cards = %#v, want none", cards)
 	}
 }
 
@@ -536,8 +655,12 @@ func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 		t.Fatalf("completed workflow result = %#v err=%v", workflowResult, err)
 	}
 	grant, active, err := st.ActiveFeishuResourceGrant("feishu:cli_test", "oc_chat", "docx", "doxcn_external", store.FeishuResourcePermissionWrite)
-	if err != nil || !active || grant.SubjectID != "ou_bot" {
+	if err != nil || !active || grant.SourceRequestID != result.RequestID {
 		t.Fatalf("saved grant = %#v active=%t err=%v", grant, active, err)
+	}
+	capability, active, err := st.ActiveFeishuResourceCapability("feishu:cli_test", "docx", "doxcn_external", "openid", "ou_bot", store.FeishuResourcePermissionWrite)
+	if err != nil || !active || capability.SourceActorOpenID != "ou_requester" || capability.SourceRequestID != result.RequestID {
+		t.Fatalf("saved capability = %#v active=%t err=%v", capability, active, err)
 	}
 	credential, err := st.GetFeishuUserOAuthCredential("feishu:cli_test", "ou_requester", "u_requester")
 	if err != nil || credential.Status != store.FeishuUserOAuthCredentialStatusActive || credential.Version != 1 ||

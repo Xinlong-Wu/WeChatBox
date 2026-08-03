@@ -196,9 +196,25 @@ func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
 			FeishuResourceGrantSourceBotOwner,
 			FeishuResourcePermissionWrite,
 			nil,
+			nil,
 			now,
 		); err != nil {
 			t.Fatalf("CompleteFeishuResourceAccessRequest returned error: %v", err)
+		}
+		if _, err := st.UpsertFeishuResourceCapability(FeishuResourceCapability{
+			AccountID:         accountID,
+			ResourceType:      "folder",
+			ResourceToken:     folder.FolderToken,
+			SubjectType:       "openchat",
+			SubjectID:         folder.ChatID,
+			Permission:        FeishuResourcePermissionWrite,
+			SourceActorOpenID: "ou_requester",
+			SourceRequestID:   access.ID,
+			State:             FeishuResourceCapabilityStateActive,
+			CreatedAt:         now,
+			VerifiedAt:        now,
+		}); err != nil {
+			t.Fatalf("UpsertFeishuResourceCapability returned error: %v", err)
 		}
 		if _, err := st.SaveFeishuUserOAuthCredential(FeishuUserOAuthCredential{
 			AccountID:              accountID,
@@ -251,6 +267,16 @@ func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
 	}
 	if _, err := st.GetFeishuUserOAuthCredential("feishu:second", "ou_requester", "u_requester"); err != nil {
 		t.Fatalf("other account OAuth credential was deleted: %v", err)
+	}
+	if _, active, err := st.ActiveFeishuResourceCapability(
+		"feishu:first", "folder", "fld_feishu:first", "openchat", "oc_chat", FeishuResourcePermissionRead,
+	); err != nil || active {
+		t.Fatalf("deleted account capability active=%t err=%v, want false", active, err)
+	}
+	if _, active, err := st.ActiveFeishuResourceCapability(
+		"feishu:second", "folder", "fld_feishu:second", "openchat", "oc_chat", FeishuResourcePermissionRead,
+	); err != nil || !active {
+		t.Fatalf("other account capability active=%t err=%v, want true", active, err)
 	}
 	var deletedAccessID string
 	if err := st.db.QueryRow(

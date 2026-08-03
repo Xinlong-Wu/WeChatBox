@@ -83,6 +83,14 @@ func TestWorkflowMigrationBackfillsApprovalsAndRenamesGrantSource(t *testing.T) 
 			updated_at_ms INTEGER NOT NULL,
 			PRIMARY KEY (account_id, chat_id, folder_token)
 		)`,
+		`CREATE TABLE feishu_resource_grants (
+			account_id TEXT NOT NULL, chat_id TEXT NOT NULL, resource_type TEXT NOT NULL,
+			resource_token TEXT NOT NULL, permission TEXT NOT NULL, subject_type TEXT NOT NULL,
+			subject_id TEXT NOT NULL, source_request_id TEXT NOT NULL, state TEXT NOT NULL,
+			created_at_ms INTEGER NOT NULL, verified_at_ms INTEGER NOT NULL,
+			updated_at_ms INTEGER NOT NULL,
+			PRIMARY KEY (account_id, chat_id, resource_type, resource_token)
+		)`,
 		`INSERT INTO tool_approvals VALUES (
 			'legacy_request', 'feishu:cli_test', 'feishu_docs_create', 'ou_requester', '',
 			'oc_chat', 'om_source', 'om_card', '{}', 'pending', 1, 60001, 1
@@ -95,6 +103,10 @@ func TestWorkflowMigrationBackfillsApprovalsAndRenamesGrantSource(t *testing.T) 
 			'feishu:cli_test', 'oc_chat', 'fld_legacy', 'Legacy Folder',
 			'https://docs.feishu.cn/drive/folder/fld_legacy', '', 1, 'openchat', 'oc_chat',
 			'succeeded', 'req_folder', 'ou_requester', 'u_requester', 1, 1
+		)`,
+		`INSERT INTO feishu_resource_grants VALUES (
+			'feishu:cli_test', 'oc_chat', 'docx', 'doxcn_legacy', 'write',
+			'openid', 'ou_bot', 'req_legacy_access', 'active', 1, 2, 2
 		)`,
 	}
 	for _, statement := range statements {
@@ -126,5 +138,14 @@ func TestWorkflowMigrationBackfillsApprovalsAndRenamesGrantSource(t *testing.T) 
 	resource, err := st.GetFeishuBotResource("feishu:cli_test", "folder", "fld_legacy")
 	if err != nil || resource.Name != "Legacy Folder" || resource.SourceRequestID != "req_folder" {
 		t.Fatalf("backfilled bot resource = %#v err=%v", resource, err)
+	}
+	capability, active, err := st.ActiveFeishuResourceCapability(
+		"feishu:cli_test", "docx", "doxcn_legacy", "openid", "ou_bot", FeishuResourcePermissionRead,
+	)
+	if err != nil || !active || capability.Permission != FeishuResourcePermissionWrite || capability.SourceRequestID != "req_legacy_access" {
+		t.Fatalf("backfilled resource capability = %#v active=%t err=%v", capability, active, err)
+	}
+	if hasLegacySubject, err := st.tableHasColumn("feishu_resource_grants", "subject_type"); err != nil || hasLegacySubject {
+		t.Fatalf("migrated resource grant subject column present=%t err=%v", hasLegacySubject, err)
 	}
 }

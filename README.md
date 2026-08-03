@@ -381,9 +381,12 @@ returned `expires_at` and is atomically consumed by exactly one concrete create
 workflow immediately before the Feishu create API call. It remains consumed if
 that API reports an error, avoiding an unsafe duplicate after an uncertain
 external side effect. Bot-owned resources return `granted` immediately. For
-other resources, LingoBridge first checks an exact
-`account_id + chat_id + resource_type + resource_token` grant and verifies it
-against Feishu in real time. If access is missing, it sends a Card V2 link to
+other resources, LingoBridge first checks an exact local
+`account_id + chat_id + resource_type + resource_token` grant, resolves the
+expected Bot or `openchat` collaborator, and loads the separate Feishu-side
+capability for that exact subject. The capability is verified against Feishu in
+real time before the local grant can be reused. If either layer is missing, it
+sends a Card V2 link to
 Feishu's official OAuth authorization page. The authorization request and any
 later create-time validation remain bound to the original Feishu user and
 chat; the model cannot provide another `chat_id`. The same card contains a
@@ -501,11 +504,14 @@ the one-time refresh token. A revoked, expired, or already-consumed refresh
 token fails closed and requires OAuth again, as does the mandatory 365-day
 reauthorization boundary. Operations interrupted while already executing are
 marked failed rather than retried automatically, avoiding duplicate creation.
-Resource grants store only chat/resource scope, collaborator identity,
-permission, source request, state, and timestamps; they contain no user OAuth
-token and are rechecked before use. Successful resource access requests also
-record the consuming create workflow ID and timestamp so concurrent or repeated
-create calls cannot reuse the same credential.
+Feishu resource capabilities store the exact collaborator subject, actual
+read/write permission, source OAuth actor, source request, live-verification
+time, and active/revoked state. Local resource grants separately store only the
+current chat/resource scope, allowed permission, source request, state, and
+timestamps. Neither layer contains a user OAuth token, and both must be active
+before reuse. Successful resource access requests also record the consuming
+create workflow ID and timestamp so concurrent or repeated create calls cannot
+reuse the same credential.
 
 The app needs a message permission that can both send and update bot cards;
 `im:message:send_as_bot` is the recommended narrow permission, while
@@ -769,10 +775,11 @@ session state, while Feishu and GitHub accounts live only under
 `platforms.<platform>.accounts.<name>` in config. Deleting a Feishu or GitHub
 account removes the config entry and clears that account's sync cursor. Feishu
 account deletion also removes its chat-bound document/folder metadata,
-Bot-resource records, resource-access requests/grants, encrypted user OAuth
-credentials, pending/completed tool approvals, reusable approval grants, and
-their global workflow request rows. Sessions and media are left intact because
-current history records are not account-id scoped.
+Bot-resource records, Feishu-side resource capabilities, local resource-access
+requests/grants, encrypted user OAuth credentials, pending/completed tool
+approvals, reusable approval grants, and their global workflow request rows.
+Sessions and media are left intact because current history records are not
+account-id scoped.
 
 Each SQLite `sessions` row owns its `model_name`. During the schema migration
 from older databases, the former user-level model preference is copied to all
@@ -853,7 +860,7 @@ internal/platform/github/   # GitHub account/runtime definition, App auth, PR po
 internal/core/              # Middle layer: scoped platform config/data APIs, tool orchestration, commands, sessions, LLM orchestration
 internal/tools/             # Shared tool interfaces, provider-neutral spec/call/result types, and runtime-owned execution context
 internal/mcp/               # Global MCP host/client sessions and MCP tool adapters exposed through tools.Provider
-internal/store/             # Platform-scoped SQLite accounts/sessions/preferences/cursors/tool approvals, grants, encrypted Feishu OAuth credentials, JSONL history, and media persistence
+internal/store/             # Platform-scoped SQLite accounts/sessions/preferences/cursors/tool approvals, resource capabilities/grants, encrypted Feishu OAuth credentials, JSONL history, and media persistence
 internal/llm/               # Backend provider adapters: OpenAI-compatible and Anthropic APIs
 internal/session/           # Session manager backed by the scoped store
 internal/commands/          # Shared in-chat slash commands

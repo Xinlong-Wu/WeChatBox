@@ -100,18 +100,31 @@ func TestFeishuResourceAccessOAuthLifecycleAndChatScopedGrant(t *testing.T) {
 		ResourceType:    request.ResourceType,
 		ResourceToken:   request.ResourceToken,
 		Permission:      FeishuResourcePermissionWrite,
-		SubjectType:     "openid",
-		SubjectID:       "ou_bot",
 		SourceRequestID: request.ID,
 		State:           FeishuResourceGrantStateActive,
 		CreatedAt:       now.Add(4 * time.Second),
-		VerifiedAt:      now.Add(4 * time.Second),
+		UpdatedAt:       now.Add(4 * time.Second),
+	}
+	capability := FeishuResourceCapability{
+		AccountID:         request.AccountID,
+		ResourceType:      request.ResourceType,
+		ResourceToken:     request.ResourceToken,
+		SubjectType:       "openid",
+		SubjectID:         "ou_bot",
+		Permission:        FeishuResourcePermissionWrite,
+		SourceActorOpenID: request.ActorOpenID,
+		SourceActorUserID: request.ActorUserID,
+		SourceRequestID:   request.ID,
+		State:             FeishuResourceCapabilityStateActive,
+		CreatedAt:         now.Add(4 * time.Second),
+		VerifiedAt:        now.Add(4 * time.Second),
 	}
 	if err := st.CompleteFeishuResourceAccessRequest(
 		request.ID,
 		request.AccountID,
 		FeishuResourceGrantSourceNewlyGranted,
 		FeishuResourcePermissionWrite,
+		&capability,
 		&grant,
 		now.Add(4*time.Second),
 	); err != nil {
@@ -179,6 +192,7 @@ func TestFeishuResourceAccessConsumptionIsAtomicAndExpires(t *testing.T) {
 		FeishuResourceGrantSourceBotOwner,
 		request.Permission,
 		nil,
+		nil,
 		now.Add(time.Second),
 	); err != nil {
 		t.Fatalf("CompleteFeishuResourceAccessRequest returned error: %v", err)
@@ -213,6 +227,7 @@ func TestFeishuResourceAccessConsumptionIsAtomicAndExpires(t *testing.T) {
 		expired.AccountID,
 		FeishuResourceGrantSourceBotOwner,
 		expired.Permission,
+		nil,
 		nil,
 		expired.CreatedAt.Add(time.Second),
 	); err != nil {
@@ -332,19 +347,17 @@ func TestFeishuResourceGrantUpgradesButDoesNotDowngrade(t *testing.T) {
 		ResourceType:    "docx",
 		ResourceToken:   "doxcn_external",
 		Permission:      FeishuResourcePermissionWrite,
-		SubjectType:     "openid",
-		SubjectID:       "ou_bot",
 		SourceRequestID: "req_write",
 		State:           FeishuResourceGrantStateActive,
 		CreatedAt:       now,
-		VerifiedAt:      now,
+		UpdatedAt:       now,
 	}
 	if _, err := st.UpsertFeishuResourceGrant(base); err != nil {
 		t.Fatalf("write UpsertFeishuResourceGrant returned error: %v", err)
 	}
 	base.Permission = FeishuResourcePermissionRead
 	base.SourceRequestID = "req_read"
-	base.VerifiedAt = now.Add(time.Minute)
+	base.UpdatedAt = now.Add(time.Minute)
 	if _, err := st.UpsertFeishuResourceGrant(base); err != nil {
 		t.Fatalf("read UpsertFeishuResourceGrant returned error: %v", err)
 	}
@@ -360,12 +373,100 @@ func TestFeishuResourceGrantUpgradesButDoesNotDowngrade(t *testing.T) {
 	}
 	base.Permission = FeishuResourcePermissionRead
 	base.SourceRequestID = "req_after_revoke"
-	base.VerifiedAt = now.Add(3 * time.Minute)
+	base.UpdatedAt = now.Add(3 * time.Minute)
 	if _, err := st.UpsertFeishuResourceGrant(base); err != nil {
 		t.Fatalf("read after revoke UpsertFeishuResourceGrant returned error: %v", err)
 	}
 	if _, active, err := st.ActiveFeishuResourceGrant(base.AccountID, base.ChatID, base.ResourceType, base.ResourceToken, FeishuResourcePermissionWrite); err != nil || active {
 		t.Fatalf("revoked write incorrectly survived read regrant active=%t err=%v", active, err)
+	}
+}
+
+func TestFeishuResourceCapabilityIsSubjectScopedAndDoesNotDowngrade(t *testing.T) {
+	st := openFeishuDocsTestStore(t)
+	now := time.Date(2026, time.August, 1, 13, 0, 0, 0, time.UTC)
+	base := FeishuResourceCapability{
+		AccountID:         "feishu:cli_test",
+		ResourceType:      "folder",
+		ResourceToken:     "fld_external",
+		SubjectType:       "openid",
+		SubjectID:         "ou_bot",
+		Permission:        FeishuResourcePermissionWrite,
+		SourceActorOpenID: "ou_requester",
+		SourceRequestID:   "req_write",
+		State:             FeishuResourceCapabilityStateActive,
+		CreatedAt:         now,
+		VerifiedAt:        now,
+	}
+	if _, err := st.UpsertFeishuResourceCapability(base); err != nil {
+		t.Fatalf("write UpsertFeishuResourceCapability returned error: %v", err)
+	}
+	base.Permission = FeishuResourcePermissionRead
+	base.SourceRequestID = "req_read"
+	base.VerifiedAt = now.Add(time.Minute)
+	if _, err := st.UpsertFeishuResourceCapability(base); err != nil {
+		t.Fatalf("read UpsertFeishuResourceCapability returned error: %v", err)
+	}
+	got, active, err := st.ActiveFeishuResourceCapability(
+		base.AccountID,
+		base.ResourceType,
+		base.ResourceToken,
+		base.SubjectType,
+		base.SubjectID,
+		FeishuResourcePermissionWrite,
+	)
+	if err != nil || !active || got.Permission != FeishuResourcePermissionWrite || got.SourceRequestID != "req_read" {
+		t.Fatalf("non-downgraded capability = %#v active=%t err=%v", got, active, err)
+	}
+
+	chatCapability := base
+	chatCapability.SubjectType = "openchat"
+	chatCapability.SubjectID = "oc_chat"
+	chatCapability.Permission = FeishuResourcePermissionRead
+	chatCapability.SourceRequestID = "req_chat"
+	chatCapability.VerifiedAt = now.Add(2 * time.Minute)
+	if _, err := st.UpsertFeishuResourceCapability(chatCapability); err != nil {
+		t.Fatalf("chat UpsertFeishuResourceCapability returned error: %v", err)
+	}
+	if _, active, err := st.ActiveFeishuResourceCapability(
+		base.AccountID,
+		base.ResourceType,
+		base.ResourceToken,
+		chatCapability.SubjectType,
+		chatCapability.SubjectID,
+		FeishuResourcePermissionWrite,
+	); err != nil || active {
+		t.Fatalf("chat write capability active=%t err=%v, want false", active, err)
+	}
+	if err := st.RevokeFeishuResourceCapability(
+		base.AccountID,
+		base.ResourceType,
+		base.ResourceToken,
+		base.SubjectType,
+		base.SubjectID,
+		now.Add(3*time.Minute),
+	); err != nil {
+		t.Fatalf("RevokeFeishuResourceCapability returned error: %v", err)
+	}
+	if _, active, err := st.ActiveFeishuResourceCapability(
+		base.AccountID,
+		base.ResourceType,
+		base.ResourceToken,
+		base.SubjectType,
+		base.SubjectID,
+		FeishuResourcePermissionRead,
+	); err != nil || active {
+		t.Fatalf("revoked Bot capability active=%t err=%v, want false", active, err)
+	}
+	if _, active, err := st.ActiveFeishuResourceCapability(
+		base.AccountID,
+		base.ResourceType,
+		base.ResourceToken,
+		chatCapability.SubjectType,
+		chatCapability.SubjectID,
+		FeishuResourcePermissionRead,
+	); err != nil || !active {
+		t.Fatalf("independent chat capability active=%t err=%v, want true", active, err)
 	}
 }
 
