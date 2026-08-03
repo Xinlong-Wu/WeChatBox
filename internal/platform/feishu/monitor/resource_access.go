@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -284,6 +285,16 @@ func (m *resourceAccessManager) RequestAccess(ctx context.Context, input feishut
 		m.failResourceAccessBestEffort(ctx, request.ID)
 		return feishutools.ResourceAccessResult{}, err
 	}
+	authTrace := resourceAccessAuthorizationURLTrace(authURL)
+	feishuLog.Debug(ctx, "prepared feishu resource OAuth PKCE request=%s account=%s state_ref=%s verifier_ref=%s verifier_length=%d pkce_ref=%s challenge_length=%d",
+		shortRequestID(request.ID), request.AccountID, shortResourceRef(stateHash), shortResourceRef(verifier), len(verifier), shortResourceRef(challenge), len(challenge))
+	feishuLog.Debug(ctx, "built feishu resource OAuth authorization URL request=%s account=%s valid=%t scheme=%s host=%s path=%s query_keys=%s url_length=%d auth_state_ref=%s state_matches=%t auth_pkce_ref=%s pkce_matches=%t pkce_method=%s challenge_length=%d redirect_ref=%s redirect_matches=%t redirect_scheme=%s redirect_host=%s redirect_path=%s redirect_length=%d scope_count=%d",
+		shortRequestID(request.ID), request.AccountID, authTrace.AuthorizationValid,
+		authTrace.Scheme, authTrace.Host, authTrace.Path, authTrace.QueryKeys, authTrace.URLLength,
+		authTrace.StateRef, authTrace.StateRef == shortResourceRef(stateHash),
+		authTrace.PKCERef, authTrace.PKCERef == shortResourceRef(challenge), authTrace.PKCEMethod, authTrace.ChallengeLength,
+		authTrace.RedirectRef, authTrace.RedirectRef == shortResourceRef(m.oauth.CallbackURL),
+		authTrace.RedirectScheme, authTrace.RedirectHost, authTrace.RedirectPath, authTrace.RedirectLength, authTrace.ScopeCount)
 	messageID, err := m.cards.Send(ctx, request.ChatID, pendingResourceAccessCard{request: request, authURL: authURL})
 	if err != nil {
 		m.failResourceAccessBestEffort(ctx, request.ID)
@@ -295,10 +306,10 @@ func (m *resourceAccessManager) RequestAccess(ctx context.Context, input feishut
 		return feishutools.ResourceAccessResult{}, fmt.Errorf("bind feishu resource access card: %w", err)
 	}
 	request.CardMessageID = messageID
-	feishuLog.Info(ctx, "requested feishu resource access request=%s account=%s user=%s chat=%s type=%s resource_ref=%s permission=%s pkce_ref=%s pkce_verifier_length=%d expires_at=%s",
+	feishuLog.Info(ctx, "requested feishu resource access request=%s account=%s user=%s chat=%s card_message=%s type=%s resource_ref=%s permission=%s state_ref=%s verifier_ref=%s pkce_ref=%s pkce_verifier_length=%d expires_at=%s",
 		shortRequestID(request.ID), request.AccountID, resourceAccessActorID(request), request.ChatID,
-		request.ResourceType, shortResourceRef(request.ResourceToken), request.Permission,
-		shortResourceRef(challenge), len(verifier), request.ExpiresAt.Format(time.RFC3339))
+		messageID, request.ResourceType, shortResourceRef(request.ResourceToken), request.Permission,
+		shortResourceRef(stateHash), shortResourceRef(verifier), shortResourceRef(challenge), len(verifier), request.ExpiresAt.Format(time.RFC3339))
 	result.ExpiresAt = request.ExpiresAt
 	result.Message = "已向当前飞书用户发送资源授权卡片。请在卡片中打开飞书官方授权页；如果浏览器无法直接回调 LingoBridge，请复制地址栏中的完整回调 URL（或授权码）粘贴到原卡片并提交。完成核验后机器人会更新卡片并通知当前对话。"
 	return result, nil
@@ -442,6 +453,15 @@ func (m *resourceAccessManager) HandleCardAction(ctx context.Context, event *cal
 				shortRequestID(requestID), m.account.ID, len([]rune(rawResult)), err)
 			return cardToast("error", err.Error()), nil
 		}
+		resultKind := "code"
+		if strings.TrimSpace(submission.Response.Error) != "" {
+			resultKind = "error"
+		}
+		feishuLog.Debug(ctx, "parsed feishu resource OAuth card handoff request=%s account=%s input_kind=%s input_length=%d callback_scheme=%s callback_host=%s callback_path=%s result_kind=%s state_ref=%s code_ref=%s code_length=%d oauth_error_ref=%s oauth_error_length=%d",
+			shortRequestID(requestID), m.account.ID, submission.InputKind, submission.InputLength,
+			submission.CallbackScheme, submission.CallbackHost, submission.CallbackPath, resultKind,
+			shortResourceRef(submission.StateHash), shortResourceRef(submission.Response.Code), len(submission.Response.Code),
+			shortResourceRef(submission.Response.Error), len(submission.Response.Error))
 		request, err := m.store.ClaimFeishuResourceAccessOAuthFromCard(
 			requestID,
 			m.account.ID,
@@ -467,14 +487,37 @@ type resourceAccessOAuthResponse struct {
 }
 
 type resourceAccessOAuthSubmission struct {
-	InputKind string
-	StateHash string
-	Response  resourceAccessOAuthResponse
+	InputKind      string
+	InputLength    int
+	CallbackScheme string
+	CallbackHost   string
+	CallbackPath   string
+	StateHash      string
+	Response       resourceAccessOAuthResponse
 }
 
 type resourceAccessOAuthQuery struct {
 	State    string
 	Response resourceAccessOAuthResponse
+}
+
+type resourceAccessAuthorizationTrace struct {
+	Scheme             string
+	Host               string
+	Path               string
+	QueryKeys          string
+	URLLength          int
+	StateRef           string
+	PKCERef            string
+	PKCEMethod         string
+	ChallengeLength    int
+	RedirectRef        string
+	RedirectScheme     string
+	RedirectHost       string
+	RedirectPath       string
+	RedirectLength     int
+	ScopeCount         int
+	AuthorizationValid bool
 }
 
 type resourceAccessOAuthCompletionError struct {
@@ -524,18 +567,59 @@ func (m *resourceAccessManager) parseResourceAccessOAuthSubmission(raw string) (
 			return resourceAccessOAuthSubmission{}, err
 		}
 		return resourceAccessOAuthSubmission{
-			InputKind: "url",
-			StateHash: hashResourceAccessState(query.State),
-			Response:  query.Response,
+			InputKind:      "url",
+			InputLength:    len(raw),
+			CallbackScheme: submitted.Scheme,
+			CallbackHost:   submitted.Host,
+			CallbackPath:   normalizedOAuthCallbackPath(submitted),
+			StateHash:      hashResourceAccessState(query.State),
+			Response:       query.Response,
 		}, nil
 	}
 	if strings.ContainsAny(raw, " \t\r\n") {
 		return resourceAccessOAuthSubmission{}, fmt.Errorf("授权码不能包含空白字符，请重新复制。")
 	}
 	return resourceAccessOAuthSubmission{
-		InputKind: "code",
-		Response:  resourceAccessOAuthResponse{Code: raw},
+		InputKind:   "code",
+		InputLength: len(raw),
+		Response:    resourceAccessOAuthResponse{Code: raw},
 	}, nil
+}
+
+func resourceAccessAuthorizationURLTrace(raw string) resourceAccessAuthorizationTrace {
+	trace := resourceAccessAuthorizationTrace{URLLength: len(raw)}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return trace
+	}
+	trace.AuthorizationValid = true
+	trace.Scheme = parsed.Scheme
+	trace.Host = parsed.Host
+	trace.Path = normalizedOAuthCallbackPath(parsed)
+	query := parsed.Query()
+	keys := make([]string, 0, len(query))
+	for key := range query {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	trace.QueryKeys = strings.Join(keys, ",")
+	if state := query.Get("state"); state != "" {
+		trace.StateRef = shortResourceRef(hashResourceAccessState(state))
+	}
+	challenge := query.Get("code_challenge")
+	trace.PKCERef = shortResourceRef(challenge)
+	trace.PKCEMethod = query.Get("code_challenge_method")
+	trace.ChallengeLength = len(challenge)
+	trace.ScopeCount = len(strings.Fields(query.Get("scope")))
+	redirectRaw := query.Get("redirect_uri")
+	trace.RedirectRef = shortResourceRef(redirectRaw)
+	trace.RedirectLength = len(redirectRaw)
+	if redirect, err := url.Parse(redirectRaw); err == nil {
+		trace.RedirectScheme = redirect.Scheme
+		trace.RedirectHost = redirect.Host
+		trace.RedirectPath = normalizedOAuthCallbackPath(redirect)
+	}
+	return trace
 }
 
 func parseResourceAccessOAuthQuery(rawQuery string) (resourceAccessOAuthQuery, error) {
@@ -620,6 +704,14 @@ func (m *resourceAccessManager) HandleOAuthCallback(w http.ResponseWriter, r *ht
 		http.Error(w, "invalid OAuth callback query", http.StatusBadRequest)
 		return
 	}
+	resultKind := "code"
+	if strings.TrimSpace(query.Response.Error) != "" {
+		resultKind = "error"
+	}
+	feishuLog.Debug(r.Context(), "parsed feishu resource OAuth HTTP callback account=%s callback_host=%s callback_path=%s raw_query_length=%d result_kind=%s state_ref=%s code_ref=%s code_length=%d oauth_error_ref=%s oauth_error_length=%d",
+		m.account.ID, r.Host, normalizedOAuthCallbackPath(r.URL), len(r.URL.RawQuery), resultKind,
+		shortResourceRef(hashResourceAccessState(query.State)), shortResourceRef(query.Response.Code), len(query.Response.Code),
+		shortResourceRef(query.Response.Error), len(query.Response.Error))
 	request, err := m.store.ClaimFeishuResourceAccessOAuth(hashResourceAccessState(query.State), m.account.ID, m.currentTime())
 	if err != nil {
 		status := http.StatusBadRequest
@@ -684,10 +776,9 @@ func (m *resourceAccessManager) completeResourceAccessOAuth(ctx context.Context,
 			"invalid PKCE verifier; start a new resource access request",
 		)
 	}
-	feishuLog.Debug(ctx, "exchange feishu resource OAuth code request=%s account=%s pkce_ref=%s pkce_verifier_length=%d",
-		shortRequestID(request.ID), request.AccountID, shortResourceRef(pkceChallenge), len(request.PKCEVerifier))
-	accessToken, err := m.exchangeAuthorizationCode(ctx, code, request.PKCEVerifier)
+	accessToken, err := m.exchangeAuthorizationCode(ctx, request.ID, code, request.PKCEVerifier, pkceChallenge)
 	if err != nil {
+		m.logResourceAccessTokenExchangeError(ctx, request, code, pkceChallenge, err)
 		if isResourceAccessPKCEFailure(err) {
 			message := fmt.Sprintf("飞书未通过本次 PKCE 校验，此授权请求已失效且不能继续使用。请重新调用 `%s`，并只使用最新授权卡片。", feishutools.ResourceAccessToolName)
 			return fail(err, "PKCE 校验失败", message, http.StatusBadRequest, "PKCE verification failed; start a new resource access request and use only the latest authorization card")
@@ -747,12 +838,60 @@ func isResourceAccessPKCEFailure(err error) bool {
 	return errors.As(err, &accessTokenErr) && accessTokenErr.Code == 20049
 }
 
-func (m *resourceAccessManager) exchangeAuthorizationCode(ctx context.Context, code, verifier string) (string, error) {
-	resp, err := m.client.AccessToken.RetrieveByAuthorizationCode(ctx, authorizationcode.NewTokenRequestBuilder().
+func (m *resourceAccessManager) logResourceAccessTokenExchangeError(
+	ctx context.Context,
+	request store.FeishuResourceAccessRequest,
+	code, challenge string,
+	err error,
+) {
+	var accessTokenErr *accesstoken.AccessTokenError
+	if !errors.As(err, &accessTokenErr) {
+		feishuLog.Warn(ctx, "feishu resource OAuth token request transport failure request=%s account=%s error_go_type=%T code_ref=%s code_length=%d verifier_ref=%s verifier_length=%d pkce_ref=%s",
+			shortRequestID(request.ID), request.AccountID, err, shortResourceRef(code), len(code),
+			shortResourceRef(request.PKCEVerifier), len(request.PKCEVerifier), shortResourceRef(challenge))
+		return
+	}
+	httpStatus := 0
+	requestLogID := ""
+	responseBytes := 0
+	contentType := ""
+	if accessTokenErr.ApiResp != nil {
+		httpStatus = accessTokenErr.ApiResp.StatusCode
+		requestLogID = accessTokenErr.ApiResp.RequestId()
+		responseBytes = len(accessTokenErr.ApiResp.RawBody)
+		contentType = accessTokenErr.ApiResp.Header.Get("Content-Type")
+	}
+	feishuLog.Warn(ctx, "feishu resource OAuth token error response request=%s account=%s http_status=%d feishu_code=%d oauth_error_type=%q oauth_error_description_ref=%s oauth_error_description_length=%d request_log_id=%q content_type=%q response_bytes=%d code_ref=%s code_length=%d verifier_ref=%s verifier_length=%d pkce_ref=%s",
+		shortRequestID(request.ID), request.AccountID, httpStatus, accessTokenErr.Code, accessTokenErr.ErrorType,
+		shortResourceRef(accessTokenErr.ErrorDescription), len(accessTokenErr.ErrorDescription), requestLogID, contentType, responseBytes,
+		shortResourceRef(code), len(code), shortResourceRef(request.PKCEVerifier), len(request.PKCEVerifier), shortResourceRef(challenge))
+}
+
+func (m *resourceAccessManager) exchangeAuthorizationCode(ctx context.Context, requestID, code, verifier, challenge string) (string, error) {
+	tokenRequest := authorizationcode.NewTokenRequestBuilder().
 		Code(code).
 		RedirectUri(m.oauth.CallbackURL).
 		CodeVerifier(verifier).
-		Build())
+		Build()
+	sdkCode := ""
+	sdkRedirect := ""
+	sdkVerifier := ""
+	if tokenRequest != nil && tokenRequest.Body != nil {
+		sdkCode = deref(tokenRequest.Body.Code)
+		sdkRedirect = deref(tokenRequest.Body.RedirectUri)
+		sdkVerifier = deref(tokenRequest.Body.CodeVerifier)
+	}
+	endpoint, _ := url.Parse(strings.TrimRight(m.oauth.BaseURL, "/") + larkcore.OAuthTokenUrlPath)
+	redirect, _ := url.Parse(m.oauth.CallbackURL)
+	sdkChallenge, sdkChallengeErr := resourceAccessPKCEChallenge(sdkVerifier)
+	feishuLog.Debug(ctx, "prepared feishu resource OAuth token request request=%s account=%s endpoint_scheme=%s endpoint_host=%s endpoint_path=%s grant_type=authorization_code content_type=application/json code_ref=%s code_length=%d sdk_code_ref=%s sdk_code_length=%d sdk_code_matches=%t verifier_ref=%s verifier_length=%d sdk_verifier_ref=%s sdk_verifier_length=%d sdk_verifier_matches=%t pkce_ref=%s sdk_pkce_ref=%s sdk_pkce_valid=%t sdk_pkce_matches=%t redirect_ref=%s redirect_scheme=%s redirect_host=%s redirect_path=%s redirect_length=%d sdk_redirect_ref=%s sdk_redirect_length=%d sdk_redirect_matches=%t",
+		shortRequestID(requestID), m.account.ID, endpoint.Scheme, endpoint.Host, normalizedOAuthCallbackPath(endpoint),
+		shortResourceRef(code), len(code), shortResourceRef(sdkCode), len(sdkCode), sdkCode == code,
+		shortResourceRef(verifier), len(verifier), shortResourceRef(sdkVerifier), len(sdkVerifier), sdkVerifier == verifier,
+		shortResourceRef(challenge), shortResourceRef(sdkChallenge), sdkChallengeErr == nil, sdkChallenge == challenge,
+		shortResourceRef(m.oauth.CallbackURL), redirect.Scheme, redirect.Host, normalizedOAuthCallbackPath(redirect), len(m.oauth.CallbackURL),
+		shortResourceRef(sdkRedirect), len(sdkRedirect), sdkRedirect == m.oauth.CallbackURL)
+	resp, err := m.client.AccessToken.RetrieveByAuthorizationCode(ctx, tokenRequest)
 	if err != nil {
 		return "", fmt.Errorf("exchange feishu OAuth authorization code: %w", err)
 	}
@@ -763,6 +902,24 @@ func (m *resourceAccessManager) exchangeAuthorizationCode(ctx context.Context, c
 	if token == "" {
 		return "", fmt.Errorf("exchange feishu OAuth authorization code returned no access_token")
 	}
+	statusCode := 0
+	requestLogID := ""
+	if resp.ApiResp != nil {
+		statusCode = resp.ApiResp.StatusCode
+		requestLogID = resp.ApiResp.RequestId()
+	}
+	scopeCount := 0
+	expiresIn := 0
+	refreshTokenPresent := false
+	if resp.Data.Scope != nil {
+		scopeCount = len(strings.Fields(deref(resp.Data.Scope)))
+	}
+	if resp.Data.ExpiresIn != nil {
+		expiresIn = *resp.Data.ExpiresIn
+	}
+	refreshTokenPresent = strings.TrimSpace(deref(resp.Data.RefreshToken)) != ""
+	feishuLog.Debug(ctx, "received feishu resource OAuth token response request=%s account=%s http_status=%d request_log_id=%q access_token_present=true refresh_token_present=%t expires_in=%d scope_count=%d",
+		shortRequestID(requestID), m.account.ID, statusCode, requestLogID, refreshTokenPresent, expiresIn, scopeCount)
 	return token, nil
 }
 

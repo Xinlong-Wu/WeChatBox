@@ -15,6 +15,7 @@ import (
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 
+	"lingobridge/internal/logging"
 	feishutools "lingobridge/internal/platform/feishu/tools"
 	"lingobridge/internal/store"
 )
@@ -197,10 +198,13 @@ func TestResourceAccessOAuthCardCodeHandoffGrantsWithoutListener(t *testing.T) {
 }
 
 func TestResourceAccessOAuthPKCEFailureRequiresNewRequest(t *testing.T) {
+	logs := captureMonitorLogs(t)
+	logging.SetLevel(logging.Debug)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/oauth/v3/token" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
+		w.Header().Set("X-Tt-Logid", "log_pkce_failure")
 		w.WriteHeader(http.StatusBadRequest)
 		writeResourceAccessJSON(t, w, map[string]any{
 			"code":              20049,
@@ -229,6 +233,14 @@ func TestResourceAccessOAuthPKCEFailureRequiresNewRequest(t *testing.T) {
 		t.Fatalf("sent cards = %#v", cards)
 	}
 	state := resourceAccessCardState(t, cards[0].text)
+	pending, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
+	if err != nil {
+		t.Fatalf("load pending request: %v", err)
+	}
+	pendingChallenge, err := resourceAccessPKCEChallenge(pending.PKCEVerifier)
+	if err != nil {
+		t.Fatalf("derive pending PKCE challenge: %v", err)
+	}
 	recorder := httptest.NewRecorder()
 	callbackRequest := httptest.NewRequest(http.MethodGet, "/feishu/oauth/callback?code=auth-code&state="+url.QueryEscape(state), nil)
 	manager.HandleOAuthCallback(recorder, callbackRequest)
@@ -244,10 +256,32 @@ func TestResourceAccessOAuthPKCEFailureRequiresNewRequest(t *testing.T) {
 		len(messages) != 1 || !strings.Contains(messages[0].text, feishutools.ResourceAccessToolName) || !strings.Contains(messages[0].text, "最新授权卡片") {
 		t.Fatalf("updates/messages = %#v/%#v", updates, messages)
 	}
+	logText := logs.String()
+	for _, fragment := range []string{
+		"feishu resource OAuth token error response",
+		"http_status=400",
+		"feishu_code=20049",
+		`oauth_error_type="invalid_grant"`,
+		`request_log_id="log_pkce_failure"`,
+		"code_ref=" + shortResourceRef("auth-code"),
+		"verifier_ref=" + shortResourceRef(pending.PKCEVerifier),
+		"pkce_ref=" + shortResourceRef(pendingChallenge),
+	} {
+		if !strings.Contains(logText, fragment) {
+			t.Fatalf("PKCE failure diagnostics missing %q:\n%s", fragment, logText)
+		}
+	}
+	for _, secret := range []string{state, pending.PKCEVerifier, "auth-code", oauth.CallbackURL} {
+		if strings.Contains(logText, secret) {
+			t.Fatalf("PKCE failure diagnostics leaked sensitive value %q:\n%s", secret, logText)
+		}
+	}
 }
 
 func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 	t.Helper()
+	logs := captureMonitorLogs(t)
+	logging.SetLevel(logging.Debug)
 	var mu sync.Mutex
 	var tokenBody map[string]any
 	var permissionBody map[string]any
@@ -419,6 +453,59 @@ func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 	_, updates, messages := sender.snapshot()
 	if len(updates) != 1 || updates[0].messageID != "om_card" || !strings.Contains(updates[0].text, "权限已授予") || len(messages) != 1 || !strings.Contains(messages[0].text, result.RequestID) {
 		t.Fatalf("updates/messages = %#v/%#v", updates, messages)
+	}
+	logText := logs.String()
+	callbackLog := "parsed feishu resource OAuth card handoff"
+	if mode == "http" {
+		callbackLog = "parsed feishu resource OAuth HTTP callback"
+	}
+	requiredLogFragments := []string{
+		"prepared feishu resource OAuth PKCE",
+		"built feishu resource OAuth authorization URL",
+		callbackLog,
+		"prepared feishu resource OAuth token request",
+		"received feishu resource OAuth token response",
+		"state_ref=" + shortResourceRef(storedPending.OAuthStateHash),
+		"auth_state_ref=" + shortResourceRef(storedPending.OAuthStateHash),
+		"verifier_ref=" + shortResourceRef(storedPending.PKCEVerifier),
+		"sdk_verifier_ref=" + shortResourceRef(storedPending.PKCEVerifier),
+		"pkce_ref=" + shortResourceRef(expectedChallenge),
+		"auth_pkce_ref=" + shortResourceRef(expectedChallenge),
+		"sdk_pkce_ref=" + shortResourceRef(expectedChallenge),
+		"code_ref=" + shortResourceRef(expectedCode),
+		"sdk_code_ref=" + shortResourceRef(expectedCode),
+		"redirect_ref=" + shortResourceRef(oauth.CallbackURL),
+		"sdk_redirect_ref=" + shortResourceRef(oauth.CallbackURL),
+		"pkce_method=S256",
+		"state_matches=true",
+		"pkce_matches=true",
+		"redirect_matches=true",
+		"sdk_code_matches=true",
+		"sdk_verifier_matches=true",
+		"sdk_pkce_matches=true",
+		"sdk_redirect_matches=true",
+		"challenge_length=43",
+		"verifier_length=64",
+		"scope_count=2",
+		"access_token_present=true",
+	}
+	for _, fragment := range requiredLogFragments {
+		if !strings.Contains(logText, fragment) {
+			t.Fatalf("OAuth diagnostic logs missing %q:\n%s", fragment, logText)
+		}
+	}
+	for _, secret := range []string{
+		state,
+		storedPending.PKCEVerifier,
+		expectedCode,
+		authURL,
+		oauth.CallbackURL,
+		"user-access-token",
+		"doxcn_external",
+	} {
+		if strings.Contains(logText, secret) {
+			t.Fatalf("OAuth diagnostic logs leaked sensitive value %q:\n%s", secret, logText)
+		}
 	}
 }
 
