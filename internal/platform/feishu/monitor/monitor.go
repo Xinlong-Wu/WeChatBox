@@ -99,7 +99,7 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 			return fmt.Errorf("recover feishu resource access for account %s: %w", acc.Name, err)
 		}
 	}
-	if docsCreateApprovalRequired(p.config.Tools) {
+	if docsOperationApprovalRequired(p.config.Tools) {
 		approvals, err = newOperationApprovalService(ctx, p.store, acc, cards)
 		if err != nil {
 			return fmt.Errorf("initialize feishu tool approvals for account %s: %w", acc.Name, err)
@@ -198,7 +198,7 @@ func docsToolsEnabled(cfg feishutools.Config) bool {
 	return cfg.Docs.Enabled
 }
 
-func docsCreateApprovalRequired(cfg feishutools.Config) bool {
+func docsOperationApprovalRequired(cfg feishutools.Config) bool {
 	cfg = feishutools.NormalizeConfig(cfg)
 	return cfg.Docs.Enabled && cfg.Docs.AllowWrite
 }

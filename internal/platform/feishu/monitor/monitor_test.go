@@ -986,14 +986,15 @@ func TestNewFeishuToolsRegistersEnabledChatHistory(t *testing.T) {
 	}
 }
 
-func TestNewFeishuToolsRegistersApprovalGatedDocumentCreate(t *testing.T) {
+func TestNewFeishuToolsRegistersApprovalGatedDocumentWrites(t *testing.T) {
 	st := openFeishuApprovalTestStore(t)
 	cfg := feishutools.Config{
 		Docs: feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true},
 	}
 	withoutApproval := toolNames(newFeishuTools(&lark.Client{}, st, "feishu:cli_test", cfg, nil, nil))
-	if strings.Contains(strings.Join(withoutApproval, ","), "feishu_docs_create") {
-		t.Fatalf("tools without approval workflow = %#v, create must fail closed", withoutApproval)
+	withoutApprovalNames := strings.Join(withoutApproval, ",")
+	if strings.Contains(withoutApprovalNames, "feishu_docs_create") || strings.Contains(withoutApprovalNames, "feishu_docs_append") {
+		t.Fatalf("tools without approval workflow = %#v, document writes must fail closed", withoutApproval)
 	}
 	withApproval := toolNames(newFeishuTools(&lark.Client{}, st, "feishu:cli_test", cfg, fakeToolApprovalRequester{}, fakeResourceAccessController{}))
 	if got, want := strings.Join(withApproval, ","), "feishu_docs_request_access,feishu_docs_search,feishu_docs_read,feishu_docs_create,feishu_docs_append,feishu_docs_folder_create,feishu_docs_folder_list"; got != want {

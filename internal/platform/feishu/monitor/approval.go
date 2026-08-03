@@ -18,7 +18,6 @@ import (
 
 const (
 	defaultToolApprovalTTL              = 10 * time.Minute
-	defaultToolApprovalGrantTTL         = 24 * time.Hour
 	defaultApprovedToolExecutionTimeout = 30 * time.Second
 	approvalCardUpdateTimeout           = 10 * time.Second
 )
@@ -38,7 +37,7 @@ type toolApprovalStore interface {
 	ExpireToolApprovals(accountID string, now time.Time) (int64, error)
 	FailExecutingToolApprovals(accountID string, now time.Time) (int64, error)
 	UpsertToolApprovalGrant(grant store.ToolApprovalGrant) (store.ToolApprovalGrant, error)
-	ActiveToolApprovalGrant(scope store.ToolApprovalGrantScope, now time.Time) (store.ToolApprovalGrant, bool, error)
+	FindToolApprovalGrant(scope store.ToolApprovalGrantScope) (store.ToolApprovalGrant, bool, error)
 }
 
 func (m *operationApprovalService) recoverPersistedApprovals(ctx context.Context) error {
@@ -73,7 +72,6 @@ type operationApprovalService struct {
 	account          store.Account
 	runCtx           context.Context
 	ttl              time.Duration
-	grantTTL         time.Duration
 	executionTimeout time.Duration
 	now              func() time.Time
 
@@ -103,7 +101,6 @@ func newOperationApprovalService(runCtx context.Context, st *store.Store, accoun
 		account:          account,
 		runCtx:           runCtx,
 		ttl:              defaultToolApprovalTTL,
-		grantTTL:         defaultToolApprovalGrantTTL,
 		executionTimeout: defaultApprovedToolExecutionTimeout,
 		now:              time.Now,
 		executors:        map[string]feishutools.OperationApprovalExecutor{},
@@ -152,7 +149,7 @@ func (m *operationApprovalService) CheckOrRequest(ctx context.Context, request f
 		return feishutools.OperationApprovalResult{}, err
 	}
 	if policy.SupportsAll {
-		active, err := m.hasActiveGrant(ctx, request.ToolName)
+		active, err := m.hasActiveGrant(ctx, request)
 		if err != nil {
 			return feishutools.OperationApprovalResult{}, err
 		}
@@ -165,7 +162,7 @@ func (m *operationApprovalService) CheckOrRequest(ctx context.Context, request f
 	return m.requestApproval(ctx, request, policy)
 }
 
-func (m *operationApprovalService) hasActiveGrant(ctx context.Context, toolName string) (bool, error) {
+func (m *operationApprovalService) hasActiveGrant(ctx context.Context, request feishutools.OperationApprovalRequest) (bool, error) {
 	actor, ok := feishutools.ActorFromContext(ctx)
 	if !ok || (actor.OpenID == "" && actor.UserID == "") {
 		return false, fmt.Errorf("feishu tool approval requires the requesting user identity")
@@ -174,21 +171,32 @@ func (m *operationApprovalService) hasActiveGrant(ctx context.Context, toolName 
 	if !ok || chat.ChatID == "" {
 		return false, fmt.Errorf("feishu tool approval requires the trusted current chat")
 	}
-	scope, err := toolApprovalGrantScope(m.account.ID, toolName, actor.OpenID, actor.UserID, chat.ChatID)
+	scope, err := toolApprovalGrantScope(
+		m.account.ID,
+		request.ToolName,
+		request.ActionKey,
+		request.ResourceType,
+		request.ResourceToken,
+		actor.OpenID,
+		actor.UserID,
+		chat.ChatID,
+	)
 	if err != nil {
 		return false, err
 	}
-	grant, active, err := m.store.ActiveToolApprovalGrant(scope, m.currentTime())
+	grant, active, err := m.store.FindToolApprovalGrant(scope)
 	if err != nil {
 		return false, fmt.Errorf("check active feishu tool approval grant: %w", err)
 	}
 	if active {
-		feishuLog.Debug(ctx, "using active feishu tool approval grant account=%s tool=%s user=%s chat=%s expires_at=%s source_request=%s",
+		feishuLog.Debug(ctx, "using permanent feishu operation grant account=%s tool=%s action=%s user=%s chat=%s resource_type=%s resource_ref=%s source_request=%s",
 			scope.AccountID,
 			scope.ToolName,
+			scope.ActionKey,
 			scope.ActorID,
 			scope.ChatID,
-			grant.ExpiresAt.Format(time.RFC3339),
+			scope.ResourceType,
+			shortResourceRef(scope.ResourceToken),
 			shortRequestID(grant.SourceRequestID),
 		)
 	}
@@ -329,10 +337,10 @@ func (m *operationApprovalService) HandleCardAction(ctx context.Context, event *
 		}
 		toast := "已同意本次操作，正在执行；完成后机器人会发送结果。"
 		if action == approvalCardActionApproveAll {
-			if expiresAt, saved := m.saveReusableApprovalGrant(ctx, approval, decidedAt); saved {
-				toast = fmt.Sprintf("已授权，当前操作正在执行；相同用户、机器人、对话和工具在 %s 前免审批。", expiresAt.Format("2006-01-02 15:04 UTC"))
+			if saved := m.saveReusableApprovalGrant(ctx, approval, decidedAt); saved {
+				toast = "已永久授权该用户、机器人、对话、工具、动作和资源的相同操作；当前操作正在执行。"
 			} else {
-				toast = "已同意本次操作，正在执行；但 24 小时免审批授权保存失败，后续调用仍需审批。"
+				toast = "已同意本次操作，正在执行；但永久免审批授权保存失败，后续调用仍需审批。"
 			}
 		}
 		feishuLog.Info(ctx, "approved feishu tool approval request=%s account=%s tool=%s user=%s chat=%s mode=%s",
@@ -347,28 +355,37 @@ func (m *operationApprovalService) HandleCardAction(ctx context.Context, event *
 	}
 }
 
-func (m *operationApprovalService) saveReusableApprovalGrant(ctx context.Context, approval store.ToolApproval, now time.Time) (time.Time, bool) {
-	scope, err := toolApprovalGrantScope(approval.AccountID, approval.ToolName, approval.ActorOpenID, approval.ActorUserID, approval.ChatID)
+func (m *operationApprovalService) saveReusableApprovalGrant(ctx context.Context, approval store.ToolApproval, now time.Time) bool {
+	scope, err := toolApprovalGrantScope(
+		approval.AccountID,
+		approval.ToolName,
+		approval.ActionKey,
+		approval.ResourceType,
+		approval.ResourceToken,
+		approval.ActorOpenID,
+		approval.ActorUserID,
+		approval.ChatID,
+	)
 	if err != nil {
-		feishuLog.Warn(ctx, "cannot scope reusable feishu tool approval request=%s account=%s tool=%s: %v",
-			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, err)
-		return time.Time{}, false
+		feishuLog.Warn(ctx, "cannot scope reusable feishu operation approval request=%s account=%s tool=%s action=%s: %v",
+			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, approval.ActionKey, err)
+		return false
 	}
-	expiresAt := now.Add(m.approvalGrantTTL())
 	grant, err := m.store.UpsertToolApprovalGrant(store.ToolApprovalGrant{
 		ToolApprovalGrantScope: scope,
 		SourceRequestID:        approval.ID,
 		CreatedAt:              now,
-		ExpiresAt:              expiresAt,
 	})
 	if err != nil {
-		feishuLog.Warn(ctx, "save reusable feishu tool approval failed request=%s account=%s tool=%s user=%s chat=%s: %v",
-			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, scope.ActorID, scope.ChatID, err)
-		return time.Time{}, false
+		feishuLog.Warn(ctx, "save reusable feishu operation approval failed request=%s account=%s tool=%s action=%s user=%s chat=%s resource_type=%s resource_ref=%s: %v",
+			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, approval.ActionKey, scope.ActorID, scope.ChatID,
+			scope.ResourceType, shortResourceRef(scope.ResourceToken), err)
+		return false
 	}
-	feishuLog.Info(ctx, "saved reusable feishu tool approval account=%s tool=%s user=%s chat=%s expires_at=%s source_request=%s",
-		grant.AccountID, grant.ToolName, grant.ActorID, grant.ChatID, grant.ExpiresAt.Format(time.RFC3339), shortRequestID(grant.SourceRequestID))
-	return grant.ExpiresAt, true
+	feishuLog.Info(ctx, "saved permanent feishu operation grant account=%s tool=%s action=%s user=%s chat=%s resource_type=%s resource_ref=%s source_request=%s",
+		grant.AccountID, grant.ToolName, grant.ActionKey, grant.ActorID, grant.ChatID, grant.ResourceType,
+		shortResourceRef(grant.ResourceToken), shortRequestID(grant.SourceRequestID))
+	return true
 }
 
 func (m *operationApprovalService) handleApprovalDecisionError(ctx context.Context, approval store.ToolApproval, requestID string, match store.ToolApprovalMatch, err error) *callback.CardActionTriggerResponse {
@@ -574,13 +591,6 @@ func (m *operationApprovalService) approvalTTL() time.Duration {
 	return m.ttl
 }
 
-func (m *operationApprovalService) approvalGrantTTL() time.Duration {
-	if m.grantTTL <= 0 {
-		return defaultToolApprovalGrantTTL
-	}
-	return m.grantTTL
-}
-
 func (m *operationApprovalService) approvedExecutionTimeout() time.Duration {
 	if m.executionTimeout <= 0 {
 		return defaultApprovedToolExecutionTimeout
@@ -658,7 +668,7 @@ func approvalMatchActorID(match store.ToolApprovalMatch) string {
 	return match.ActorUserID
 }
 
-func toolApprovalGrantScope(accountID, toolName, actorOpenID, actorUserID, chatID string) (store.ToolApprovalGrantScope, error) {
+func toolApprovalGrantScope(accountID, toolName, actionKey, resourceType, resourceToken, actorOpenID, actorUserID, chatID string) (store.ToolApprovalGrantScope, error) {
 	actorType := store.ToolApprovalActorTypeOpenID
 	actorID := strings.TrimSpace(actorOpenID)
 	if actorID == "" {
@@ -666,14 +676,18 @@ func toolApprovalGrantScope(accountID, toolName, actorOpenID, actorUserID, chatI
 		actorID = strings.TrimSpace(actorUserID)
 	}
 	scope := store.ToolApprovalGrantScope{
-		AccountID: strings.TrimSpace(accountID),
-		ToolName:  strings.TrimSpace(toolName),
-		ActorType: actorType,
-		ActorID:   actorID,
-		ChatID:    strings.TrimSpace(chatID),
+		AccountID:     strings.TrimSpace(accountID),
+		ToolName:      strings.TrimSpace(toolName),
+		ActionKey:     strings.TrimSpace(actionKey),
+		ResourceType:  strings.ToLower(strings.TrimSpace(resourceType)),
+		ResourceToken: strings.TrimSpace(resourceToken),
+		ActorType:     actorType,
+		ActorID:       actorID,
+		ChatID:        strings.TrimSpace(chatID),
 	}
-	if scope.AccountID == "" || scope.ToolName == "" || scope.ActorID == "" || scope.ChatID == "" {
-		return store.ToolApprovalGrantScope{}, fmt.Errorf("feishu tool approval grant account, tool, user, and chat are required")
+	if scope.AccountID == "" || scope.ToolName == "" || scope.ActionKey == "" || scope.ResourceType == "" ||
+		scope.ResourceToken == "" || scope.ActorID == "" || scope.ChatID == "" {
+		return store.ToolApprovalGrantScope{}, fmt.Errorf("feishu operation grant account, tool, action, resource, user, and chat are required")
 	}
 	return scope, nil
 }

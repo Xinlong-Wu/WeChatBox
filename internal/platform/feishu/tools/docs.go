@@ -55,8 +55,8 @@ func NewDocsTools(client *lark.Client, st *store.Store, accountID string, cfg Co
 	if cfg.Docs.AllowWrite {
 		if approvals != nil && resourceAccess != nil {
 			tools = append(tools, docsTool{name: createToolName, spec: docsCreateSpec(), client: client, store: st, accountID: accountID, cfg: cfg, approvals: approvals, resourceAccess: resourceAccess, now: time.Now})
+			tools = append(tools, docsTool{name: appendToolName, spec: docsAppendSpec(), client: client, store: st, accountID: accountID, cfg: cfg, approvals: approvals, resourceAccess: resourceAccess, now: time.Now})
 		}
-		tools = append(tools, docsTool{name: appendToolName, spec: docsAppendSpec(), client: client, store: st, accountID: accountID, cfg: cfg, resourceAccess: resourceAccess, now: time.Now})
 	}
 	return tools
 }
@@ -77,7 +77,7 @@ func (t docsTool) Execute(ctx context.Context, call tooltypes.Call) tooltypes.Re
 	case createToolName:
 		content, pendingWorkflowID, err = t.create(ctx, call.Arguments)
 	case appendToolName:
-		content, err = t.append(ctx, call.Arguments)
+		content, pendingWorkflowID, err = t.append(ctx, call.Arguments)
 	default:
 		err = fmt.Errorf("unsupported feishu docs tool %q", t.name)
 	}
@@ -122,6 +122,15 @@ type approvedCreatePayload struct {
 	ChatID      string `json:"chat_id"`
 	ActorOpenID string `json:"actor_open_id,omitempty"`
 	ActorUserID string `json:"actor_user_id,omitempty"`
+}
+
+type approvedAppendPayload struct {
+	DocumentToken string `json:"document_token"`
+	Content       string `json:"content"`
+	FolderToken   string `json:"folder_token,omitempty"`
+	ChatID        string `json:"chat_id"`
+	ActorOpenID   string `json:"actor_open_id,omitempty"`
+	ActorUserID   string `json:"actor_user_id,omitempty"`
 }
 
 type appendArgs struct {
@@ -403,30 +412,47 @@ func (t docsTool) create(ctx context.Context, raw json.RawMessage) (string, stri
 		Status:    "pending_approval",
 		RequestID: approval.RequestID,
 		ExpiresAt: approval.ExpiresAt.UTC().Format(time.RFC3339),
-		Message:   "已向本次请求的飞书用户发送授权卡片；可同意本次，或为相同用户、机器人账号、对话和 feishu_docs_create 授权 24 小时。批准后会异步创建文档，请勿重复调用。",
+		Message:   "已向本次请求的飞书用户发送授权卡片；可同意本次，或永久允许相同用户、机器人账号、对话和 feishu_docs_create 在当前文件夹中创建文档。批准后会异步创建文档，请勿重复调用。",
 	})
 	return content, approval.RequestID, marshalErr
 }
 
-// OperationApprovalPolicy identifies the document create operation handled by
+// OperationApprovalPolicy identifies the exact document operation handled by
 // the shared approval service.
 func (t docsTool) OperationApprovalPolicy() OperationApprovalPolicy {
-	if t.name == createToolName {
+	switch t.name {
+	case createToolName:
 		return OperationApprovalPolicy{
 			ToolName:    createToolName,
 			ActionKey:   "create",
 			Action:      "创建飞书文档",
 			SupportsAll: true,
 		}
+	case appendToolName:
+		return OperationApprovalPolicy{
+			ToolName:    appendToolName,
+			ActionKey:   "append",
+			Action:      "追加飞书文档内容",
+			SupportsAll: true,
+		}
+	default:
+		return OperationApprovalPolicy{}
 	}
-	return OperationApprovalPolicy{}
 }
 
-// ExecuteApproved creates the exact document payload persisted before authorization.
+// ExecuteApproved executes the exact document payload persisted before authorization.
 func (t docsTool) ExecuteApproved(ctx context.Context, requestID string, payload json.RawMessage) (OperationApprovalExecution, error) {
-	if t.name != createToolName {
+	switch t.name {
+	case createToolName:
+		return t.executeApprovedCreate(ctx, requestID, payload)
+	case appendToolName:
+		return t.executeApprovedAppend(ctx, requestID, payload)
+	default:
 		return OperationApprovalExecution{}, fmt.Errorf("tool %q does not support approved execution", t.name)
 	}
+}
+
+func (t docsTool) executeApprovedCreate(ctx context.Context, requestID string, payload json.RawMessage) (OperationApprovalExecution, error) {
 	args, err := t.parseApprovedCreatePayload(payload)
 	if err != nil {
 		return OperationApprovalExecution{}, err
@@ -449,6 +475,22 @@ func (t docsTool) ExecuteApproved(ctx context.Context, requestID string, payload
 	}
 	return OperationApprovalExecution{
 		Message: fmt.Sprintf("✅ 飞书文档已创建：[%s](%s)", escapeFeishuLinkText(out.Title), out.URL),
+	}, nil
+}
+
+func (t docsTool) executeApprovedAppend(ctx context.Context, requestID string, payload json.RawMessage) (OperationApprovalExecution, error) {
+	args, err := t.parseApprovedAppendPayload(payload)
+	if err != nil {
+		return OperationApprovalExecution{}, err
+	}
+	executionCtx := WithActor(ctx, Actor{OpenID: args.ActorOpenID, UserID: args.ActorUserID})
+	executionCtx = WithChatContext(executionCtx, ChatContext{ChatID: args.ChatID})
+	out, err := t.appendDocument(executionCtx, requestID, args)
+	if err != nil {
+		return OperationApprovalExecution{}, err
+	}
+	return OperationApprovalExecution{
+		Message: fmt.Sprintf("✅ 已追加飞书文档内容：[%s](%s)", escapeFeishuLinkText(out.DocumentID), out.URL),
 	}, nil
 }
 
@@ -685,41 +727,149 @@ func (t docsTool) authorizeDocumentAccess(ctx context.Context, chat ChatContext,
 	return store.FeishuChatDocument{}, false, nil
 }
 
-func (t docsTool) append(ctx context.Context, raw json.RawMessage) (string, error) {
+func (t docsTool) append(ctx context.Context, raw json.RawMessage) (string, string, error) {
+	payload, err := t.resolveAppendPayload(ctx, raw)
+	if err != nil {
+		return "", "", err
+	}
+	if t.approvals == nil {
+		return "", "", fmt.Errorf("feishu document append approval workflow is unavailable")
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return "", "", fmt.Errorf("marshal approved document append request: %w", err)
+	}
+	approval, err := t.approvals.CheckOrRequest(ctx, OperationApprovalRequest{
+		ToolName:      appendToolName,
+		ActionKey:     "append",
+		ResourceType:  "docx",
+		ResourceToken: payload.DocumentToken,
+		Fields: []ApprovalField{
+			{Label: "目标文档", Value: payload.DocumentToken},
+			{Label: "追加内容", Value: fmt.Sprintf("%d 个字符", utf8.RuneCountInString(payload.Content))},
+		},
+		Payload: payloadJSON,
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("check or request feishu document append approval: %w", err)
+	}
+	if approval.Status == OperationApprovalStatusPending {
+		content, marshalErr := marshalToolOutput(pendingApprovalOutput{
+			Status:    "pending_approval",
+			RequestID: approval.RequestID,
+			ExpiresAt: approval.ExpiresAt.UTC().Format(time.RFC3339),
+			Message:   "已向本次请求的飞书用户发送授权卡片；可同意本次，或永久允许相同用户、机器人账号、对话和 feishu_docs_append 对当前文档执行追加。批准后会异步追加内容，请勿重复调用。",
+		})
+		return content, approval.RequestID, marshalErr
+	}
+	if approval.Status != OperationApprovalStatusGranted {
+		return "", "", fmt.Errorf("unsupported feishu document append approval status %q", approval.Status)
+	}
+	request, err := t.store.CreateWorkflowRequest(store.WorkflowRequest{
+		AccountID: t.accountID,
+		Kind:      store.WorkflowRequestKindFeishuDocsAppend,
+		State:     store.WorkflowRequestStateExecuting,
+		CreatedAt: t.currentTime(),
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("create feishu document append workflow request: %w", err)
+	}
+	out, err := t.appendDocument(ctx, request.ID, payload)
+	if err != nil {
+		t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStateFailed)
+		return "", "", err
+	}
+	t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStateSucceeded)
+	content, marshalErr := marshalToolOutput(out)
+	return content, "", marshalErr
+}
+
+func (t docsTool) resolveAppendPayload(ctx context.Context, raw json.RawMessage) (approvedAppendPayload, error) {
 	var args appendArgs
 	if err := json.Unmarshal(raw, &args); err != nil {
-		return "", fmt.Errorf("parse arguments: %w", err)
+		return approvedAppendPayload{}, fmt.Errorf("parse arguments: %w", err)
 	}
 	if strings.TrimSpace(args.Content) == "" {
-		return "", fmt.Errorf("content is required")
+		return approvedAppendPayload{}, fmt.Errorf("content is required")
 	}
 	ref, err := parseDocRef(args.Token, args.URL, "docx")
 	if err != nil {
-		return "", err
+		return approvedAppendPayload{}, err
 	}
 	if ref.Kind != "docx" {
-		return "", fmt.Errorf("append supports docx documents only")
+		return approvedAppendPayload{}, fmt.Errorf("append supports docx documents only")
 	}
-	_, chat, err := trustedDocsScope(ctx)
+	actor, chat, err := trustedDocsScope(ctx)
 	if err != nil {
-		return "", err
+		return approvedAppendPayload{}, err
 	}
-	document, bound, err := t.authorizeDocumentAccess(ctx, chat, ref.Token, ResourcePermissionWrite)
+	payload := approvedAppendPayload{
+		DocumentToken: ref.Token,
+		Content:       args.Content,
+		FolderToken:   strings.TrimSpace(args.FolderToken),
+		ChatID:        chat.ChatID,
+		ActorOpenID:   actor.OpenID,
+		ActorUserID:   actor.UserID,
+	}
+	if err := t.validateAppendAccess(ctx, payload); err != nil {
+		return approvedAppendPayload{}, err
+	}
+	return payload, nil
+}
+
+func (t docsTool) parseApprovedAppendPayload(raw json.RawMessage) (approvedAppendPayload, error) {
+	var payload approvedAppendPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return approvedAppendPayload{}, fmt.Errorf("parse approved document append request: %w", err)
+	}
+	payload.DocumentToken = strings.TrimSpace(payload.DocumentToken)
+	payload.FolderToken = strings.TrimSpace(payload.FolderToken)
+	payload.ChatID = strings.TrimSpace(payload.ChatID)
+	payload.ActorOpenID = strings.TrimSpace(payload.ActorOpenID)
+	payload.ActorUserID = strings.TrimSpace(payload.ActorUserID)
+	if strings.TrimSpace(payload.Content) == "" {
+		return approvedAppendPayload{}, fmt.Errorf("approved document append content is required")
+	}
+	ref, err := parseDocRef(payload.DocumentToken, "", "docx")
 	if err != nil {
-		return "", err
+		return approvedAppendPayload{}, err
 	}
-	if folderToken := strings.TrimSpace(args.FolderToken); folderToken != "" {
+	payload.DocumentToken = ref.Token
+	if payload.ChatID == "" || (payload.ActorOpenID == "" && payload.ActorUserID == "") {
+		return approvedAppendPayload{}, fmt.Errorf("approved document append request is missing trusted chat or actor identity")
+	}
+	return payload, nil
+}
+
+func (t docsTool) validateAppendAccess(ctx context.Context, payload approvedAppendPayload) error {
+	document, bound, err := t.authorizeDocumentAccess(ctx, ChatContext{ChatID: payload.ChatID}, payload.DocumentToken, ResourcePermissionWrite)
+	if err != nil {
+		return err
+	}
+	if folderToken := payload.FolderToken; folderToken != "" {
 		if !bound {
-			return "", fmt.Errorf("folder_token can only validate a document bound to the current Feishu chat")
+			return fmt.Errorf("folder_token can only validate a document bound to the current Feishu chat")
 		}
 		if folderToken != document.FolderToken {
-			return "", fmt.Errorf("folder_token does not match the document binding in the current Feishu chat")
+			return fmt.Errorf("folder_token does not match the document binding in the current Feishu chat")
 		}
 	}
-	if err := t.appendTextBlocks(ctx, ref.Token, args.Content); err != nil {
-		return "", err
+	return nil
+}
+
+func (t docsTool) appendDocument(ctx context.Context, requestID string, payload approvedAppendPayload) (writeOutput, error) {
+	if err := t.validateAppendAccess(ctx, payload); err != nil {
+		return writeOutput{}, fmt.Errorf("revalidate approved document append access: %w", err)
 	}
-	return marshalToolOutput(writeOutput{DocumentID: ref.Token, URL: "https://docs.feishu.cn/docx/" + ref.Token, Appended: true})
+	if err := t.appendTextBlocks(ctx, payload.DocumentToken, payload.Content); err != nil {
+		return writeOutput{}, err
+	}
+	return writeOutput{
+		RequestID:  requestID,
+		DocumentID: payload.DocumentToken,
+		URL:        "https://docs.feishu.cn/docx/" + payload.DocumentToken,
+		Appended:   true,
+	}, nil
 }
 
 func (t docsTool) appendTextBlocks(ctx context.Context, documentID, content string) error {
@@ -882,7 +1032,7 @@ func escapeFeishuLinkText(value string) string {
 func docsAppendSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        appendToolName,
-		Description: "Append plain text paragraphs to a Feishu docx document. The tool checks Bot ownership or the current trusted user's scoped docx/write grant and live Feishu capability without sending cards itself. If authorization is missing it returns resource_authorization_required; call feishu_docs_request_access with the returned resource and permission, then retry. External access does not create a permanent chat binding.",
+		Description: "Append plain text paragraphs to a Feishu docx document. The tool first checks Bot ownership or the current trusted user's scoped docx/write grant and live Feishu capability without sending a resource card. If resource authorization is missing it returns resource_authorization_required; call feishu_docs_request_access with the returned resource and permission, then retry. After resource access succeeds, a matching append-operation grant executes immediately; otherwise the requester must approve an operation card. The append grant is isolated to this exact document and does not inherit from create or other tools. External access does not create a permanent chat binding.",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"token":{"type":"string"},"url":{"type":"string"},"content":{"type":"string"},"folder_token":{"type":"string","description":"Optional consistency check available only for a current-chat document binding."}},"required":["content"],"additionalProperties":false}`),
 	}
 }

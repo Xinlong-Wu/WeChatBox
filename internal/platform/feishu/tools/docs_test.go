@@ -51,14 +51,20 @@ func TestDocsToolConfigDefaultsAndRegistration(t *testing.T) {
 		t.Fatalf("read-only tools = %d, want search/read", len(got))
 	}
 	cfg.Docs.AllowWrite = true
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil, nil); len(got) != 3 {
-		t.Fatalf("write tools without approval workflow = %d, want search/read/append", len(got))
+	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil, nil); len(got) != 2 {
+		t.Fatalf("write tools without approval or resource access workflow = %d, want search/read", len(got))
 	}
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, &fakeApprovalRequester{}, nil); len(got) != 3 {
-		t.Fatalf("write tools without resource access workflow = %d, want search/read/append", len(got))
+	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, &fakeApprovalRequester{}, nil); len(got) != 2 {
+		t.Fatalf("write tools without resource access workflow = %d, want search/read", len(got))
 	}
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, &fakeApprovalRequester{}, grantedResourceAccessController("req_access")); len(got) != 4 {
+	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, &fakeApprovalRequester{result: OperationApprovalResult{Status: OperationApprovalStatusGranted}}, grantedResourceAccessController("req_access")); len(got) != 4 {
 		t.Fatalf("write tools with approval workflow = %d, want four tools", len(got))
+	} else {
+		createPolicy := findDocsTool(t, got, createToolName).(OperationApprovalExecutor).OperationApprovalPolicy()
+		appendPolicy := findDocsTool(t, got, appendToolName).(OperationApprovalExecutor).OperationApprovalPolicy()
+		if createPolicy.ActionKey != "create" || appendPolicy.ActionKey != "append" || createPolicy.ToolName == appendPolicy.ToolName {
+			t.Fatalf("operation policies create=%#v append=%#v, want independent actions", createPolicy, appendPolicy)
+		}
 	}
 }
 
@@ -94,7 +100,8 @@ func TestDocsReadAndAppendExternalDocumentUseResourceAccessWithoutBinding(t *tes
 		lark.WithHttpClient(server.Client()),
 	)
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
-	st, tools, access := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
+	approver := &fakeApprovalRequester{result: OperationApprovalResult{Status: OperationApprovalStatusGranted}}
+	st, tools, access := newDocsToolsForTest(t, client, cfg, approver)
 	readTool := findDocsTool(t, tools, readToolName)
 	read := readTool.Execute(groupDocsContext(), tooltypes.Call{
 		ID:        "read_external",
@@ -117,11 +124,115 @@ func TestDocsReadAndAppendExternalDocumentUseResourceAccessWithoutBinding(t *tes
 	if append.IsError || !strings.Contains(append.Content, `"appended":true`) || appendCalls != 1 {
 		t.Fatalf("external append result=%#v append_calls=%d", append, appendCalls)
 	}
-	if access.requirement.ResourceToken != documentToken || access.requirement.Permission != ResourcePermissionWrite {
-		t.Fatalf("external append requirement = %#v", access.requirement)
+	if len(access.requirements) != 3 || access.requirement.ResourceToken != documentToken || access.requirement.Permission != ResourcePermissionWrite {
+		t.Fatalf("external read/append requirements = %#v", access.requirements)
+	}
+	if approver.checks != 1 || approver.request.ToolName != appendToolName || approver.request.ActionKey != "append" || approver.request.ResourceType != "docx" || approver.request.ResourceToken != documentToken {
+		t.Fatalf("external append approval request = %#v checks=%d", approver.request, approver.checks)
 	}
 	if _, err := st.GetFeishuChatDocument("feishu:cli_test", "oc_chat", documentToken); !errors.Is(err, store.ErrFeishuChatDocumentNotFound) {
 		t.Fatalf("external document binding error = %v, want not found", err)
+	}
+}
+
+func TestDocsAppendToolReturnsPendingOperationApproval(t *testing.T) {
+	expiresAt := time.Date(2026, time.August, 1, 12, 10, 0, 0, time.UTC)
+	approver := &fakeApprovalRequester{result: OperationApprovalResult{
+		Status: OperationApprovalStatusPending, RequestID: "req_append", ExpiresAt: expiresAt,
+	}}
+	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
+	_, tools, access := newDocsToolsForTest(t, &lark.Client{}, cfg, approver)
+	result := findDocsTool(t, tools, appendToolName).Execute(groupDocsContext(), tooltypes.Call{
+		ID:        "append_pending",
+		Name:      appendToolName,
+		Arguments: json.RawMessage(`{"token":"doxcnappend12345","content":"private paragraph"}`),
+	})
+	if result.IsError || result.PendingWorkflowID != "req_append" {
+		t.Fatalf("pending append result = %#v", result)
+	}
+	var output pendingApprovalOutput
+	if err := json.Unmarshal([]byte(result.Content), &output); err != nil {
+		t.Fatalf("unmarshal pending append output: %v", err)
+	}
+	if output.Status != "pending_approval" || output.RequestID != "req_append" || output.ExpiresAt != expiresAt.Format(time.RFC3339) ||
+		!strings.Contains(output.Message, "永久允许") || !strings.Contains(output.Message, "请勿重复调用") {
+		t.Fatalf("pending append output = %#v", output)
+	}
+	if approver.checks != 1 || approver.request.ToolName != appendToolName || approver.request.ActionKey != "append" ||
+		approver.request.ResourceType != "docx" || approver.request.ResourceToken != "doxcnappend12345" {
+		t.Fatalf("append approval request = %#v checks=%d", approver.request, approver.checks)
+	}
+	var payload approvedAppendPayload
+	if err := json.Unmarshal(approver.request.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal approved append payload: %v", err)
+	}
+	if payload.DocumentToken != "doxcnappend12345" || payload.Content != "private paragraph" || payload.ChatID != "oc_chat" || payload.ActorOpenID != "ou_requester" {
+		t.Fatalf("approved append payload = %#v", payload)
+	}
+	for _, field := range approver.request.Fields {
+		if strings.Contains(field.Value, "private paragraph") {
+			t.Fatalf("append approval field leaked content: %#v", field)
+		}
+	}
+	if len(access.requirements) != 1 || access.requirement.ResourceToken != "doxcnappend12345" || access.requirement.Permission != ResourcePermissionWrite {
+		t.Fatalf("pending append access requirements = %#v", access.requirements)
+	}
+}
+
+func TestDocsAppendApprovedExecutionRevalidatesAndAppends(t *testing.T) {
+	const documentToken = "doxcnapproved12345"
+	var appendCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/oauth/v3/token" || r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200,
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodGet:
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"items": []any{}, "has_more": false}})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodPost:
+			appendCalls++
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"children": []any{}}})
+		default:
+			t.Fatalf("unexpected path: %s method=%s", r.URL.Path, r.Method)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
+	_, tools, access := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
+	executor := findDocsTool(t, tools, appendToolName).(OperationApprovalExecutor)
+	result, err := executor.ExecuteApproved(context.Background(), "req_append_approved", json.RawMessage(
+		`{"document_token":"doxcnapproved12345","content":"approved paragraph","chat_id":"oc_chat","actor_open_id":"ou_requester"}`,
+	))
+	if err != nil {
+		t.Fatalf("ExecuteApproved returned error: %v", err)
+	}
+	if result.Warning || appendCalls != 1 || !strings.Contains(result.Message, "https://docs.feishu.cn/docx/"+documentToken) {
+		t.Fatalf("approved append result=%#v append_calls=%d", result, appendCalls)
+	}
+	if len(access.requirements) != 1 || access.requirement.ResourceToken != documentToken || access.requirement.Permission != ResourcePermissionWrite ||
+		access.actor.OpenID != "ou_requester" || access.chat.ChatID != "oc_chat" {
+		t.Fatalf("approved append access requirements=%#v actor=%#v chat=%#v", access.requirements, access.actor, access.chat)
+	}
+}
+
+func TestDocsAppendApprovedExecutionStopsWhenAccessWasRevoked(t *testing.T) {
+	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
+	_, tools, access := newDocsToolsForTest(t, &lark.Client{}, cfg, &fakeApprovalRequester{})
+	access.err = errors.New("permission revoked")
+	executor := findDocsTool(t, tools, appendToolName).(OperationApprovalExecutor)
+
+	_, err := executor.ExecuteApproved(context.Background(), "req_append_approved", json.RawMessage(
+		`{"document_token":"doxcnrevoked12345","content":"must not append","chat_id":"oc_chat","actor_open_id":"ou_requester"}`,
+	))
+	if err == nil || !strings.Contains(err.Error(), "revalidate approved document append access") || !strings.Contains(err.Error(), "permission revoked") {
+		t.Fatalf("ExecuteApproved error = %v", err)
 	}
 }
 
@@ -253,7 +364,7 @@ func TestDocsCreateToolReturnsPendingApprovalWithoutCallingFeishuDocs(t *testing
 	if err := json.Unmarshal([]byte(result.Content), &output); err != nil {
 		t.Fatalf("unmarshal pending output: %v", err)
 	}
-	if output.Status != "pending_approval" || output.RequestID != "req_123" || output.ExpiresAt != expiresAt.Format(time.RFC3339) || !strings.Contains(output.Message, "24 小时") || !strings.Contains(output.Message, "请勿重复调用") {
+	if output.Status != "pending_approval" || output.RequestID != "req_123" || output.ExpiresAt != expiresAt.Format(time.RFC3339) || !strings.Contains(output.Message, "永久允许") || !strings.Contains(output.Message, "请勿重复调用") {
 		t.Fatalf("pending output = %#v", output)
 	}
 	if approver.checks != 1 {

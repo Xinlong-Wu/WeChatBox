@@ -484,44 +484,50 @@ rows persist `action_key`, `resource_type`, `resource_token`, and
 `supports_all`; older rows receive empty fail-closed scope fields rather than a
 compatibility authorization.
 
-`feishu_docs_create` declares the `create` action on its exact parent folder. A
-call first checks `folder/write` from trusted runtime context, then invokes the
-shared operation service. Without an active operation grant the service stores
-the exact request, sends the built-in raw Feishu Card V2 form to the current
-chat, and immediately returns `pending_approval` to the model. The form offers
-**同意一次**, **全部同意**, and **拒绝**, plus an optional suggestion field.
-Tools that disable reusable authorization do not receive an **全部同意** button,
-and a forged approve-all callback is rejected. Callback values carry
-LingoBridge's approval kind, approval ID, and action; the suggestion text is not
-persisted or written to logs (only whether it was present and its character
-count may be logged). No card ID or `template_id` configuration is required.
+`feishu_docs_create` declares the `create` action on its exact parent folder,
+while `feishu_docs_append` declares a separate `append` action on its exact
+target Docx. Each call first checks the required `folder/write` or `docx/write`
+resource access from trusted runtime context, then invokes the shared operation
+service. Without a matching operation grant the service stores the exact
+request, sends the built-in raw Feishu Card V2 form to the current chat, and
+immediately returns `pending_approval` to the model. The form offers **同意一次**,
+**全部同意**, and **拒绝**, plus an optional suggestion field. Tools that disable
+reusable authorization do not receive an **全部同意** button, and a forged
+approve-all callback is rejected. Callback values carry LingoBridge's approval
+kind, approval ID, and action; the suggestion text is not persisted or written
+to logs (only whether it was present and its character count may be logged). No
+card ID or `template_id` configuration is required.
 
 Only the Feishu user who triggered that LLM turn can act on the operation card.
 The callback is also bound to the original bot account, chat, and card message;
 the pending card expires after 10 minutes and can be consumed only once.
-**同意一次** executes only that stored request. **全部同意** also creates or
-renews a 24-hour grant keyed by the same Feishu user (preferring `open_id`), bot
-account, `chat_id`, and `feishu_docs_create` tool. The 24 hours start when the
-user clicks the button. A later call matching every scope field bypasses the
-operation card, but it never bypasses the trusted resource-access check. A
-different user, bot, chat, or tool, or an expired grant, requires a new
-operation card.
+**同意一次** executes only that stored workflow. **全部同意** also creates or
+renews a permanent local operation grant with the exact scope
+`account + actor + chat + tool + action + resource`. A later call matching every
+scope field bypasses the operation card, but it never bypasses the trusted
+resource-access check. Create and append grants do not inherit from each other,
+and a grant for one folder or document cannot authorize another resource. A
+different user, bot, chat, tool, action, or resource requires a new operation
+card. During schema migration, legacy 24-hour tool-wide grants are cleared
+fail-closed because they cannot be safely promoted to this permanent exact
+scope without a new user decision.
 
-Card-approved document creation runs asynchronously and updates the original
-card with the result; it does not send a second standalone success/failure text
-message. Immediately before execution, LingoBridge reconstructs the original
-trusted actor/chat context and revalidates the target folder. If permission was
-revoked, no document-create API call is made. The approval callback responds
-within three seconds; terminal denial/expiry states can replace the card in
-that response, while an approved asynchronous operation uses the callback
-token and Feishu's delayed card-update API for its final state. After Feishu
-creates the document, LingoBridge records Bot ownership and the current-chat
-binding before appending optional initial content. If any post-create step
-fails, the card and durable workflow result report partial success and tell the
-model not to create a duplicate; an initial append failure can be recovered
-through `feishu_docs_append`. `feishu_docs_append` remains an immediate write
-tool restricted to a document bound to the current trusted chat or an external
-Docx with a live scoped `docx/write` grant and Feishu capability.
+Card-approved document creation and append run asynchronously and update the
+original card with the result; they do not send a second standalone
+success/failure text message. Immediately before execution, LingoBridge
+reconstructs the original trusted actor/chat context and revalidates the exact
+target folder or document. If permission was revoked, no create or append API
+call is made. The approval callback responds within three seconds; terminal
+denial/expiry states can replace the card in that response, while an approved
+asynchronous operation uses the callback token and Feishu's delayed card-update
+API for its final state. After Feishu creates a document, LingoBridge records
+Bot ownership and the current-chat binding before appending optional initial
+content. If any post-create step fails, the card and durable workflow result
+report partial success and tell the model not to create a duplicate; an initial
+append failure can be recovered through `feishu_docs_append`, subject to that
+tool's independent operation approval. Append is restricted to a document
+bound to the current trusted chat or an external Docx with a live scoped
+`docx/write` grant and Feishu capability.
 
 Pending operation and resource-access requests survive process restarts in the
 Feishu platform SQLite database. The document payload is retained only while
@@ -750,7 +756,7 @@ guarded tools exposed for the current PR.
 | `platforms.feishu.tools.max_chars` | `12000` | Shared maximum character count for Feishu tools that return content, including `feishu_chat_history_get` and `feishu_docs_read` |
 | `platforms.feishu.tools.chat_history.enabled` | `false` | Enable `feishu_chat_history_get` for the current trusted Feishu `chat_id`; each call returns at most 100 messages |
 | `platforms.feishu.tools.docs.enabled` | `false` | Enable Feishu Docs tools for tool-capable LLM profiles |
-| `platforms.feishu.tools.docs.allow_write` | `false` | Register folder/document create and append tools. Protected tools check the trusted actor/chat's scoped resource grant directly and never accept an access request ID. Document create additionally requires requester-only operation approval unless the same user, bot account, chat, and tool have an active 24-hour grant |
+| `platforms.feishu.tools.docs.allow_write` | `false` | Register folder/document create and append tools when both resource access and operation approval services are available. Protected tools check the trusted actor/chat's scoped resource grant directly and never accept an access request ID. Document create and append each require requester-only operation approval unless a permanent grant matches the exact account, actor, chat, tool, action, and resource |
 | `platforms.feishu.tools.litellm.enabled` | `false` | Enable the Feishu natural-language LiteLLM account invitation tool |
 | `platforms.feishu.tools.litellm.base_url` | — | LiteLLM proxy base URL used for API calls and invitation link construction |
 | `platforms.feishu.tools.litellm.api_key` | — | LiteLLM admin/master API key used for `/user/new` and `/invitation/new` |
@@ -804,7 +810,7 @@ saved per-session model preference that no longer exists back to
         media/{safeUserId}/{safeSessionId}/
     feishu/
       data/
-        lingobridge.db                   # Feishu sessions, workflow requests/results/continuations, chat-bound Docs metadata, Bot resources, resource grants, operation approvals, and scoped 24-hour grants
+        lingobridge.db                   # Feishu sessions, workflow requests/results/continuations, chat-bound Docs metadata, Bot resources, resource grants, operation approvals, and permanent exact-scope operation grants
         sessions/{userId}/{sessionId}.jsonl # Revisioned conversation snapshots with compact provider_contexts and tool_traces
     github/
       data/

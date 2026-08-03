@@ -40,7 +40,7 @@ func (c pendingApprovalCard) JSON() (string, error) {
 	}
 	lines = append(lines, "", "- **同意一次**：仅执行当前请求。")
 	if c.policy.SupportsAll {
-		lines = append(lines, "- **全部同意**：从点击起 24 小时内，同一飞书用户、机器人账号、当前对话和该工具的后续请求免审批。")
+		lines = append(lines, "- **全部同意**：永久允许同一飞书用户、机器人账号、当前对话、工具和动作访问当前资源执行相同操作。")
 	}
 	lines = append(lines, fmt.Sprintf("本卡片将于 %s 过期。", c.approval.ExpiresAt.UTC().Format("2006-01-02 15:04 UTC")))
 	value := func(action string) map[string]interface{} {

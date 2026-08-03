@@ -138,12 +138,33 @@ func TestWorkflowMigrationBackfillsApprovalsAndRenamesGrantSource(t *testing.T) 
 	if actionKey != "" || resourceType != "" || resourceToken != "" || supportsAll != 0 {
 		t.Fatalf("legacy operation scope = %q/%q/%q/%d, want fail-closed empty defaults", actionKey, resourceType, resourceToken, supportsAll)
 	}
-	var sourceRequestID string
-	if err := st.db.QueryRow(`SELECT source_request_id FROM tool_approval_grants`).Scan(&sourceRequestID); err != nil {
-		t.Fatalf("query renamed grant source: %v", err)
+	var grantCount int
+	if err := st.db.QueryRow(`SELECT COUNT(*) FROM tool_approval_grants`).Scan(&grantCount); err != nil {
+		t.Fatalf("count migrated operation grants: %v", err)
 	}
-	if sourceRequestID != "legacy_request" {
-		t.Fatalf("source_request_id = %q, want legacy_request", sourceRequestID)
+	if grantCount != 0 {
+		t.Fatalf("migrated operation grants = %d, want legacy 24-hour grants cleared fail closed", grantCount)
+	}
+	grantColumns := map[string]bool{}
+	rows, err := st.db.Query(`PRAGMA table_info(tool_approval_grants)`)
+	if err != nil {
+		t.Fatalf("inspect migrated operation grant schema: %v", err)
+	}
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue interface{}
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			t.Fatalf("scan migrated operation grant schema: %v", err)
+		}
+		grantColumns[name] = true
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("close migrated operation grant schema: %v", err)
+	}
+	if !grantColumns["action_key"] || !grantColumns["resource_type"] || !grantColumns["resource_token"] || grantColumns["expires_at_ms"] {
+		t.Fatalf("migrated operation grant columns = %#v", grantColumns)
 	}
 	resource, err := st.GetFeishuBotResource("feishu:cli_test", "folder", "fld_legacy")
 	if err != nil || resource.Name != "Legacy Folder" || resource.SourceRequestID != "req_folder" {

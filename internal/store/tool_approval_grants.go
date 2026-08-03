@@ -15,19 +15,22 @@ const (
 
 // ToolApprovalGrantScope identifies one exact reusable authorization boundary.
 type ToolApprovalGrantScope struct {
-	AccountID string
-	ToolName  string
-	ActorType string
-	ActorID   string
-	ChatID    string
+	AccountID     string
+	ToolName      string
+	ActionKey     string
+	ResourceType  string
+	ResourceToken string
+	ActorType     string
+	ActorID       string
+	ChatID        string
 }
 
-// ToolApprovalGrant authorizes repeated calls within one scope until ExpiresAt.
+// ToolApprovalGrant permanently authorizes repeated calls within one exact
+// tool/action/resource scope until the row is explicitly removed.
 type ToolApprovalGrant struct {
 	ToolApprovalGrantScope
 	SourceRequestID string
 	CreatedAt       time.Time
-	ExpiresAt       time.Time
 	UpdatedAt       time.Time
 }
 
@@ -43,22 +46,23 @@ func (s *Store) UpsertToolApprovalGrant(grant ToolApprovalGrant) (ToolApprovalGr
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(
 		`INSERT INTO tool_approval_grants (
-			account_id, tool_name, actor_type, actor_id, chat_id,
-			source_request_id, created_at_ms, expires_at_ms, updated_at_ms
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(account_id, tool_name, actor_type, actor_id, chat_id) DO UPDATE SET
+			account_id, tool_name, action_key, resource_type, resource_token,
+			actor_type, actor_id, chat_id, source_request_id, created_at_ms, updated_at_ms
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(account_id, actor_type, actor_id, chat_id, tool_name, action_key, resource_type, resource_token) DO UPDATE SET
 			source_request_id=excluded.source_request_id,
 			created_at_ms=excluded.created_at_ms,
-			expires_at_ms=excluded.expires_at_ms,
 			updated_at_ms=excluded.updated_at_ms`,
 		grant.AccountID,
 		grant.ToolName,
+		grant.ActionKey,
+		grant.ResourceType,
+		grant.ResourceToken,
 		grant.ActorType,
 		grant.ActorID,
 		grant.ChatID,
 		grant.SourceRequestID,
 		grant.CreatedAt.UnixMilli(),
-		grant.ExpiresAt.UnixMilli(),
 		grant.UpdatedAt.UnixMilli(),
 	)
 	if err != nil {
@@ -67,48 +71,33 @@ func (s *Store) UpsertToolApprovalGrant(grant ToolApprovalGrant) (ToolApprovalGr
 	return grant, nil
 }
 
-// ActiveToolApprovalGrant returns an unexpired grant for one exact scope.
-// An expired matching row is removed lazily before lookup.
-func (s *Store) ActiveToolApprovalGrant(scope ToolApprovalGrantScope, now time.Time) (ToolApprovalGrant, bool, error) {
+// FindToolApprovalGrant returns one permanent grant for an exact scope.
+func (s *Store) FindToolApprovalGrant(scope ToolApprovalGrantScope) (ToolApprovalGrant, bool, error) {
 	scope = normalizeToolApprovalGrantScope(scope)
 	if err := validateToolApprovalGrantScope(scope); err != nil {
 		return ToolApprovalGrant{}, false, err
 	}
-	now = normalizedApprovalTime(now)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, err := s.db.Exec(
-		`DELETE FROM tool_approval_grants
-		 WHERE account_id=? AND tool_name=? AND actor_type=? AND actor_id=? AND chat_id=?
-		 AND expires_at_ms<=?`,
-		scope.AccountID,
-		scope.ToolName,
-		scope.ActorType,
-		scope.ActorID,
-		scope.ChatID,
-		now.UnixMilli(),
-	); err != nil {
-		return ToolApprovalGrant{}, false, fmt.Errorf("expire tool approval grant: %w", err)
-	}
 	grant, err := scanToolApprovalGrant(s.db.QueryRow(
-		`SELECT account_id, tool_name, actor_type, actor_id, chat_id,
-		 source_request_id, created_at_ms, expires_at_ms, updated_at_ms
+		`SELECT account_id, tool_name, action_key, resource_type, resource_token,
+		 actor_type, actor_id, chat_id, source_request_id, created_at_ms, updated_at_ms
 		 FROM tool_approval_grants
-		 WHERE account_id=? AND tool_name=? AND actor_type=? AND actor_id=? AND chat_id=?
-		 AND expires_at_ms>?`,
+		 WHERE account_id=? AND actor_type=? AND actor_id=? AND chat_id=?
+		 AND tool_name=? AND action_key=? AND resource_type=? AND resource_token=?`,
 		scope.AccountID,
-		scope.ToolName,
 		scope.ActorType,
 		scope.ActorID,
 		scope.ChatID,
-		now.UnixMilli(),
+		scope.ToolName,
+		scope.ActionKey,
+		scope.ResourceType,
+		scope.ResourceToken,
 	))
 	if errors.Is(err, sql.ErrNoRows) {
 		return ToolApprovalGrant{}, false, nil
 	}
 	if err != nil {
-		return ToolApprovalGrant{}, false, fmt.Errorf("get active tool approval grant: %w", err)
+		return ToolApprovalGrant{}, false, fmt.Errorf("get tool approval grant: %w", err)
 	}
 	return grant, true, nil
 }
@@ -119,22 +108,23 @@ type toolApprovalGrantScanner interface {
 
 func scanToolApprovalGrant(row toolApprovalGrantScanner) (ToolApprovalGrant, error) {
 	var grant ToolApprovalGrant
-	var createdAtMS, expiresAtMS, updatedAtMS int64
+	var createdAtMS, updatedAtMS int64
 	if err := row.Scan(
 		&grant.AccountID,
 		&grant.ToolName,
+		&grant.ActionKey,
+		&grant.ResourceType,
+		&grant.ResourceToken,
 		&grant.ActorType,
 		&grant.ActorID,
 		&grant.ChatID,
 		&grant.SourceRequestID,
 		&createdAtMS,
-		&expiresAtMS,
 		&updatedAtMS,
 	); err != nil {
 		return ToolApprovalGrant{}, err
 	}
 	grant.CreatedAt = time.UnixMilli(createdAtMS).UTC()
-	grant.ExpiresAt = time.UnixMilli(expiresAtMS).UTC()
 	grant.UpdatedAt = time.UnixMilli(updatedAtMS).UTC()
 	return grant, nil
 }
@@ -143,13 +133,15 @@ func normalizeToolApprovalGrant(grant ToolApprovalGrant) ToolApprovalGrant {
 	grant.ToolApprovalGrantScope = normalizeToolApprovalGrantScope(grant.ToolApprovalGrantScope)
 	grant.SourceRequestID = strings.TrimSpace(grant.SourceRequestID)
 	grant.CreatedAt = normalizedApprovalTime(grant.CreatedAt)
-	grant.ExpiresAt = grant.ExpiresAt.UTC()
 	return grant
 }
 
 func normalizeToolApprovalGrantScope(scope ToolApprovalGrantScope) ToolApprovalGrantScope {
 	scope.AccountID = strings.TrimSpace(scope.AccountID)
 	scope.ToolName = strings.TrimSpace(scope.ToolName)
+	scope.ActionKey = strings.TrimSpace(scope.ActionKey)
+	scope.ResourceType = strings.ToLower(strings.TrimSpace(scope.ResourceType))
+	scope.ResourceToken = strings.TrimSpace(scope.ResourceToken)
 	scope.ActorType = strings.TrimSpace(scope.ActorType)
 	scope.ActorID = strings.TrimSpace(scope.ActorID)
 	scope.ChatID = strings.TrimSpace(scope.ChatID)
@@ -163,15 +155,13 @@ func validateToolApprovalGrant(grant ToolApprovalGrant) error {
 	if grant.SourceRequestID == "" {
 		return fmt.Errorf("tool approval grant source_request_id is required")
 	}
-	if !grant.ExpiresAt.After(grant.CreatedAt) {
-		return fmt.Errorf("tool approval grant expires_at must be after created_at")
-	}
 	return nil
 }
 
 func validateToolApprovalGrantScope(scope ToolApprovalGrantScope) error {
-	if scope.AccountID == "" || scope.ToolName == "" || scope.ActorID == "" || scope.ChatID == "" {
-		return fmt.Errorf("tool approval grant account_id, tool_name, actor_id, and chat_id are required")
+	if scope.AccountID == "" || scope.ToolName == "" || scope.ActionKey == "" || scope.ResourceType == "" ||
+		scope.ResourceToken == "" || scope.ActorID == "" || scope.ChatID == "" {
+		return fmt.Errorf("tool approval grant account_id, tool_name, action_key, resource, actor_id, and chat_id are required")
 	}
 	if scope.ActorType != ToolApprovalActorTypeOpenID && scope.ActorType != ToolApprovalActorTypeUserID {
 		return fmt.Errorf("unsupported tool approval grant actor_type %q", scope.ActorType)

@@ -94,14 +94,19 @@ func (s *Store) migrate() error {
 		`CREATE TABLE IF NOT EXISTS tool_approval_grants (
 			account_id TEXT NOT NULL,
 			tool_name TEXT NOT NULL,
+			action_key TEXT NOT NULL,
+			resource_type TEXT NOT NULL,
+			resource_token TEXT NOT NULL,
 			actor_type TEXT NOT NULL,
 			actor_id TEXT NOT NULL,
 			chat_id TEXT NOT NULL,
 			source_request_id TEXT NOT NULL,
 			created_at_ms INTEGER NOT NULL,
-			expires_at_ms INTEGER NOT NULL,
 			updated_at_ms INTEGER NOT NULL,
-			PRIMARY KEY (account_id, tool_name, actor_type, actor_id, chat_id)
+			PRIMARY KEY (
+				account_id, actor_type, actor_id, chat_id,
+				tool_name, action_key, resource_type, resource_token
+			)
 		)`,
 		`CREATE TABLE IF NOT EXISTS feishu_chat_folders (
 			account_id TEXT NOT NULL,
@@ -238,6 +243,9 @@ func (s *Store) migrate() error {
 	if err := s.ensureToolApprovalOperationColumns(); err != nil {
 		return err
 	}
+	if err := s.migrateToolApprovalGrantScopes(); err != nil {
+		return err
+	}
 	if err := s.removeFeishuResourceAccessConsumptionColumns(); err != nil {
 		return err
 	}
@@ -275,8 +283,8 @@ func (s *Store) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_sessions_archived ON sessions(user_id, archived)`,
 		`CREATE INDEX IF NOT EXISTS idx_tool_approvals_account_state_expiry
 		 ON tool_approvals(account_id, state, expires_at_ms)`,
-		`CREATE INDEX IF NOT EXISTS idx_tool_approval_grants_account_expiry
-			 ON tool_approval_grants(account_id, expires_at_ms)`,
+		`CREATE INDEX IF NOT EXISTS idx_tool_approval_grants_account_scope
+			 ON tool_approval_grants(account_id, actor_type, actor_id, chat_id, tool_name, action_key)`,
 		`CREATE INDEX IF NOT EXISTS idx_workflow_requests_account_kind_state
 			 ON workflow_requests(account_id, kind, state, updated_at_ms)`,
 		`CREATE INDEX IF NOT EXISTS idx_workflow_results_account_state
@@ -605,6 +613,66 @@ func (s *Store) ensureToolApprovalOperationColumns() error {
 		if _, err := s.db.Exec(`ALTER TABLE tool_approvals ADD COLUMN ` + column.name + ` ` + column.definition); err != nil {
 			return fmt.Errorf("add tool approval %s column: %w", column.name, err)
 		}
+	}
+	return nil
+}
+
+func (s *Store) migrateToolApprovalGrantScopes() error {
+	hasActionKey, err := s.tableHasColumn("tool_approval_grants", "action_key")
+	if err != nil {
+		return fmt.Errorf("inspect tool approval grant action scope: %w", err)
+	}
+	hasResourceType, err := s.tableHasColumn("tool_approval_grants", "resource_type")
+	if err != nil {
+		return fmt.Errorf("inspect tool approval grant resource type scope: %w", err)
+	}
+	hasResourceToken, err := s.tableHasColumn("tool_approval_grants", "resource_token")
+	if err != nil {
+		return fmt.Errorf("inspect tool approval grant resource token scope: %w", err)
+	}
+	hasExpiry, err := s.tableHasColumn("tool_approval_grants", "expires_at_ms")
+	if err != nil {
+		return fmt.Errorf("inspect legacy tool approval grant expiry: %w", err)
+	}
+	if hasActionKey && hasResourceType && hasResourceToken && !hasExpiry {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tool approval grant scope migration: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`ALTER TABLE tool_approval_grants RENAME TO tool_approval_grants_legacy`); err != nil {
+		return fmt.Errorf("rename legacy tool approval grants: %w", err)
+	}
+	if _, err := tx.Exec(`CREATE TABLE tool_approval_grants (
+		account_id TEXT NOT NULL,
+		tool_name TEXT NOT NULL,
+		action_key TEXT NOT NULL,
+		resource_type TEXT NOT NULL,
+		resource_token TEXT NOT NULL,
+		actor_type TEXT NOT NULL,
+		actor_id TEXT NOT NULL,
+		chat_id TEXT NOT NULL,
+		source_request_id TEXT NOT NULL,
+		created_at_ms INTEGER NOT NULL,
+		updated_at_ms INTEGER NOT NULL,
+		PRIMARY KEY (
+			account_id, actor_type, actor_id, chat_id,
+			tool_name, action_key, resource_type, resource_token
+		)
+	)`); err != nil {
+		return fmt.Errorf("create exact tool approval grants: %w", err)
+	}
+	// Existing grants were approved as time-limited, tool-wide scopes. They
+	// cannot be promoted to permanent resource-specific authorization without a
+	// new user decision, so migration intentionally drops them fail closed.
+	if _, err := tx.Exec(`DROP TABLE tool_approval_grants_legacy`); err != nil {
+		return fmt.Errorf("drop legacy tool approval grants: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tool approval grant scope migration: %w", err)
 	}
 	return nil
 }
