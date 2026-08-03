@@ -123,37 +123,113 @@ func TestArchiveCurrentSessionFallsBack(t *testing.T) {
 	}
 }
 
-func TestResetUnavailableUserModels(t *testing.T) {
+func TestResetUnavailableSessionModels(t *testing.T) {
 	st := openTestStore(t)
 
-	if err := st.SetUserModelName("user1", "old"); err != nil {
-		t.Fatalf("SetUserModelName user1 returned error: %v", err)
+	user1, err := st.CreateSession("user1", "work")
+	if err != nil {
+		t.Fatalf("CreateSession user1 returned error: %v", err)
 	}
-	if err := st.SetUserModelName("user2", "deepseek"); err != nil {
-		t.Fatalf("SetUserModelName user2 returned error: %v", err)
+	user2, err := st.CreateSession("user2", "work")
+	if err != nil {
+		t.Fatalf("CreateSession user2 returned error: %v", err)
+	}
+	if err := st.SetSessionModelName("user1", user1.ID, "old"); err != nil {
+		t.Fatalf("SetSessionModelName user1 returned error: %v", err)
+	}
+	if err := st.SetSessionModelName("user2", user2.ID, "deepseek"); err != nil {
+		t.Fatalf("SetSessionModelName user2 returned error: %v", err)
 	}
 
-	count, err := st.ResetUnavailableUserModels("deepseek", []string{"deepseek", "gpt4o"})
+	count, err := st.ResetUnavailableSessionModels("deepseek", []string{"deepseek", "gpt4o"})
 	if err != nil {
-		t.Fatalf("ResetUnavailableUserModels returned error: %v", err)
+		t.Fatalf("ResetUnavailableSessionModels returned error: %v", err)
 	}
 	if count != 1 {
 		t.Fatalf("reset count = %d, want 1", count)
 	}
 
-	model, err := st.GetUserModelName("user1")
+	model, err := st.GetSessionModelName("user1", user1.ID)
 	if err != nil {
-		t.Fatalf("GetUserModelName user1 returned error: %v", err)
+		t.Fatalf("GetSessionModelName user1 returned error: %v", err)
 	}
 	if model != "deepseek" {
 		t.Fatalf("user1 model = %q, want deepseek", model)
 	}
-	model, err = st.GetUserModelName("user2")
+	model, err = st.GetSessionModelName("user2", user2.ID)
 	if err != nil {
-		t.Fatalf("GetUserModelName user2 returned error: %v", err)
+		t.Fatalf("GetSessionModelName user2 returned error: %v", err)
 	}
 	if model != "deepseek" {
 		t.Fatalf("user2 model = %q, want deepseek", model)
+	}
+}
+
+func TestOpenMigratesUserModelPreferenceToExistingSessions(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dataDir, err := config.EnsurePlatformDataDir(PlatformWeChat)
+	if err != nil {
+		t.Fatalf("EnsurePlatformDataDir returned error: %v", err)
+	}
+	dbPath := filepath.Join(dataDir, "lingobridge.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open returned error: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE sessions (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		name TEXT NOT NULL DEFAULT 'default',
+		archived INTEGER NOT NULL DEFAULT 0,
+		created_at TEXT NOT NULL DEFAULT (datetime('now'))
+	)`); err != nil {
+		t.Fatalf("create legacy sessions returned error: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE user_preferences (
+		user_id TEXT PRIMARY KEY,
+		current_session_id TEXT NOT NULL DEFAULT '',
+		model_name TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+	)`); err != nil {
+		t.Fatalf("create legacy preferences returned error: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO sessions (id, user_id, name, archived) VALUES
+		('work', 'user', 'work', 0),
+		('play', 'user', 'play', 0)`); err != nil {
+		t.Fatalf("insert legacy sessions returned error: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO user_preferences (user_id, current_session_id, model_name)
+		VALUES ('user', 'work', 'gpt4o')`); err != nil {
+		t.Fatalf("insert legacy preference returned error: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close returned error: %v", err)
+	}
+
+	st, err := Open(PlatformWeChat)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+	})
+	for _, sessionID := range []string{"work", "play"} {
+		model, err := st.GetSessionModelName("user", sessionID)
+		if err != nil {
+			t.Fatalf("GetSessionModelName %s returned error: %v", sessionID, err)
+		}
+		if model != "gpt4o" {
+			t.Fatalf("session %s model = %q, want gpt4o", sessionID, model)
+		}
+	}
+	hasLegacyColumn, err := st.tableHasColumn("user_preferences", "model_name")
+	if err != nil {
+		t.Fatalf("tableHasColumn returned error: %v", err)
+	}
+	if hasLegacyColumn {
+		t.Fatal("legacy user_preferences.model_name still exists after migration")
 	}
 }
 

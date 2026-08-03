@@ -20,6 +20,8 @@ type fakeSessionManager struct {
 	currentModel string
 	models       []string
 	clearCalled  bool
+	modelSession string
+	setSession   string
 }
 
 func (f *fakeSessionManager) CurrentSession(userID string) (*store.Session, error) {
@@ -70,14 +72,16 @@ func (f *fakeSessionManager) ClearSession(userID string) (*store.Session, error)
 	return &store.Session{ID: "cleared", UserID: userID, Name: "session-1", Current: true}, nil
 }
 
-func (f *fakeSessionManager) CurrentModel(userID string) (string, error) {
+func (f *fakeSessionManager) CurrentModel(userID, sessionID string) (string, error) {
+	f.modelSession = sessionID
 	if f.currentModel != "" {
 		return f.currentModel, nil
 	}
 	return "deepseek", nil
 }
 
-func (f *fakeSessionManager) SetModel(userID, modelName string) error {
+func (f *fakeSessionManager) SetModel(userID, sessionID, modelName string) error {
+	f.setSession = sessionID
 	if f.setModelErr != nil {
 		return f.setModelErr
 	}
@@ -289,7 +293,8 @@ func TestHandleListSessions(t *testing.T) {
 }
 
 func TestHandleCurrent(t *testing.T) {
-	resp, handled, err := Handle("/current", "user", &fakeSessionManager{currentModel: "gpt4o"})
+	manager := &fakeSessionManager{currentModel: "gpt4o"}
+	resp, handled, err := Handle("/current", "user", manager)
 	if err != nil {
 		t.Fatalf("Handle returned error: %v", err)
 	}
@@ -300,6 +305,9 @@ func TestHandleCurrent(t *testing.T) {
 		if !strings.Contains(resp, want) {
 			t.Fatalf("response = %q, want %s", resp, want)
 		}
+	}
+	if manager.modelSession != "current" {
+		t.Fatalf("model session = %q, want current", manager.modelSession)
 	}
 }
 
@@ -353,7 +361,8 @@ func TestHandleModelUnknown(t *testing.T) {
 }
 
 func TestHandleModelShowsCurrentAndAvailable(t *testing.T) {
-	resp, handled, err := Handle("/model", "user", &fakeSessionManager{currentModel: "gpt4o"})
+	manager := &fakeSessionManager{currentModel: "gpt4o"}
+	resp, handled, err := Handle("/model", "user", manager)
 	if err != nil {
 		t.Fatalf("Handle returned error: %v", err)
 	}
@@ -364,5 +373,25 @@ func TestHandleModelShowsCurrentAndAvailable(t *testing.T) {
 		if !strings.Contains(resp, want) {
 			t.Fatalf("response = %q, want %s", resp, want)
 		}
+	}
+	if manager.modelSession != "current" {
+		t.Fatalf("model session = %q, want current", manager.modelSession)
+	}
+}
+
+func TestHandleModelSetsCurrentSession(t *testing.T) {
+	manager := &fakeSessionManager{}
+	resp, handled, err := Handle("/model gpt4o", "user", manager)
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if !handled {
+		t.Fatal("Handle did not handle /model")
+	}
+	if !strings.Contains(resp, "gpt4o") {
+		t.Fatalf("response = %q, want gpt4o", resp)
+	}
+	if manager.setSession != "current" {
+		t.Fatalf("set model session = %q, want current", manager.setSession)
 	}
 }

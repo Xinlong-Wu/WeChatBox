@@ -23,13 +23,13 @@ func (s *Store) migrate() error {
 			id TEXT PRIMARY KEY,
 			user_id TEXT NOT NULL,
 			name TEXT NOT NULL DEFAULT 'default',
+			model_name TEXT NOT NULL DEFAULT '',
 			archived INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL DEFAULT (datetime('now'))
 		)`,
 		`CREATE TABLE IF NOT EXISTS user_preferences (
 			user_id TEXT PRIMARY KEY,
 			current_session_id TEXT NOT NULL DEFAULT '',
-			model_name TEXT NOT NULL DEFAULT '',
 			updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 		)`,
 		`CREATE TABLE IF NOT EXISTS workflow_requests (
@@ -157,6 +157,9 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("migrate: %w", err)
 		}
 	}
+	if err := s.migrateSessionModelPreferences(); err != nil {
+		return err
+	}
 	if err := s.renameToolApprovalGrantRequestIDColumn(); err != nil {
 		return err
 	}
@@ -210,6 +213,76 @@ func (s *Store) migrate() error {
 		}
 	}
 	return nil
+}
+
+func (s *Store) migrateSessionModelPreferences() error {
+	hasSessionModel, err := s.tableHasColumn("sessions", "model_name")
+	if err != nil {
+		return fmt.Errorf("inspect session model schema: %w", err)
+	}
+	if !hasSessionModel {
+		if _, err := s.db.Exec(`ALTER TABLE sessions ADD COLUMN model_name TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add session model column: %w", err)
+		}
+	}
+
+	hasLegacyUserModel, err := s.tableHasColumn("user_preferences", "model_name")
+	if err != nil {
+		return fmt.Errorf("inspect legacy user model schema: %w", err)
+	}
+	if !hasLegacyUserModel {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin session model migration: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
+		`UPDATE sessions
+		 SET model_name=(
+			SELECT user_preferences.model_name
+			FROM user_preferences
+			WHERE user_preferences.user_id=sessions.user_id
+		 )
+		 WHERE model_name=''
+		   AND EXISTS (
+			SELECT 1 FROM user_preferences
+			WHERE user_preferences.user_id=sessions.user_id
+			  AND user_preferences.model_name<>''
+		   )`,
+	); err != nil {
+		return fmt.Errorf("backfill session model preferences: %w", err)
+	}
+	if _, err := tx.Exec(`ALTER TABLE user_preferences DROP COLUMN model_name`); err != nil {
+		return fmt.Errorf("remove legacy user model column: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit session model migration: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) tableHasColumn(tableName, columnName string) (bool, error) {
+	rows, err := s.db.Query(`SELECT name FROM pragma_table_info(?)`, tableName)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return false, err
+		}
+		if name == columnName {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func (s *Store) ensureFeishuResourceAccessConsumptionColumns() error {

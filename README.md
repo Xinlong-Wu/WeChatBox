@@ -160,14 +160,14 @@ Send these as WeChat or Feishu text messages to the bot:
 | Command | Description |
 |---|---|
 | `/help` | Show Markdown-formatted in-chat commands and current platform tool summaries |
-| `/current` | Show current session and model |
+| `/current` | Show current session and that session's model |
 | `/new [name]` | Create a new conversation session |
 | `/list` | List your sessions |
 | `/switch <name>` | Switch current session |
 | `/rename <name>` | Rename current session |
 | `/archive [name]` | Archive a session |
 | `/clear` | Archive the current session and start a new one |
-| `/model [name]` | Show or switch model profile |
+| `/model [name]` | Show or switch the current session's model profile |
 | `/compact` | Manually compact the current session context |
 
 Platforms can narrow or extend the shared command set through their platform
@@ -718,8 +718,10 @@ The core config loader preserves `platforms.<platform>` as platform-private
 YAML and only validates that platform keys are safe registry IDs. Platform
 packages decode and validate their own config through core's scoped platform
 config API.
+Model selection is stored independently for each conversation session. New
+sessions use `llm.default_model` until `/model <name>` changes that session.
 On startup and reload, `run` validates the default model profile and resets any
-saved per-user model preference that no longer exists back to
+saved per-session model preference that no longer exists back to
 `llm.default_model`.
 
 ## Storage
@@ -731,7 +733,7 @@ saved per-user model preference that no longer exists back to
   platforms/
     wechat/
       data/
-        lingobridge.db                   # WeChat accounts, sessions, user preferences, sync cursors
+        lingobridge.db                   # WeChat accounts, sessions with model preferences, current-session pointers, sync cursors
         sessions/{userId}/{sessionId}.jsonl # Conversation snapshots; may include compact provider_contexts and tool_traces
         media/{safeUserId}/{safeSessionId}/
     feishu/
@@ -757,6 +759,10 @@ Bot-resource records, resource-access requests/grants, pending/completed tool
 approvals, reusable approval grants, and their global workflow request rows.
 Sessions and media are left intact because current history records are not
 account-id scoped.
+
+Each SQLite `sessions` row owns its `model_name`. During the schema migration
+from older databases, the former user-level model preference is copied to all
+existing sessions for that user and the legacy preference column is removed.
 
 ## Internal Architecture
 

@@ -78,15 +78,15 @@ func (f *fakeSessions) ArchiveSession(userID, sessionName string) (*store.Archiv
 func (f *fakeSessions) ClearSession(userID string) (*store.Session, error) {
 	return &store.Session{ID: "cleared", UserID: userID, Name: "session-1", Current: true}, nil
 }
-func (f *fakeSessions) CurrentModel(userID string) (string, error) {
+func (f *fakeSessions) CurrentModel(userID, sessionID string) (string, error) {
 	if f.model != "" {
 		return f.model, nil
 	}
 	return "deepseek", nil
 }
-func (f *fakeSessions) SetModel(userID, modelName string) error { return nil }
-func (f *fakeSessions) DefaultModelName() string                { return "deepseek" }
-func (f *fakeSessions) ListModels() []string                    { return []string{"deepseek"} }
+func (f *fakeSessions) SetModel(userID, sessionID, modelName string) error { return nil }
+func (f *fakeSessions) DefaultModelName() string                           { return "deepseek" }
+func (f *fakeSessions) ListModels() []string                               { return []string{"deepseek"} }
 
 type fakeLLM struct {
 	called          bool

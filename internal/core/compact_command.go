@@ -27,7 +27,7 @@ func (b *Bot) handleCompactCommand(ctx context.Context, msg InboundMessage, send
 		return err
 	}
 
-	model, llmClient, err := b.llmForUser(msg.UserKey)
+	model, llmClient, err := b.llmForSession(msg.UserKey, sess.ID)
 	if err != nil {
 		coreLog.Error(ctx, "resolve LLM for compact: %v", err)
 		_ = sender.Send(ctx, OutboundMessage{Text: "❌ 模型配置不可用，请检查配置。"})

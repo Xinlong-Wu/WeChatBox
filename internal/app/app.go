@@ -584,12 +584,12 @@ func (r *runtimeState) updateConfig(ctx context.Context, cfg config.Config) erro
 	}
 	runtimes := make(map[string]platformRuntime, len(r.stores))
 	for platformID, st := range r.stores {
-		resetCount, err := st.ResetUnavailableUserModels(cfg.LLM.DefaultModel, cfg.LLM.ModelNames())
+		resetCount, err := st.ResetUnavailableSessionModels(cfg.LLM.DefaultModel, cfg.LLM.ModelNames())
 		if err != nil {
-			return fmt.Errorf("reset %s user models: %w", platformID, err)
+			return fmt.Errorf("reset %s session models: %w", platformID, err)
 		}
 		if resetCount > 0 {
-			runtimeLog.Info(context.Background(), "reset %d %s user model preference(s) to default model %q", resetCount, platformID, cfg.LLM.DefaultModel)
+			runtimeLog.Info(context.Background(), "reset %d %s session model preference(s) to default model %q", resetCount, platformID, cfg.LLM.DefaultModel)
 		}
 		sm := session.NewManager(st, cfg.LLM)
 		handler := core.New(sm, cfg.LLM)

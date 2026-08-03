@@ -2,30 +2,42 @@ package store
 
 import "database/sql"
 
-// GetUserModelName returns the stored model preference for a user.
-func (s *Store) GetUserModelName(userID string) (string, error) {
+// GetSessionModelName returns the stored model preference for one active session.
+func (s *Store) GetSessionModelName(userID, sessionID string) (string, error) {
 	var modelName string
-	err := s.db.QueryRow(`SELECT model_name FROM user_preferences WHERE user_id=?`, userID).Scan(&modelName)
+	err := s.db.QueryRow(
+		`SELECT model_name FROM sessions WHERE user_id=? AND id=? AND archived=0`,
+		userID, sessionID,
+	).Scan(&modelName)
 	if err == sql.ErrNoRows {
-		return "", nil
+		return "", ErrSessionNotFound
 	}
 	return modelName, err
 }
 
-// SetUserModelName saves a model preference for a user.
-func (s *Store) SetUserModelName(userID, modelName string) error {
+// SetSessionModelName saves a model preference for one active session.
+func (s *Store) SetSessionModelName(userID, sessionID, modelName string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(
-		`INSERT INTO user_preferences (user_id, model_name, updated_at) VALUES (?, ?, datetime('now'))
-		 ON CONFLICT(user_id) DO UPDATE SET model_name=excluded.model_name, updated_at=excluded.updated_at`,
-		userID, modelName,
+	result, err := s.db.Exec(
+		`UPDATE sessions SET model_name=? WHERE user_id=? AND id=? AND archived=0`,
+		modelName, userID, sessionID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated == 0 {
+		return ErrSessionNotFound
+	}
+	return nil
 }
 
-// ResetUnavailableUserModels resets model preferences not present in validModels to defaultModel.
-func (s *Store) ResetUnavailableUserModels(defaultModel string, validModels []string) (int, error) {
+// ResetUnavailableSessionModels resets session model preferences not present in validModels.
+func (s *Store) ResetUnavailableSessionModels(defaultModel string, validModels []string) (int, error) {
 	valid := map[string]bool{}
 	for _, name := range validModels {
 		valid[name] = true
@@ -40,19 +52,19 @@ func (s *Store) ResetUnavailableUserModels(defaultModel string, validModels []st
 	}
 	defer tx.Rollback()
 
-	rows, err := tx.Query(`SELECT user_id, model_name FROM user_preferences WHERE model_name<>''`)
+	rows, err := tx.Query(`SELECT id, model_name FROM sessions WHERE model_name<>''`)
 	if err != nil {
 		return 0, err
 	}
-	var users []string
+	var sessionIDs []string
 	for rows.Next() {
-		var userID, modelName string
-		if err := rows.Scan(&userID, &modelName); err != nil {
+		var sessionID, modelName string
+		if err := rows.Scan(&sessionID, &modelName); err != nil {
 			rows.Close()
 			return 0, err
 		}
 		if !valid[modelName] {
-			users = append(users, userID)
+			sessionIDs = append(sessionIDs, sessionID)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -61,10 +73,10 @@ func (s *Store) ResetUnavailableUserModels(defaultModel string, validModels []st
 	}
 	rows.Close()
 
-	for _, userID := range users {
+	for _, sessionID := range sessionIDs {
 		if _, err := tx.Exec(
-			`UPDATE user_preferences SET model_name=?, updated_at=datetime('now') WHERE user_id=?`,
-			defaultModel, userID,
+			`UPDATE sessions SET model_name=? WHERE id=?`,
+			defaultModel, sessionID,
 		); err != nil {
 			return 0, err
 		}
@@ -72,7 +84,7 @@ func (s *Store) ResetUnavailableUserModels(defaultModel string, validModels []st
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	return len(users), nil
+	return len(sessionIDs), nil
 }
 
 func upsertCurrentSessionTx(tx *sql.Tx, userID, sessionID string) error {
