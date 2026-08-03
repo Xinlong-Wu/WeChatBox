@@ -29,17 +29,21 @@ const (
 	ResourceAccessSourceExistingGrant = "existing_grant"
 	ResourceAccessSourceNewlyGranted  = "newly_granted"
 
+	ResourceAccessMinOnceDurationMinutes = 10
+	ResourceAccessMaxOnceDurationMinutes = 60
+
 	maxResourceAccessReasonRunes = 500
 )
 
 // ResourceAccessRequest asks the platform runtime to verify or obtain one
 // read/write permission for the trusted current Feishu chat.
 type ResourceAccessRequest struct {
-	ResourceType  string `json:"resource_type"`
-	ResourceToken string `json:"resource_token"`
-	ResourceURL   string `json:"resource_url,omitempty"`
-	Permission    string `json:"permission"`
-	Reason        string `json:"reason,omitempty"`
+	ResourceType        string `json:"resource_type"`
+	ResourceToken       string `json:"resource_token"`
+	ResourceURL         string `json:"resource_url,omitempty"`
+	Permission          string `json:"permission"`
+	OnceDurationMinutes int    `json:"once_duration_minutes"`
+	Reason              string `json:"reason,omitempty"`
 }
 
 // ResourceAccessResult is returned by both the public tool and create-time validation.
@@ -185,6 +189,9 @@ func parseResourceAccessRequest(raw json.RawMessage) (ResourceAccessRequest, err
 	if request.Permission != ResourcePermissionRead && request.Permission != ResourcePermissionWrite {
 		return ResourceAccessRequest{}, fmt.Errorf("permission must be read or write")
 	}
+	if request.OnceDurationMinutes < ResourceAccessMinOnceDurationMinutes || request.OnceDurationMinutes > ResourceAccessMaxOnceDurationMinutes {
+		return ResourceAccessRequest{}, fmt.Errorf("once_duration_minutes must be between %d and %d", ResourceAccessMinOnceDurationMinutes, ResourceAccessMaxOnceDurationMinutes)
+	}
 	if utf8.RuneCountInString(request.Reason) > maxResourceAccessReasonRunes {
 		return ResourceAccessRequest{}, fmt.Errorf("reason must not exceed %d characters", maxResourceAccessReasonRunes)
 	}
@@ -228,7 +235,7 @@ func ResourceTokenAlias(token string) bool {
 func docsResourceAccessSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        ResourceAccessToolName,
-		Description: "Verify or request read/write access to one Feishu file or folder for the trusted current chat. Call this before every folder or document creation and pass the returned request_id to the create tool. Also call it before reading or appending an external document that is not bound to the current chat. Bot-owned resources return granted immediately. Existing chat-scoped grants are live-checked; otherwise the requester receives a card linking to Feishu's official OAuth page. If the browser cannot return directly to LingoBridge, the requester can paste the complete callback URL or authorization code into that card. write also satisfies read. Use resource_token=bot_root for the Bot root or chat_default_folder for the current chat's default Bot folder.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"resource_type":{"type":"string","enum":["folder","doc","docx","sheet","file","wiki","bitable","mindnote","minutes","slides"]},"resource_token":{"type":"string","description":"Exact Feishu resource token, or bot_root/chat_default_folder for a trusted Bot folder alias."},"resource_url":{"type":"string","description":"Optional Feishu resource URL used for the card and post-authorization redirect."},"permission":{"type":"string","enum":["read","write"]},"reason":{"type":"string","maxLength":500,"description":"Short user-visible reason for requesting access."}},"required":["resource_type","resource_token","permission"],"additionalProperties":false}`),
+		Description: "Verify or request read/write access to one exact Feishu file or folder for the trusted current user and chat. Bot-owned resources and existing valid grants return granted immediately. Otherwise the requester chooses either a temporary 10–60 minute grant or a permanent grant in a card; once_duration_minutes is the model's suggested temporary window and is shown to the user. write also satisfies read, while read never satisfies write. If Feishu-side permission is missing, LingoBridge reuses the requester's encrypted OAuth credential or updates the same card with Feishu's official OAuth handoff. Use resource_token=bot_root for the Bot root or chat_default_folder for the current chat's default Bot folder.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"resource_type":{"type":"string","enum":["folder","doc","docx","sheet","file","wiki","bitable","mindnote","minutes","slides"]},"resource_token":{"type":"string","description":"Exact Feishu resource token, or bot_root/chat_default_folder for a trusted Bot folder alias."},"resource_url":{"type":"string","description":"Optional Feishu resource URL used in the authorization card and post-OAuth redirect."},"permission":{"type":"string","enum":["read","write"]},"once_duration_minutes":{"type":"integer","minimum":10,"maximum":60,"description":"Suggested temporary authorization window shown on the card; the user can instead choose permanent authorization."},"reason":{"type":"string","maxLength":500,"description":"Short user-visible reason for requesting access."}},"required":["resource_type","resource_token","permission","once_duration_minutes"],"additionalProperties":false}`),
 	}
 }

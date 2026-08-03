@@ -51,18 +51,19 @@ func TestFeishuResourceAccessOAuthLifecycleAndChatScopedGrant(t *testing.T) {
 	st := openFeishuDocsTestStore(t)
 	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
 	request, err := st.CreateFeishuResourceAccessRequest(FeishuResourceAccessRequest{
-		AccountID:       "feishu:cli_test",
-		ActorOpenID:     "ou_requester",
-		ActorUserID:     "u_requester",
-		ChatID:          "oc_chat",
-		SourceMessageID: "om_source",
-		ResourceType:    "docx",
-		ResourceToken:   "doxcn_external",
-		ResourceURL:     "https://docs.feishu.cn/docx/doxcn_external",
-		Permission:      FeishuResourcePermissionWrite,
-		Reason:          "append the approved plan",
-		CreatedAt:       now,
-		ExpiresAt:       now.Add(10 * time.Minute),
+		AccountID:           "feishu:cli_test",
+		ActorOpenID:         "ou_requester",
+		ActorUserID:         "u_requester",
+		ChatID:              "oc_chat",
+		SourceMessageID:     "om_source",
+		ResourceType:        "docx",
+		ResourceToken:       "doxcn_external",
+		ResourceURL:         "https://docs.feishu.cn/docx/doxcn_external",
+		Permission:          FeishuResourcePermissionWrite,
+		Reason:              "append the approved plan",
+		OnceDurationMinutes: 30,
+		CreatedAt:           now,
+		ExpiresAt:           now.Add(10 * time.Minute),
 	})
 	if err != nil {
 		t.Fatalf("CreateFeishuResourceAccessRequest returned error: %v", err)
@@ -70,13 +71,18 @@ func TestFeishuResourceAccessOAuthLifecycleAndChatScopedGrant(t *testing.T) {
 	if !strings.HasPrefix(request.ID, "req_") || request.State != FeishuResourceAccessStatePending {
 		t.Fatalf("created request = %#v", request)
 	}
-	if err := st.PrepareFeishuResourceAccessOAuth(request.ID, request.AccountID, "state_hash", "", "openid", "ou_bot", now.Add(time.Second)); err != nil {
-		t.Fatalf("PrepareFeishuResourceAccessOAuth returned error: %v", err)
-	}
 	if err := st.SetFeishuResourceAccessCardMessageID(request.ID, request.AccountID, "om_card", now.Add(2*time.Second)); err != nil {
 		t.Fatalf("SetFeishuResourceAccessCardMessageID returned error: %v", err)
 	}
-	claimed, err := st.ClaimFeishuResourceAccessOAuth("state_hash", request.AccountID, now.Add(3*time.Second))
+	match := FeishuResourceAccessMatch{ActorOpenID: request.ActorOpenID, ActorUserID: request.ActorUserID, ChatID: request.ChatID, CardMessageID: "om_card"}
+	request, err = st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, FeishuResourceGrantModeOnce, match, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+	if err := st.PrepareFeishuResourceAccessOAuth(request.ID, request.AccountID, "state_hash", "", "openid", "ou_bot", now.Add(3*time.Second)); err != nil {
+		t.Fatalf("PrepareFeishuResourceAccessOAuth returned error: %v", err)
+	}
+	claimed, err := st.ClaimFeishuResourceAccessOAuth("state_hash", request.AccountID, now.Add(4*time.Second))
 	if err != nil {
 		t.Fatalf("ClaimFeishuResourceAccessOAuth returned error: %v", err)
 	}
@@ -174,17 +180,27 @@ func TestFeishuResourceAccessOAuthClaimReturnsAndClearsLegacyPKCEVerifier(t *tes
 	st := openFeishuDocsTestStore(t)
 	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
 	request, err := st.CreateFeishuResourceAccessRequest(FeishuResourceAccessRequest{
-		AccountID:     "feishu:cli_test",
-		ActorOpenID:   "ou_requester",
-		ChatID:        "oc_chat",
-		ResourceType:  "docx",
-		ResourceToken: "doxcn_external",
-		Permission:    FeishuResourcePermissionWrite,
-		CreatedAt:     now,
-		ExpiresAt:     now.Add(10 * time.Minute),
+		AccountID:           "feishu:cli_test",
+		ActorOpenID:         "ou_requester",
+		ChatID:              "oc_chat",
+		ResourceType:        "docx",
+		ResourceToken:       "doxcn_external",
+		Permission:          FeishuResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+		CreatedAt:           now,
+		ExpiresAt:           now.Add(10 * time.Minute),
 	})
 	if err != nil {
 		t.Fatalf("CreateFeishuResourceAccessRequest returned error: %v", err)
+	}
+	if err := st.SetFeishuResourceAccessCardMessageID(request.ID, request.AccountID, "om_card", now); err != nil {
+		t.Fatalf("SetFeishuResourceAccessCardMessageID returned error: %v", err)
+	}
+	request, err = st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, FeishuResourceGrantModeOnce, FeishuResourceAccessMatch{
+		ActorOpenID: request.ActorOpenID, ChatID: request.ChatID, CardMessageID: "om_card",
+	}, now)
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
 	}
 	if err := st.PrepareFeishuResourceAccessOAuth(request.ID, request.AccountID, "legacy_state_hash", "legacy_pkce_verifier", "openid", "ou_bot", now); err != nil {
 		t.Fatalf("PrepareFeishuResourceAccessOAuth returned error: %v", err)
@@ -208,7 +224,7 @@ func TestFeishuResourceAccessOAuthClaimReturnsAndClearsLegacyPKCEVerifier(t *tes
 func TestFeishuResourceAccessConsumptionIsAtomicAndExpires(t *testing.T) {
 	st := openFeishuDocsTestStore(t)
 	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
-	request := createPendingFeishuResourceAccess(t, st, now)
+	request := createUnapprovedFeishuResourceAccess(t, st, now)
 	if err := st.CompleteFeishuResourceAccessRequest(
 		request.ID,
 		request.AccountID,
@@ -244,7 +260,7 @@ func TestFeishuResourceAccessConsumptionIsAtomicAndExpires(t *testing.T) {
 		t.Fatalf("second consumption error = %v, want ErrFeishuResourceAccessConsumed", err)
 	}
 
-	expired := createPendingFeishuResourceAccess(t, st, now.Add(time.Hour))
+	expired := createUnapprovedFeishuResourceAccess(t, st, now.Add(time.Hour))
 	if err := st.CompleteFeishuResourceAccessRequest(
 		expired.ID,
 		expired.AccountID,
@@ -287,6 +303,165 @@ func TestFeishuResourceAccessDenyValidatesActorAndCard(t *testing.T) {
 	}
 	if _, err := st.DenyFeishuResourceAccessRequest(request.ID, request.AccountID, match, now.Add(2*time.Second)); !errors.Is(err, ErrFeishuResourceAccessResolved) {
 		t.Fatalf("second deny error = %v, want ErrFeishuResourceAccessResolved", err)
+	}
+}
+
+func TestFeishuResourceAccessApprovalPersistsChoiceAndListsRecovery(t *testing.T) {
+	st := openFeishuDocsTestStore(t)
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	request := createUnapprovedFeishuResourceAccess(t, st, now)
+	if err := st.SetFeishuResourceAccessCardMessageID(request.ID, request.AccountID, "om_choice", now); err != nil {
+		t.Fatalf("SetFeishuResourceAccessCardMessageID returned error: %v", err)
+	}
+	match := FeishuResourceAccessMatch{
+		ActorOpenID: request.ActorOpenID, ActorUserID: request.ActorUserID,
+		ChatID: request.ChatID, CardMessageID: "om_choice",
+	}
+	wrongActor := match
+	wrongActor.ActorOpenID = "ou_other"
+	if _, err := st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, FeishuResourceGrantModeOnce, wrongActor, now.Add(time.Second)); !errors.Is(err, ErrFeishuResourceAccessForbidden) {
+		t.Fatalf("wrong actor approval error = %v, want ErrFeishuResourceAccessForbidden", err)
+	}
+	wrongCard := match
+	wrongCard.CardMessageID = "om_other"
+	if _, err := st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, FeishuResourceGrantModeOnce, wrongCard, now.Add(time.Second)); !errors.Is(err, ErrFeishuResourceAccessContextMismatch) {
+		t.Fatalf("wrong card approval error = %v, want ErrFeishuResourceAccessContextMismatch", err)
+	}
+	decisionAt := now.Add(2 * time.Second)
+	approved, err := st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, FeishuResourceGrantModeOnce, match, decisionAt)
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+	if approved.GrantMode != FeishuResourceGrantModeOnce || !approved.DecisionAt.Equal(decisionAt) || approved.State != FeishuResourceAccessStatePending {
+		t.Fatalf("approved request = %#v", approved)
+	}
+	requests, err := st.ListApprovedPendingFeishuResourceAccessRequests(request.AccountID, decisionAt, 10)
+	if err != nil || len(requests) != 1 || requests[0].ID != request.ID {
+		t.Fatalf("approved recovery requests = %#v err=%v", requests, err)
+	}
+	if _, err := st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, FeishuResourceGrantModeAll, match, decisionAt.Add(time.Second)); !errors.Is(err, ErrFeishuResourceAccessResolved) {
+		t.Fatalf("duplicate approval error = %v, want ErrFeishuResourceAccessResolved", err)
+	}
+	if err := st.PrepareFeishuResourceAccessOAuth(request.ID, request.AccountID, "state_hash", "", "openid", "ou_bot", decisionAt.Add(time.Second)); err != nil {
+		t.Fatalf("PrepareFeishuResourceAccessOAuth returned error: %v", err)
+	}
+	requests, err = st.ListApprovedPendingFeishuResourceAccessRequests(request.AccountID, decisionAt, 10)
+	if err != nil || len(requests) != 0 {
+		t.Fatalf("OAuth-prepared recovery requests = %#v err=%v, want none", requests, err)
+	}
+}
+
+func TestFeishuResourceAccessApprovalExpiresAtCardDeadline(t *testing.T) {
+	st := openFeishuDocsTestStore(t)
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	request := createUnapprovedFeishuResourceAccess(t, st, now)
+	if err := st.SetFeishuResourceAccessCardMessageID(request.ID, request.AccountID, "om_choice", now); err != nil {
+		t.Fatalf("SetFeishuResourceAccessCardMessageID returned error: %v", err)
+	}
+	match := FeishuResourceAccessMatch{ActorOpenID: request.ActorOpenID, ChatID: request.ChatID, CardMessageID: "om_choice"}
+	expired, err := st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, FeishuResourceGrantModeOnce, match, request.ExpiresAt)
+	if !errors.Is(err, ErrFeishuResourceAccessExpired) || expired.State != FeishuResourceAccessStateExpired {
+		t.Fatalf("expired approval = %#v err=%v", expired, err)
+	}
+	workflow, err := st.GetWorkflowRequest(request.ID, request.AccountID)
+	if err != nil || workflow.State != WorkflowRequestStateExpired {
+		t.Fatalf("expired workflow = %#v err=%v", workflow, err)
+	}
+}
+
+func TestFeishuResourceAccessCompletionUsesDecisionModeAndCompletionTime(t *testing.T) {
+	st := openFeishuDocsTestStore(t)
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	request, err := st.CreateFeishuResourceAccessRequest(FeishuResourceAccessRequest{
+		AccountID: "feishu:cli_test", ActorOpenID: "ou_requester", ChatID: "oc_chat",
+		ResourceType: "docx", ResourceToken: "doxcn_external", Permission: FeishuResourcePermissionWrite,
+		OnceDurationMinutes: 45, SubjectType: "openid", SubjectID: "ou_bot",
+		CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("CreateFeishuResourceAccessRequest returned error: %v", err)
+	}
+	if err := st.SetFeishuResourceAccessCardMessageID(request.ID, request.AccountID, "om_choice", now); err != nil {
+		t.Fatalf("SetFeishuResourceAccessCardMessageID returned error: %v", err)
+	}
+	request, err = st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, FeishuResourceGrantModeOnce, FeishuResourceAccessMatch{
+		ActorOpenID: request.ActorOpenID, ChatID: request.ChatID, CardMessageID: "om_choice",
+	}, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+	completedAt := now.Add(5 * time.Minute)
+	capability := FeishuResourceCapability{
+		AccountID: request.AccountID, ResourceType: request.ResourceType, ResourceToken: request.ResourceToken,
+		SubjectType: request.SubjectType, SubjectID: request.SubjectID, Permission: request.Permission,
+		SourceActorOpenID: request.ActorOpenID, SourceRequestID: request.ID,
+		State: FeishuResourceCapabilityStateActive, CreatedAt: completedAt, VerifiedAt: completedAt,
+	}
+	grant := FeishuResourceGrant{
+		AccountID: request.AccountID, ActorType: FeishuResourceGrantActorTypeOpenID, ActorID: request.ActorOpenID,
+		ChatID: request.ChatID, ResourceType: request.ResourceType, ResourceToken: request.ResourceToken,
+		Permission: request.Permission, GrantMode: FeishuResourceGrantModeOnce, SourceRequestID: request.ID,
+		State: FeishuResourceGrantStateActive, CreatedAt: completedAt, UpdatedAt: completedAt, ExpiresAt: completedAt.Add(time.Minute),
+	}
+	if err := st.CompleteFeishuResourceAccessRequest(request.ID, request.AccountID, FeishuResourceGrantSourceNewlyGranted, request.Permission, &capability, &grant, completedAt); err != nil {
+		t.Fatalf("CompleteFeishuResourceAccessRequest returned error: %v", err)
+	}
+	storedGrant, active, err := st.ActiveFeishuResourceGrant(
+		request.AccountID, FeishuResourceGrantActorTypeOpenID, request.ActorOpenID, request.ChatID,
+		request.ResourceType, request.ResourceToken, request.Permission, completedAt,
+	)
+	wantExpiry := completedAt.Add(45 * time.Minute)
+	if err != nil || !active || storedGrant.GrantMode != FeishuResourceGrantModeOnce || !storedGrant.ExpiresAt.Equal(wantExpiry) || !storedGrant.CreatedAt.Equal(completedAt) {
+		t.Fatalf("completion-timed grant = %#v active=%t err=%v want_expiry=%s", storedGrant, active, err, wantExpiry)
+	}
+
+	allRequest, err := st.CreateFeishuResourceAccessRequest(FeishuResourceAccessRequest{
+		AccountID: "feishu:cli_test", ActorOpenID: "ou_requester", ChatID: "oc_chat",
+		ResourceType: "docx", ResourceToken: "doxcn_all", Permission: FeishuResourcePermissionRead,
+		OnceDurationMinutes: 30, SubjectType: "openid", SubjectID: "ou_bot",
+		CreatedAt: now.Add(time.Hour), ExpiresAt: now.Add(time.Hour + 10*time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("create all request: %v", err)
+	}
+	if err := st.SetFeishuResourceAccessCardMessageID(allRequest.ID, allRequest.AccountID, "om_all", allRequest.CreatedAt); err != nil {
+		t.Fatalf("bind all request card: %v", err)
+	}
+	allRequest, err = st.ApproveFeishuResourceAccessRequest(allRequest.ID, allRequest.AccountID, FeishuResourceGrantModeAll, FeishuResourceAccessMatch{
+		ActorOpenID: allRequest.ActorOpenID, ChatID: allRequest.ChatID, CardMessageID: "om_all",
+	}, allRequest.CreatedAt.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("approve all request: %v", err)
+	}
+	allCompletedAt := allRequest.CreatedAt.Add(2 * time.Minute)
+	allCapability := capability
+	allCapability.ResourceToken = allRequest.ResourceToken
+	allCapability.Permission = allRequest.Permission
+	allCapability.SourceRequestID = allRequest.ID
+	allCapability.CreatedAt = allCompletedAt
+	allCapability.VerifiedAt = allCompletedAt
+	wrongModeGrant := grant
+	wrongModeGrant.ResourceToken = allRequest.ResourceToken
+	wrongModeGrant.Permission = allRequest.Permission
+	wrongModeGrant.SourceRequestID = allRequest.ID
+	wrongModeGrant.CreatedAt = allCompletedAt
+	wrongModeGrant.UpdatedAt = allCompletedAt
+	wrongModeGrant.ExpiresAt = allCompletedAt.Add(time.Minute)
+	if err := st.CompleteFeishuResourceAccessRequest(allRequest.ID, allRequest.AccountID, FeishuResourceGrantSourceNewlyGranted, allRequest.Permission, &allCapability, &wrongModeGrant, allCompletedAt); err == nil || !strings.Contains(err.Error(), "grant mode") {
+		t.Fatalf("mismatched all completion error = %v", err)
+	}
+	allGrant := wrongModeGrant
+	allGrant.GrantMode = FeishuResourceGrantModeAll
+	allGrant.ExpiresAt = time.Time{}
+	if err := st.CompleteFeishuResourceAccessRequest(allRequest.ID, allRequest.AccountID, FeishuResourceGrantSourceNewlyGranted, allRequest.Permission, &allCapability, &allGrant, allCompletedAt); err != nil {
+		t.Fatalf("complete all request: %v", err)
+	}
+	storedAll, active, err := st.ActiveFeishuResourceGrant(
+		allRequest.AccountID, FeishuResourceGrantActorTypeOpenID, allRequest.ActorOpenID, allRequest.ChatID,
+		allRequest.ResourceType, allRequest.ResourceToken, allRequest.Permission, allCompletedAt,
+	)
+	if err != nil || !active || storedAll.GrantMode != FeishuResourceGrantModeAll || !storedAll.ExpiresAt.IsZero() {
+		t.Fatalf("permanent all grant = %#v active=%t err=%v", storedAll, active, err)
 	}
 }
 
@@ -578,30 +753,46 @@ func TestFeishuResourceAccessRecoveryClearsOneTimeSecrets(t *testing.T) {
 
 func createPendingFeishuResourceAccess(t *testing.T, st *Store, now time.Time) FeishuResourceAccessRequest {
 	t.Helper()
-	request, err := st.CreateFeishuResourceAccessRequest(FeishuResourceAccessRequest{
-		AccountID:     "feishu:cli_test",
-		ActorOpenID:   "ou_requester",
-		ActorUserID:   "u_requester",
-		ChatID:        "oc_chat",
-		ResourceType:  "docx",
-		ResourceToken: "doxcn_external",
-		Permission:    FeishuResourcePermissionRead,
-		CreatedAt:     now,
-		ExpiresAt:     now.Add(10 * time.Minute),
-	})
+	request := createUnapprovedFeishuResourceAccess(t, st, now)
+	if err := st.SetFeishuResourceAccessCardMessageID(request.ID, request.AccountID, "card_"+request.ID, now); err != nil {
+		t.Fatalf("SetFeishuResourceAccessCardMessageID returned error: %v", err)
+	}
+	match := FeishuResourceAccessMatch{
+		ActorOpenID: request.ActorOpenID, ActorUserID: request.ActorUserID,
+		ChatID: request.ChatID, CardMessageID: "card_" + request.ID,
+	}
+	var err error
+	request, err = st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, FeishuResourceGrantModeOnce, match, now)
 	if err != nil {
-		t.Fatalf("CreateFeishuResourceAccessRequest returned error: %v", err)
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
 	}
 	stateHash := "hash_" + request.ID
 	if err := st.PrepareFeishuResourceAccessOAuth(request.ID, request.AccountID, stateHash, "", "openid", "ou_bot", now); err != nil {
 		t.Fatalf("PrepareFeishuResourceAccessOAuth returned error: %v", err)
 	}
-	if err := st.SetFeishuResourceAccessCardMessageID(request.ID, request.AccountID, "card_"+request.ID, now); err != nil {
-		t.Fatalf("SetFeishuResourceAccessCardMessageID returned error: %v", err)
-	}
 	request.OAuthStateHash = stateHash
 	request.SubjectType = "openid"
 	request.SubjectID = "ou_bot"
 	request.CardMessageID = "card_" + request.ID
+	return request
+}
+
+func createUnapprovedFeishuResourceAccess(t *testing.T, st *Store, now time.Time) FeishuResourceAccessRequest {
+	t.Helper()
+	request, err := st.CreateFeishuResourceAccessRequest(FeishuResourceAccessRequest{
+		AccountID:           "feishu:cli_test",
+		ActorOpenID:         "ou_requester",
+		ActorUserID:         "u_requester",
+		ChatID:              "oc_chat",
+		ResourceType:        "docx",
+		ResourceToken:       "doxcn_external",
+		Permission:          FeishuResourcePermissionRead,
+		OnceDurationMinutes: 30,
+		CreatedAt:           now,
+		ExpiresAt:           now.Add(10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("CreateFeishuResourceAccessRequest returned error: %v", err)
+	}
 	return request
 }

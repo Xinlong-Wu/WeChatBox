@@ -178,14 +178,15 @@ func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
 			t.Fatalf("SaveFeishuBotResource returned error: %v", err)
 		}
 		access, err := st.CreateFeishuResourceAccessRequest(FeishuResourceAccessRequest{
-			AccountID:     accountID,
-			ActorOpenID:   "ou_requester",
-			ChatID:        folder.ChatID,
-			ResourceType:  "folder",
-			ResourceToken: folder.FolderToken,
-			Permission:    FeishuResourcePermissionWrite,
-			CreatedAt:     now,
-			ExpiresAt:     now.Add(time.Minute),
+			AccountID:           accountID,
+			ActorOpenID:         "ou_requester",
+			ChatID:              folder.ChatID,
+			ResourceType:        "folder",
+			ResourceToken:       folder.FolderToken,
+			Permission:          FeishuResourcePermissionWrite,
+			OnceDurationMinutes: 30,
+			CreatedAt:           now,
+			ExpiresAt:           now.Add(time.Minute),
 		})
 		if err != nil {
 			t.Fatalf("CreateFeishuResourceAccessRequest returned error: %v", err)

@@ -196,6 +196,41 @@ func TestFeishuUserAccessTokenMarksInvalidRefreshForReauthorization(t *testing.T
 	}
 }
 
+func TestFeishuUserAccessTokenRequiresReauthorizationWhenStoredScopesAreStale(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected OAuth request: %s", r.URL.Path)
+	}))
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	now := time.Date(2026, time.August, 3, 16, 30, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	if _, err := manager.persistFeishuOAuthCredential(context.Background(), feishuOAuthIdentity{
+		OpenID: "ou_requester",
+		UserID: "u_requester",
+	}, feishuOAuthTokenBundle{
+		AccessToken:           "access-token",
+		AccessTokenExpiresIn:  2 * time.Hour,
+		RefreshToken:          "refresh-token",
+		RefreshTokenExpiresIn: 24 * time.Hour,
+		Scopes:                "auth:user.id:read docs:permission.member:create offline_access",
+	}); err != nil {
+		t.Fatalf("persist OAuth credential: %v", err)
+	}
+
+	if _, err := manager.feishuUserAccessToken(context.Background(), "ou_requester", "u_requester"); !errors.Is(err, ErrFeishuUserOAuthReauthorizationNeeded) {
+		t.Fatalf("access token error = %v, want reauthorization for missing update scope", err)
+	}
+	credential, err := st.GetFeishuUserOAuthCredential(manager.account.ID, "ou_requester", "u_requester")
+	if err != nil || credential.Status != store.FeishuUserOAuthCredentialStatusReauthRequired ||
+		credential.AccessTokenCiphertext != "" || credential.RefreshTokenCiphertext != "" {
+		t.Fatalf("credential after stale scope detection = %#v err=%v", credential, err)
+	}
+}
+
 func TestFeishuUserAccessTokenRequiresReauthorizationAfterCredentialKeyRotation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatalf("unexpected refresh request: %s", r.URL.Path)

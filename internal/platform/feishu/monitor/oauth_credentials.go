@@ -214,6 +214,13 @@ func (m *resourceAccessManager) usableFeishuUserAccessToken(ctx context.Context,
 	if credential.Status != store.FeishuUserOAuthCredentialStatusActive {
 		return "", ErrFeishuUserOAuthReauthorizationNeeded
 	}
+	missingScopes := missingOAuthScopes(credential.Scopes, resourceAccessOAuthScope)
+	if len(missingScopes) > 0 {
+		m.markFeishuOAuthReauthorizationBestEffort(ctx, credential)
+		feishuLog.Warn(ctx, "stored feishu user OAuth credential lacks required resource scopes; reauthorization required account=%s credential=%s version=%d missing_scope_count=%d missing_scopes=%s",
+			m.account.ID, shortResourceRef(credential.ID), credential.Version, len(missingScopes), strings.Join(missingScopes, ","))
+		return "", ErrFeishuUserOAuthReauthorizationNeeded
+	}
 	if !credential.ReauthorizeAt.After(now) {
 		m.markFeishuOAuthReauthorizationBestEffort(ctx, credential)
 		return "", ErrFeishuUserOAuthReauthorizationNeeded
@@ -374,6 +381,21 @@ func canonicalOAuthScopes(scopes string) string {
 		}
 	}
 	return strings.Join(unique, " ")
+}
+
+func missingOAuthScopes(granted, required string) []string {
+	grantedSet := make(map[string]struct{}, len(strings.Fields(granted)))
+	for _, scope := range strings.Fields(granted) {
+		grantedSet[scope] = struct{}{}
+	}
+	missing := make([]string, 0)
+	for _, scope := range strings.Fields(required) {
+		if _, ok := grantedSet[scope]; !ok {
+			missing = append(missing, scope)
+		}
+	}
+	sort.Strings(missing)
+	return missing
 }
 
 func feishuOAuthRefreshRequiresReauthorization(err error) bool {

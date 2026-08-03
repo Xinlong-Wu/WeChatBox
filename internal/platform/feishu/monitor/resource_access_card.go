@@ -12,11 +12,102 @@ import (
 
 const (
 	resourceAccessCardActionKind        = "lingobridge_resource_access"
+	resourceAccessCardActionApproveOnce = "approve_once"
+	resourceAccessCardActionApproveAll  = "approve_all"
 	resourceAccessCardActionSubmitOAuth = "submit_oauth_callback"
 	resourceAccessCardActionReject      = "reject"
 	resourceAccessOAuthResultField      = "information_1"
 	resourceAccessOAuthResultMaxLength  = 1000
 )
+
+type pendingResourceGrantCard struct {
+	request store.FeishuResourceAccessRequest
+}
+
+func (c pendingResourceGrantCard) JSON() (string, error) {
+	permissionLabel := resourceAccessPermissionLabel(c.request.Permission)
+	lines := []string{
+		"机器人请求在当前飞书对话中使用以下资源：",
+		"",
+		"**权限**：" + permissionLabel,
+		"**资源类型**：" + escapeApprovalMarkdown(c.request.ResourceType),
+		"**资源 Token**：`" + escapeApprovalMarkdown(c.request.ResourceToken) + "`",
+		"**飞书协作者**：" + escapeApprovalMarkdown(resourceAccessSubjectLabel(c.request)),
+	}
+	if c.request.ResourceURL != "" {
+		lines = append(lines, "**资源链接**：[在飞书中打开]("+c.request.ResourceURL+")")
+	}
+	if c.request.Reason != "" {
+		lines = append(lines, "**用途**："+escapeApprovalMarkdown(c.request.Reason))
+	}
+	lines = append(lines,
+		"",
+		fmt.Sprintf("- **允许 %d 分钟**：飞书能力核验成功后，LingoBridge 在该时限内允许当前用户和对话多次使用此权限。", c.request.OnceDurationMinutes),
+		"- **永久允许**：为当前用户、机器人账号、当前对话和这一精确资源保存长期授权。",
+		"- 临时授权到期只会让 LingoBridge 停止放行新的操作，不会移除或降低飞书中的 Bot/群聊协作者权限。",
+		fmt.Sprintf("本卡片将于 %s 过期。", c.request.ExpiresAt.UTC().Format("2006-01-02 15:04 UTC")),
+	)
+	value := func(action string) map[string]interface{} {
+		return map[string]interface{}{
+			"kind":       resourceAccessCardActionKind,
+			"request_id": c.request.ID,
+			"action":     action,
+		}
+	}
+	card := map[string]interface{}{
+		"schema": "2.0",
+		"config": map[string]interface{}{"update_multi": true},
+		"header": map[string]interface{}{
+			"title":    map[string]interface{}{"tag": "plain_text", "content": "飞书资源权限申请"},
+			"subtitle": map[string]interface{}{"tag": "plain_text", "content": permissionLabel},
+			"text_tag_list": []interface{}{
+				map[string]interface{}{
+					"tag":   "text_tag",
+					"text":  map[string]interface{}{"tag": "plain_text", "content": "待授权"},
+					"color": "orange",
+				},
+			},
+			"template": "blue",
+			"padding":  "12px 8px 12px 8px",
+		},
+		"body": map[string]interface{}{
+			"direction":          "vertical",
+			"horizontal_spacing": "8px",
+			"vertical_spacing":   "8px",
+			"horizontal_align":   "left",
+			"vertical_align":     "top",
+			"elements": []interface{}{
+				map[string]interface{}{
+					"tag": "form",
+					"elements": []interface{}{
+						map[string]interface{}{
+							"tag":        "markdown",
+							"content":    strings.Join(lines, "\n"),
+							"text_align": "left",
+							"text_size":  "normal",
+							"margin":     "0px 0px 0px 0px",
+							"element_id": "SnLSJiYBwzi2qzhJsFPP",
+						},
+						approvalFormButton(fmt.Sprintf("允许 %d 分钟", c.request.OnceDurationMinutes), "primary_filled", "Button_resource_once", value(resourceAccessCardActionApproveOnce)),
+						approvalFormButton("永久允许", "primary", "Button_resource_all", value(resourceAccessCardActionApproveAll)),
+						approvalReasonRow(value(resourceAccessCardActionReject)),
+					},
+					"direction":        "vertical",
+					"horizontal_align": "left",
+					"vertical_align":   "top",
+					"padding":          "4px 0px 4px 0px",
+					"margin":           "0px 0px 0px 0px",
+					"name":             "Form_resource_access",
+				},
+			},
+		},
+	}
+	data, err := json.Marshal(card)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
 
 type pendingResourceAccessCard struct {
 	request store.FeishuResourceAccessRequest
@@ -24,16 +115,15 @@ type pendingResourceAccessCard struct {
 }
 
 func (c pendingResourceAccessCard) JSON() (string, error) {
-	permissionLabel := "读取"
-	if c.request.Permission == store.FeishuResourcePermissionWrite {
-		permissionLabel = "写入"
-	}
+	permissionLabel := resourceAccessPermissionLabel(c.request.Permission)
 	lines := []string{
 		"机器人需要由本次请求的飞书用户授权，才能为当前对话访问该资源。",
 		"",
 		"**权限**：" + permissionLabel,
 		"**资源类型**：" + escapeApprovalMarkdown(c.request.ResourceType),
 		"**资源 Token**：`" + escapeApprovalMarkdown(c.request.ResourceToken) + "`",
+		"**飞书协作者**：" + escapeApprovalMarkdown(resourceAccessSubjectLabel(c.request)),
+		"**LingoBridge 授权**：" + escapeApprovalMarkdown(resourceAccessGrantModeLabel(c.request)),
 	}
 	if c.request.Reason != "" {
 		lines = append(lines, "**用途**："+escapeApprovalMarkdown(c.request.Reason))
@@ -226,10 +316,39 @@ func parseResourceAccessCardAction(event *callback.CardActionTriggerEvent) (stri
 	}
 	requestID := strings.TrimSpace(stringApprovalValue(event.Event.Action.Value, "request_id"))
 	action := strings.TrimSpace(stringApprovalValue(event.Event.Action.Value, "action"))
-	if requestID == "" || (action != resourceAccessCardActionSubmitOAuth && action != resourceAccessCardActionReject) {
+	if requestID == "" || (action != resourceAccessCardActionApproveOnce && action != resourceAccessCardActionApproveAll && action != resourceAccessCardActionSubmitOAuth && action != resourceAccessCardActionReject) {
 		return requestID, action, false
 	}
 	return requestID, action, true
+}
+
+func resourceAccessPermissionLabel(permission string) string {
+	if permission == store.FeishuResourcePermissionWrite {
+		return "写入（包含读取）"
+	}
+	return "读取"
+}
+
+func resourceAccessSubjectLabel(request store.FeishuResourceAccessRequest) string {
+	switch strings.TrimSpace(request.SubjectType) {
+	case "openchat":
+		return "当前群聊（openchat）"
+	case "openid":
+		return "机器人（Bot）"
+	default:
+		return "待核验的机器人或群聊协作者"
+	}
+}
+
+func resourceAccessGrantModeLabel(request store.FeishuResourceAccessRequest) string {
+	switch request.GrantMode {
+	case store.FeishuResourceGrantModeOnce:
+		return fmt.Sprintf("允许 %d 分钟", request.OnceDurationMinutes)
+	case store.FeishuResourceGrantModeAll:
+		return "永久允许"
+	default:
+		return "等待用户选择"
+	}
 }
 
 func resourceAccessCardOAuthResult(event *callback.CardActionTriggerEvent) string {

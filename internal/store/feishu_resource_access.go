@@ -53,6 +53,9 @@ const (
 
 	FeishuResourceGrantActorTypeOpenID = "open_id"
 	FeishuResourceGrantActorTypeUserID = "user_id"
+
+	FeishuResourceAccessMinOnceDurationMinutes = 10
+	FeishuResourceAccessMaxOnceDurationMinutes = 60
 )
 
 // FeishuBotResource records one folder or file created and owned by the Bot account.
@@ -84,6 +87,9 @@ type FeishuResourceAccessRequest struct {
 	ResourceURL         string
 	Permission          string
 	Reason              string
+	OnceDurationMinutes int
+	GrantMode           string
+	DecisionAt          time.Time
 	SubjectType         string
 	SubjectID           string
 	GrantSource         string
@@ -218,10 +224,11 @@ func (s *Store) CreateFeishuResourceAccessRequest(request FeishuResourceAccessRe
 		`INSERT INTO feishu_resource_access_requests (
 			id, account_id, actor_open_id, actor_user_id, chat_id, source_message_id,
 			resource_type, resource_token, resource_url, permission, reason,
+			once_duration_minutes, grant_mode, decision_at_ms,
 			subject_type, subject_id, grant_source, verified_permission,
 			card_message_id, oauth_state_hash, pkce_verifier, state,
 			created_at_ms, expires_at_ms, updated_at_ms
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', '', '', '', ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, ?, ?, '', '', '', '', '', ?, ?, ?, ?)`,
 		request.ID,
 		request.AccountID,
 		request.ActorOpenID,
@@ -233,6 +240,7 @@ func (s *Store) CreateFeishuResourceAccessRequest(request FeishuResourceAccessRe
 		request.ResourceURL,
 		request.Permission,
 		request.Reason,
+		request.OnceDurationMinutes,
 		request.SubjectType,
 		request.SubjectID,
 		request.State,
@@ -252,6 +260,9 @@ func (s *Store) CreateFeishuResourceAccessRequest(request FeishuResourceAccessRe
 // PrepareFeishuResourceAccessOAuth binds the one-time OAuth state. verifier is kept
 // for compatibility with requests created by older PKCE-enabled versions.
 func (s *Store) PrepareFeishuResourceAccessOAuth(id, accountID, stateHash, verifier, subjectType, subjectID string, now time.Time) error {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return err
+	}
 	id = strings.TrimSpace(id)
 	accountID = strings.TrimSpace(accountID)
 	stateHash = strings.TrimSpace(stateHash)
@@ -267,7 +278,8 @@ func (s *Store) PrepareFeishuResourceAccessOAuth(id, accountID, stateHash, verif
 	result, err := s.db.Exec(
 		`UPDATE feishu_resource_access_requests
 		 SET oauth_state_hash=?, pkce_verifier=?, subject_type=?, subject_id=?, updated_at_ms=?
-		 WHERE id=? AND account_id=? AND state=? AND oauth_state_hash='' AND pkce_verifier=''`,
+		 WHERE id=? AND account_id=? AND state=? AND grant_mode<>''
+		 AND oauth_state_hash='' AND pkce_verifier=''`,
 		stateHash, verifier, subjectType, subjectID, now.UnixMilli(),
 		id, accountID, FeishuResourceAccessStatePending,
 	)
@@ -279,6 +291,9 @@ func (s *Store) PrepareFeishuResourceAccessOAuth(id, accountID, stateHash, verif
 
 // SetFeishuResourceAccessCardMessageID binds the pending request to the exact card message.
 func (s *Store) SetFeishuResourceAccessCardMessageID(id, accountID, messageID string, now time.Time) error {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return err
+	}
 	id = strings.TrimSpace(id)
 	accountID = strings.TrimSpace(accountID)
 	messageID = strings.TrimSpace(messageID)
@@ -298,6 +313,116 @@ func (s *Store) SetFeishuResourceAccessCardMessageID(id, accountID, messageID st
 		return fmt.Errorf("bind feishu resource access card: %w", err)
 	}
 	return requireOneFeishuResourceAccessRow(result)
+}
+
+// ApproveFeishuResourceAccessRequest records the requester's once/all choice
+// while leaving the workflow pending for capability verification or OAuth.
+func (s *Store) ApproveFeishuResourceAccessRequest(id, accountID, grantMode string, match FeishuResourceAccessMatch, now time.Time) (FeishuResourceAccessRequest, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return FeishuResourceAccessRequest{}, err
+	}
+	id = strings.TrimSpace(id)
+	accountID = strings.TrimSpace(accountID)
+	grantMode = strings.TrimSpace(grantMode)
+	match = normalizeFeishuResourceAccessMatch(match)
+	if id == "" || accountID == "" || !validFeishuResourceGrantMode(grantMode) {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("feishu resource access id, account, and grant mode are required")
+	}
+	now = normalizedWorkflowTime(now)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("begin approve feishu resource access: %w", err)
+	}
+	defer tx.Rollback()
+	request, err := feishuResourceAccessByID(tx, id, accountID)
+	if err != nil {
+		return FeishuResourceAccessRequest{}, err
+	}
+	if request.State != FeishuResourceAccessStatePending || request.GrantMode != "" || request.OAuthStateHash != "" {
+		return request, ErrFeishuResourceAccessResolved
+	}
+	if request.OnceDurationMinutes < FeishuResourceAccessMinOnceDurationMinutes || request.OnceDurationMinutes > FeishuResourceAccessMaxOnceDurationMinutes {
+		return request, fmt.Errorf("stored feishu resource access once duration is invalid")
+	}
+	if !now.Before(request.ExpiresAt) {
+		if err := updateFeishuResourceAccessTerminal(tx, request.ID, request.AccountID, FeishuResourceAccessStateExpired, "", "", now); err != nil {
+			return FeishuResourceAccessRequest{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return FeishuResourceAccessRequest{}, fmt.Errorf("commit expired feishu resource approval: %w", err)
+		}
+		request.State = FeishuResourceAccessStateExpired
+		request.UpdatedAt = now
+		return request, ErrFeishuResourceAccessExpired
+	}
+	if !feishuResourceAccessActorMatches(request, match) {
+		return request, ErrFeishuResourceAccessForbidden
+	}
+	if request.ChatID != match.ChatID || request.CardMessageID == "" || request.CardMessageID != match.CardMessageID {
+		return request, ErrFeishuResourceAccessContextMismatch
+	}
+	result, err := tx.Exec(
+		`UPDATE feishu_resource_access_requests
+		 SET grant_mode=?, decision_at_ms=?, updated_at_ms=?
+		 WHERE id=? AND account_id=? AND state=? AND grant_mode='' AND oauth_state_hash=''`,
+		grantMode, now.UnixMilli(), now.UnixMilli(), request.ID, request.AccountID, FeishuResourceAccessStatePending,
+	)
+	if err != nil {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("approve feishu resource access: %w", err)
+	}
+	if err := requireOneFeishuResourceAccessRow(result); err != nil {
+		return FeishuResourceAccessRequest{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("commit approved feishu resource access: %w", err)
+	}
+	request.GrantMode = grantMode
+	request.DecisionAt = now
+	request.UpdatedAt = now
+	return request, nil
+}
+
+// ListApprovedPendingFeishuResourceAccessRequests returns approved requests
+// that have not yet transitioned to OAuth or a terminal result.
+func (s *Store) ListApprovedPendingFeishuResourceAccessRequests(accountID string, now time.Time, limit int) ([]FeishuResourceAccessRequest, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return nil, err
+	}
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil, fmt.Errorf("feishu resource access account is required")
+	}
+	now = normalizedWorkflowTime(now)
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.Query(
+		feishuResourceAccessSelect+`
+		 WHERE account_id=? AND state=? AND grant_mode IN (?, ?) AND decision_at_ms>0
+		 AND oauth_state_hash='' AND expires_at_ms>?
+		 ORDER BY decision_at_ms, created_at_ms LIMIT ?`,
+		accountID, FeishuResourceAccessStatePending,
+		FeishuResourceGrantModeOnce, FeishuResourceGrantModeAll,
+		now.UnixMilli(), limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list approved pending feishu resource access requests: %w", err)
+	}
+	defer rows.Close()
+	requests := make([]FeishuResourceAccessRequest, 0)
+	for rows.Next() {
+		request, err := scanFeishuResourceAccessRequest(rows)
+		if err != nil {
+			return nil, err
+		}
+		requests = append(requests, request)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate approved pending feishu resource access requests: %w", err)
+	}
+	return requests, nil
 }
 
 // GetFeishuResourceAccessRequest returns one request by its global ID and account.
@@ -436,6 +561,9 @@ func (s *Store) claimFeishuResourceAccessOAuthRequest(
 	if request.State != FeishuResourceAccessStatePending {
 		return request, ErrFeishuResourceAccessResolved
 	}
+	if !validFeishuResourceGrantMode(request.GrantMode) || request.DecisionAt.IsZero() {
+		return request, ErrFeishuResourceAccessResolved
+	}
 	if !now.Before(request.ExpiresAt) {
 		if err := updateFeishuResourceAccessTerminal(tx, request.ID, request.AccountID, FeishuResourceAccessStateExpired, "", "", now); err != nil {
 			return FeishuResourceAccessRequest{}, err
@@ -504,7 +632,7 @@ func (s *Store) DenyFeishuResourceAccessRequest(id, accountID string, match Feis
 	if err != nil {
 		return FeishuResourceAccessRequest{}, err
 	}
-	if request.State != FeishuResourceAccessStatePending {
+	if request.State != FeishuResourceAccessStatePending || (request.GrantMode != "" && request.OAuthStateHash == "") {
 		return request, ErrFeishuResourceAccessResolved
 	}
 	if !now.Before(request.ExpiresAt) {
@@ -622,6 +750,30 @@ func (s *Store) CompleteFeishuResourceAccessRequest(
 		}
 		if normalizedGrant.ChatID != request.ChatID || normalizedGrant.ResourceType != request.ResourceType || normalizedGrant.ResourceToken != request.ResourceToken {
 			return fmt.Errorf("feishu resource grant does not match the access request scope")
+		}
+	}
+	if request.GrantMode != "" {
+		if !validFeishuResourceGrantMode(request.GrantMode) || request.DecisionAt.IsZero() {
+			return fmt.Errorf("feishu resource access request has an invalid grant decision")
+		}
+		if grant == nil {
+			return fmt.Errorf("approved feishu resource access request requires a local grant")
+		}
+		if normalizedGrant.GrantMode != request.GrantMode {
+			return fmt.Errorf("feishu resource grant mode does not match the access request decision")
+		}
+		if normalizedGrant.Permission != request.Permission {
+			return fmt.Errorf("feishu resource grant permission does not match the access request")
+		}
+		normalizedGrant.CreatedAt = now
+		normalizedGrant.UpdatedAt = now
+		if request.GrantMode == FeishuResourceGrantModeOnce {
+			normalizedGrant.ExpiresAt = now.Add(time.Duration(request.OnceDurationMinutes) * time.Minute)
+		} else {
+			normalizedGrant.ExpiresAt = time.Time{}
+		}
+		if err := validateFeishuResourceGrant(normalizedGrant); err != nil {
+			return err
 		}
 	}
 	result, err := tx.Exec(
@@ -918,7 +1070,8 @@ func FeishuResourcePermissionSatisfies(granted, requested string) bool {
 
 const feishuResourceAccessSelect = `SELECT id, account_id, actor_open_id, actor_user_id,
  chat_id, source_message_id, resource_type, resource_token, resource_url,
- permission, reason, subject_type, subject_id, grant_source, verified_permission,
+ permission, reason, once_duration_minutes, grant_mode, decision_at_ms,
+ subject_type, subject_id, grant_source, verified_permission,
  card_message_id, oauth_state_hash, pkce_verifier, state,
  consumed_by_request_id, consumed_at_ms, created_at_ms, expires_at_ms, updated_at_ms
  FROM feishu_resource_access_requests`
@@ -953,7 +1106,7 @@ func scanFeishuBotResource(row feishuResourceAccessScanner) (FeishuBotResource, 
 
 func scanFeishuResourceAccessRequest(row feishuResourceAccessScanner) (FeishuResourceAccessRequest, error) {
 	var request FeishuResourceAccessRequest
-	var consumedAtMS, createdAtMS, expiresAtMS, updatedAtMS int64
+	var decisionAtMS, consumedAtMS, createdAtMS, expiresAtMS, updatedAtMS int64
 	if err := row.Scan(
 		&request.ID,
 		&request.AccountID,
@@ -966,6 +1119,9 @@ func scanFeishuResourceAccessRequest(row feishuResourceAccessScanner) (FeishuRes
 		&request.ResourceURL,
 		&request.Permission,
 		&request.Reason,
+		&request.OnceDurationMinutes,
+		&request.GrantMode,
+		&decisionAtMS,
 		&request.SubjectType,
 		&request.SubjectID,
 		&request.GrantSource,
@@ -988,6 +1144,7 @@ func scanFeishuResourceAccessRequest(row feishuResourceAccessScanner) (FeishuRes
 	request.CreatedAt = time.UnixMilli(createdAtMS).UTC()
 	request.ExpiresAt = time.UnixMilli(expiresAtMS).UTC()
 	request.UpdatedAt = time.UnixMilli(updatedAtMS).UTC()
+	request.DecisionAt = timeFromOptionalMillis(decisionAtMS)
 	if consumedAtMS > 0 {
 		request.ConsumedAt = time.UnixMilli(consumedAtMS).UTC()
 	}
@@ -1055,6 +1212,8 @@ func normalizeFeishuResourceAccessRequest(request FeishuResourceAccessRequest) F
 	request.ResourceURL = strings.TrimSpace(request.ResourceURL)
 	request.Permission = strings.TrimSpace(request.Permission)
 	request.Reason = strings.TrimSpace(request.Reason)
+	request.GrantMode = strings.TrimSpace(request.GrantMode)
+	request.DecisionAt = optionalUTC(request.DecisionAt)
 	request.SubjectType = strings.TrimSpace(request.SubjectType)
 	request.SubjectID = strings.TrimSpace(request.SubjectID)
 	request.CreatedAt = normalizedWorkflowTime(request.CreatedAt)
@@ -1068,6 +1227,12 @@ func validateNewFeishuResourceAccessRequest(request FeishuResourceAccessRequest)
 	}
 	if request.ActorOpenID == "" && request.ActorUserID == "" {
 		return fmt.Errorf("feishu resource access requesting user is required")
+	}
+	if request.OnceDurationMinutes < FeishuResourceAccessMinOnceDurationMinutes || request.OnceDurationMinutes > FeishuResourceAccessMaxOnceDurationMinutes {
+		return fmt.Errorf("feishu resource access once duration must be between %d and %d minutes", FeishuResourceAccessMinOnceDurationMinutes, FeishuResourceAccessMaxOnceDurationMinutes)
+	}
+	if request.GrantMode != "" || !request.DecisionAt.IsZero() || request.CardMessageID != "" || request.OAuthStateHash != "" || request.PKCEVerifier != "" {
+		return fmt.Errorf("new feishu resource access request must not contain a decision, card binding, or oauth state")
 	}
 	if !request.ExpiresAt.After(request.CreatedAt) {
 		return fmt.Errorf("feishu resource access expires_at must be after created_at")
@@ -1133,6 +1298,10 @@ func validFeishuResourceGrantActor(actorType, actorID string) bool {
 		return false
 	}
 	return actorType == FeishuResourceGrantActorTypeOpenID || actorType == FeishuResourceGrantActorTypeUserID
+}
+
+func validFeishuResourceGrantMode(mode string) bool {
+	return mode == FeishuResourceGrantModeOnce || mode == FeishuResourceGrantModeAll
 }
 
 func validFeishuResourcePermission(permission string) bool {

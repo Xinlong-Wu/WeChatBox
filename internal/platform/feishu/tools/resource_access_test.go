@@ -70,13 +70,14 @@ func TestDocsResourceAccessToolRegistrationAndNormalization(t *testing.T) {
 			"resource_type":" folder ",
 			"resource_token":" bot_root ",
 			"permission":" WRITE ",
+			"once_duration_minutes":30,
 			"reason":" create a document "
 		}`),
 	})
 	if result.IsError {
 		t.Fatalf("Execute result = %#v", result)
 	}
-	if controller.request.ResourceType != "folder" || controller.request.ResourceToken != BotRootResourceAlias || controller.request.Permission != ResourcePermissionWrite || controller.request.Reason != "create a document" {
+	if controller.request.ResourceType != "folder" || controller.request.ResourceToken != BotRootResourceAlias || controller.request.Permission != ResourcePermissionWrite || controller.request.OnceDurationMinutes != 30 || controller.request.Reason != "create a document" {
 		t.Fatalf("normalized request = %#v", controller.request)
 	}
 	if !strings.Contains(result.Content, `"request_id":"req_access"`) || !strings.Contains(result.Content, `"source":"bot_owner"`) {
@@ -99,7 +100,7 @@ func TestDocsResourceAccessToolReturnsPendingWorkflowID(t *testing.T) {
 	result := tool.Execute(context.Background(), tooltypes.Call{
 		ID:        "call_access",
 		Name:      ResourceAccessToolName,
-		Arguments: json.RawMessage(`{"resource_type":"docx","resource_token":"doxcn_pending","permission":"write"}`),
+		Arguments: json.RawMessage(`{"resource_type":"docx","resource_token":"doxcn_pending","permission":"write","once_duration_minutes":45}`),
 	})
 	if result.IsError || result.PendingWorkflowID != "req_pending" {
 		t.Fatalf("Execute result = %#v, want pending workflow req_pending", result)
@@ -110,8 +111,10 @@ func TestDocsResourceAccessToolRejectsInvalidPermissionAndAliasType(t *testing.T
 	controller := &fakeResourceAccessController{}
 	tool := NewDocsResourceAccessTools(controller, Config{Docs: DocsToolsConfig{Enabled: true}})[0]
 	tests := []json.RawMessage{
-		json.RawMessage(`{"resource_type":"folder","resource_token":"fld_token","permission":"admin"}`),
-		json.RawMessage(`{"resource_type":"docx","resource_token":"bot_root","permission":"read"}`),
+		json.RawMessage(`{"resource_type":"folder","resource_token":"fld_token","permission":"admin","once_duration_minutes":30}`),
+		json.RawMessage(`{"resource_type":"docx","resource_token":"bot_root","permission":"read","once_duration_minutes":30}`),
+		json.RawMessage(`{"resource_type":"docx","resource_token":"doxcn_pending","permission":"read","once_duration_minutes":9}`),
+		json.RawMessage(`{"resource_type":"docx","resource_token":"doxcn_pending","permission":"read","once_duration_minutes":61}`),
 	}
 	for _, args := range tests {
 		result := tool.Execute(context.Background(), tooltypes.Call{ID: "call", Name: ResourceAccessToolName, Arguments: args})

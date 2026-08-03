@@ -153,6 +153,9 @@ func (s *Store) migrate() error {
 			resource_url TEXT NOT NULL DEFAULT '',
 			permission TEXT NOT NULL,
 			reason TEXT NOT NULL DEFAULT '',
+			once_duration_minutes INTEGER NOT NULL DEFAULT 30,
+			grant_mode TEXT NOT NULL DEFAULT '',
+			decision_at_ms INTEGER NOT NULL DEFAULT 0,
 			subject_type TEXT NOT NULL DEFAULT '',
 			subject_id TEXT NOT NULL DEFAULT '',
 			grant_source TEXT NOT NULL DEFAULT '',
@@ -231,6 +234,9 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if err := s.ensureFeishuResourceAccessConsumptionColumns(); err != nil {
+		return err
+	}
+	if err := s.ensureFeishuResourceAccessDecisionColumns(); err != nil {
 		return err
 	}
 	if err := s.ensureWorkflowContinuationContextColumns(); err != nil {
@@ -549,6 +555,37 @@ func (s *Store) ensureFeishuResourceAccessConsumptionColumns() error {
 	if !hasConsumedAtMS {
 		if _, err := s.db.Exec(`ALTER TABLE feishu_resource_access_requests ADD COLUMN consumed_at_ms INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return fmt.Errorf("add feishu resource access consumed timestamp column: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) ensureFeishuResourceAccessDecisionColumns() error {
+	hasDuration, err := s.tableHasColumn("feishu_resource_access_requests", "once_duration_minutes")
+	if err != nil {
+		return fmt.Errorf("inspect feishu resource access duration schema: %w", err)
+	}
+	if !hasDuration {
+		if _, err := s.db.Exec(`ALTER TABLE feishu_resource_access_requests ADD COLUMN once_duration_minutes INTEGER NOT NULL DEFAULT 30`); err != nil {
+			return fmt.Errorf("add feishu resource access duration column: %w", err)
+		}
+	}
+	hasGrantMode, err := s.tableHasColumn("feishu_resource_access_requests", "grant_mode")
+	if err != nil {
+		return fmt.Errorf("inspect feishu resource access grant mode schema: %w", err)
+	}
+	if !hasGrantMode {
+		if _, err := s.db.Exec(`ALTER TABLE feishu_resource_access_requests ADD COLUMN grant_mode TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add feishu resource access grant mode column: %w", err)
+		}
+	}
+	hasDecisionAt, err := s.tableHasColumn("feishu_resource_access_requests", "decision_at_ms")
+	if err != nil {
+		return fmt.Errorf("inspect feishu resource access decision timestamp schema: %w", err)
+	}
+	if !hasDecisionAt {
+		if _, err := s.db.Exec(`ALTER TABLE feishu_resource_access_requests ADD COLUMN decision_at_ms INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add feishu resource access decision timestamp column: %w", err)
 		}
 	}
 	return nil
