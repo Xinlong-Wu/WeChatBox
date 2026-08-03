@@ -288,6 +288,16 @@ func (s *Store) DeleteFeishuDocsData(accountID string) error {
 	if _, err := tx.Exec(`DELETE FROM feishu_bot_resources WHERE account_id=?`, accountID); err != nil {
 		return fmt.Errorf("delete feishu bot resources: %w", err)
 	}
+	if err := deleteWorkflowRuntimeData(
+		tx,
+		accountID,
+		WorkflowRequestKindFeishuFolderCreate,
+		WorkflowRequestKindFeishuDocsCreate,
+		WorkflowRequestKindFeishuDocsAppend,
+		WorkflowRequestKindFeishuResourceAccess,
+	); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(
 		`DELETE FROM workflow_requests WHERE account_id=? AND kind IN (?, ?, ?, ?)`,
 		accountID,

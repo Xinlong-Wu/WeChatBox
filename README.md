@@ -738,7 +738,7 @@ saved per-session model preference that no longer exists back to
         media/{safeUserId}/{safeSessionId}/
     feishu/
       data/
-        lingobridge.db                   # Feishu sessions, workflow requests, chat-bound Docs metadata, Bot resources, resource grants, operation approvals, and scoped 24-hour grants
+        lingobridge.db                   # Feishu sessions, workflow requests/results/continuations, chat-bound Docs metadata, Bot resources, resource grants, operation approvals, and scoped 24-hour grants
         sessions/{userId}/{sessionId}.jsonl # Revisioned conversation snapshots with compact provider_contexts and tool_traces
     github/
       data/
@@ -767,6 +767,17 @@ Each JSONL conversation snapshot also carries a monotonic `revision`. Saves use
 compare-and-swap against the revision loaded at turn start, so a stale turn
 cannot replace newer history. Legacy snapshots without the field load as
 revision zero and receive revision one on their next successful save.
+
+Asynchronous approval and authorization workflows persist one sanitized
+terminal result per global request ID plus a continuation bound to the trusted
+account, user, session, chat, actor, source message, origin turn, and tool call.
+The origin conversation revision is committed only after its CAS save. A
+terminal result can arrive before or after that commit; the continuation becomes
+resumable only when both exist. Ready work is leased while processing, and an
+expired lease can be reclaimed after restart. Continuations do not store model
+names, OAuth codes, callback URLs, access tokens, refresh tokens, or card callback
+tokens. Deleting a Feishu account's Docs or approval data also deletes the
+matching workflow results and continuations.
 
 ## Internal Architecture
 

@@ -40,6 +40,37 @@ func (s *Store) migrate() error {
 			created_at_ms INTEGER NOT NULL,
 			updated_at_ms INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS workflow_results (
+			request_id TEXT PRIMARY KEY,
+			account_id TEXT NOT NULL,
+			state TEXT NOT NULL,
+			payload TEXT NOT NULL DEFAULT '{}',
+			created_at_ms INTEGER NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS workflow_continuations (
+			request_id TEXT PRIMARY KEY,
+			account_id TEXT NOT NULL,
+			platform TEXT NOT NULL,
+			user_key TEXT NOT NULL,
+			session_id TEXT NOT NULL,
+			chat_id TEXT NOT NULL DEFAULT '',
+			source_message_id TEXT NOT NULL DEFAULT '',
+			actor_open_id TEXT NOT NULL DEFAULT '',
+			actor_user_id TEXT NOT NULL DEFAULT '',
+			origin_revision INTEGER NOT NULL,
+			committed_revision INTEGER NOT NULL DEFAULT -1,
+			origin_turn_id TEXT NOT NULL,
+			tool_call_id TEXT NOT NULL,
+			tool_name TEXT NOT NULL,
+			state TEXT NOT NULL,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			available_at_ms INTEGER NOT NULL,
+			lease_token TEXT NOT NULL DEFAULT '',
+			lease_expires_at_ms INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at_ms INTEGER NOT NULL,
+			updated_at_ms INTEGER NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS tool_approvals (
 			id TEXT PRIMARY KEY,
 			account_id TEXT NOT NULL,
@@ -192,6 +223,10 @@ func (s *Store) migrate() error {
 			 ON tool_approval_grants(account_id, expires_at_ms)`,
 		`CREATE INDEX IF NOT EXISTS idx_workflow_requests_account_kind_state
 			 ON workflow_requests(account_id, kind, state, updated_at_ms)`,
+		`CREATE INDEX IF NOT EXISTS idx_workflow_results_account_state
+			 ON workflow_results(account_id, state, created_at_ms)`,
+		`CREATE INDEX IF NOT EXISTS idx_workflow_continuations_account_state_available
+			 ON workflow_continuations(account_id, state, available_at_ms, lease_expires_at_ms)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_feishu_chat_folders_one_default
 			 ON feishu_chat_folders(account_id, chat_id) WHERE is_default=1`,
 		`CREATE INDEX IF NOT EXISTS idx_feishu_chat_folders_account_chat

@@ -414,6 +414,9 @@ func (s *Store) DeleteToolApprovals(accountID string) error {
 	if _, err := tx.Exec(`DELETE FROM tool_approval_grants WHERE account_id=?`, accountID); err != nil {
 		return fmt.Errorf("delete tool approval grants: %w", err)
 	}
+	if err := deleteWorkflowRuntimeData(tx, accountID, WorkflowRequestKindToolApproval); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`DELETE FROM workflow_requests WHERE account_id=? AND kind=?`, accountID, WorkflowRequestKindToolApproval); err != nil {
 		return fmt.Errorf("delete tool approval workflow requests: %w", err)
 	}

@@ -200,6 +200,20 @@ func TestDeleteToolApprovalsRemovesOnlyMatchingAccount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateToolApproval second returned error: %v", err)
 	}
+	for _, approval := range []ToolApproval{first, second} {
+		continuation := attachWorkflowContinuationForTest(t, st, approval.ID, approval.AccountID, now, 0)
+		if _, _, err := st.CommitWorkflowContinuation(continuation.RequestID, continuation.AccountID, 1, now.Add(time.Second)); err != nil {
+			t.Fatalf("CommitWorkflowContinuation returned error: %v", err)
+		}
+		if _, _, _, err := st.StoreWorkflowResult(WorkflowResult{
+			RequestID: continuation.RequestID,
+			AccountID: continuation.AccountID,
+			State:     WorkflowResultStateDenied,
+			CreatedAt: now.Add(2 * time.Second),
+		}); err != nil {
+			t.Fatalf("StoreWorkflowResult returned error: %v", err)
+		}
+	}
 
 	if err := st.DeleteToolApprovals(first.AccountID); err != nil {
 		t.Fatalf("DeleteToolApprovals returned error: %v", err)
@@ -210,8 +224,20 @@ func TestDeleteToolApprovalsRemovesOnlyMatchingAccount(t *testing.T) {
 	if _, err := st.GetWorkflowRequest(first.ID, first.AccountID); !errors.Is(err, ErrWorkflowRequestNotFound) {
 		t.Fatalf("deleted workflow error = %v, want ErrWorkflowRequestNotFound", err)
 	}
+	if _, err := st.GetWorkflowContinuation(first.ID, first.AccountID); !errors.Is(err, ErrWorkflowContinuationNotFound) {
+		t.Fatalf("deleted workflow continuation error = %v, want ErrWorkflowContinuationNotFound", err)
+	}
+	if _, err := st.GetWorkflowResult(first.ID, first.AccountID); !errors.Is(err, ErrWorkflowResultNotFound) {
+		t.Fatalf("deleted workflow result error = %v, want ErrWorkflowResultNotFound", err)
+	}
 	if _, err := st.GetToolApproval(second.ID, second.AccountID); err != nil {
 		t.Fatalf("other account approval was deleted: %v", err)
+	}
+	if _, err := st.GetWorkflowContinuation(second.ID, second.AccountID); err != nil {
+		t.Fatalf("other account workflow continuation was deleted: %v", err)
+	}
+	if _, err := st.GetWorkflowResult(second.ID, second.AccountID); err != nil {
+		t.Fatalf("other account workflow result was deleted: %v", err)
 	}
 }
 

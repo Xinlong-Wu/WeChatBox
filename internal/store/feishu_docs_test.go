@@ -133,6 +133,7 @@ func TestFeishuFolderShareStateAndDocumentsAreDurableAndScoped(t *testing.T) {
 func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
 	st := openFeishuDocsTestStore(t)
 	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	accessIDs := map[string]string{}
 	for _, accountID := range []string{"feishu:first", "feishu:second"} {
 		request, err := st.CreateWorkflowRequest(WorkflowRequest{
 			AccountID: accountID,
@@ -199,6 +200,19 @@ func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
 		); err != nil {
 			t.Fatalf("CompleteFeishuResourceAccessRequest returned error: %v", err)
 		}
+		continuation := attachWorkflowContinuationForTest(t, st, access.ID, accountID, now, 0)
+		if _, _, err := st.CommitWorkflowContinuation(continuation.RequestID, continuation.AccountID, 1, now.Add(time.Second)); err != nil {
+			t.Fatalf("CommitWorkflowContinuation returned error: %v", err)
+		}
+		if _, _, _, err := st.StoreWorkflowResult(WorkflowResult{
+			RequestID: continuation.RequestID,
+			AccountID: continuation.AccountID,
+			State:     WorkflowResultStateSucceeded,
+			CreatedAt: now.Add(2 * time.Second),
+		}); err != nil {
+			t.Fatalf("StoreWorkflowResult returned error: %v", err)
+		}
+		accessIDs[accountID] = access.ID
 	}
 	if err := st.DeleteFeishuDocsData("feishu:first"); err != nil {
 		t.Fatalf("DeleteFeishuDocsData returned error: %v", err)
@@ -228,6 +242,18 @@ func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
 		"feishu:second", WorkflowRequestKindFeishuResourceAccess,
 	).Scan(&otherAccessID); err != nil || otherAccessID == "" {
 		t.Fatalf("other account resource workflow id = %q err=%v", otherAccessID, err)
+	}
+	if _, err := st.GetWorkflowContinuation(accessIDs["feishu:first"], "feishu:first"); !errors.Is(err, ErrWorkflowContinuationNotFound) {
+		t.Fatalf("deleted account continuation error = %v, want ErrWorkflowContinuationNotFound", err)
+	}
+	if _, err := st.GetWorkflowResult(accessIDs["feishu:first"], "feishu:first"); !errors.Is(err, ErrWorkflowResultNotFound) {
+		t.Fatalf("deleted account workflow result error = %v, want ErrWorkflowResultNotFound", err)
+	}
+	if _, err := st.GetWorkflowContinuation(accessIDs["feishu:second"], "feishu:second"); err != nil {
+		t.Fatalf("other account workflow continuation was deleted: %v", err)
+	}
+	if _, err := st.GetWorkflowResult(accessIDs["feishu:second"], "feishu:second"); err != nil {
+		t.Fatalf("other account workflow result was deleted: %v", err)
 	}
 }
 
