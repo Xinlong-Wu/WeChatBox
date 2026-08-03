@@ -446,15 +446,17 @@ func TestResourceAccessCardRejectIsBoundToRequester(t *testing.T) {
 }
 
 func TestPendingResourceAccessCardContainsOAuthHandoffForm(t *testing.T) {
+	authURL := "https://accounts.feishu.cn/open-apis/authen/v1/authorize?state=secret"
 	raw, err := (pendingResourceAccessCard{
 		request: store.FeishuResourceAccessRequest{
 			ID:            "req_test",
 			ResourceType:  "docx",
 			ResourceToken: "doxcn_external",
 			Permission:    store.FeishuResourcePermissionWrite,
+			Reason:        "创建项目计划文档",
 			ExpiresAt:     time.Date(2026, time.August, 1, 12, 10, 0, 0, time.UTC),
 		},
-		authURL: "https://accounts.feishu.cn/open-apis/authen/v1/authorize?state=secret",
+		authURL: authURL,
 	}).JSON()
 	if err != nil {
 		t.Fatalf("pendingResourceAccessCard.JSON returned error: %v", err)
@@ -463,18 +465,63 @@ func TestPendingResourceAccessCardContainsOAuthHandoffForm(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &card); err != nil {
 		t.Fatalf("unmarshal resource access card: %v", err)
 	}
+	if card["schema"] != "2.0" {
+		t.Fatalf("resource card schema = %#v", card["schema"])
+	}
+	config, _ := card["config"].(map[string]any)
+	style, _ := config["style"].(map[string]any)
+	textSize, _ := style["text_size"].(map[string]any)
+	normalV2, _ := textSize["normal_v2"].(map[string]any)
+	if config["update_multi"] != true || normalV2["default"] != "normal" || normalV2["pc"] != "normal" || normalV2["mobile"] != "heading" {
+		t.Fatalf("resource card config = %#v", config)
+	}
+	header, _ := card["header"].(map[string]any)
+	title, _ := header["title"].(map[string]any)
+	tags, _ := header["text_tag_list"].([]any)
+	tag, _ := tags[0].(map[string]any)
+	tagText, _ := tag["text"].(map[string]any)
+	if title["content"] != "飞书文档权限申请" || tagText["content"] != "安全加密" || tag["color"] != "blue" || header["padding"] != "12px 8px 12px 8px" {
+		t.Fatalf("resource card header = %#v", header)
+	}
+	body, _ := card["body"].(map[string]any)
+	elements, _ := body["elements"].([]any)
+	if body["direction"] != "vertical" || len(elements) != 3 {
+		t.Fatalf("resource card body = %#v", body)
+	}
+	intro, _ := elements[0].(map[string]any)
+	introText, _ := intro["text"].(map[string]any)
+	if intro["tag"] != "div" || introText["content"] != "飞书资源授权" || introText["text_size"] != "normal_v2" {
+		t.Fatalf("resource card intro = %#v", intro)
+	}
+	markdown, _ := elements[1].(map[string]any)
+	markdownContent, _ := markdown["content"].(string)
+	if markdown["tag"] != "markdown" || markdown["element_id"] != "KNJPSduXTksKaRe28qq6" || markdown["text_size"] != "normal_v2" ||
+		!strings.Contains(markdownContent, "为了更好地为您提供服务") || !strings.Contains(markdownContent, "创建项目计划文档") || !strings.Contains(markdownContent, authURL) {
+		t.Fatalf("resource card description = %#v", markdown)
+	}
+	form, _ := elements[2].(map[string]any)
+	if form["tag"] != "form" || form["name"] != "privacy_form" || form["element_id"] != "STIJ_lgxwvFvn9xFUnT8" || form["padding"] != "12px 12px 12px 12px" {
+		t.Fatalf("resource card form = %#v", form)
+	}
 	input := findCardElementByName(card, resourceAccessOAuthResultField)
-	if input == nil || input["tag"] != "input" || input["required"] != true || input["max_length"] != float64(resourceAccessOAuthResultMaxLength) {
+	label, _ := input["label"].(map[string]any)
+	if input == nil || input["tag"] != "input" || input["required"] != false || input["element_id"] != "e45nAhDEUoVmMTaWcZKP" || label["content"] != "授权回调 URL 或授权码" {
 		t.Fatalf("OAuth result input = %#v", input)
 	}
-	submit := findCardElementByName(card, "Button_submit_oauth_result")
-	if submit == nil || submit["form_action_type"] != "submit" || cardButtonAction(submit) != resourceAccessCardActionSubmitOAuth {
+	submit := findCardElementByName(card, "submit_btn")
+	if submit == nil || submit["form_action_type"] != "submit" || submit["width"] != "fill" || submit["element_id"] != "yJZDKLb72aTt6mKHuVam" || cardButtonAction(submit) != resourceAccessCardActionSubmitOAuth {
 		t.Fatalf("OAuth submit button = %#v", submit)
 	}
-	reject := findCardElementByName(card, "Button_reject_resource_access")
-	if reject == nil || reject["form_action_type"] != nil || cardButtonAction(reject) != resourceAccessCardActionReject {
+	assertResourceAccessCardButtonBinding(t, submit, "req_test", resourceAccessCardActionSubmitOAuth)
+	suggestion := findCardElementByName(card, "Input_9luq5y9ljxa")
+	if suggestion == nil || suggestion["tag"] != "input" || suggestion["width"] != "fill" {
+		t.Fatalf("resource suggestion input = %#v", suggestion)
+	}
+	reject := findCardElementByName(card, "Button_ylh56j56ycl")
+	if reject == nil || reject["form_action_type"] != "submit" || reject["type"] != "danger" || cardButtonAction(reject) != resourceAccessCardActionReject {
 		t.Fatalf("resource reject button = %#v", reject)
 	}
+	assertResourceAccessCardButtonBinding(t, reject, "req_test", resourceAccessCardActionReject)
 }
 
 func TestParseResourceAccessOAuthSubmissionValidatesURLAndRawCode(t *testing.T) {
@@ -685,17 +732,19 @@ func resourceAccessCardURL(t *testing.T, raw string) string {
 	if len(elements) < 2 {
 		t.Fatalf("resource access card elements = %#v", elements)
 	}
-	button, _ := elements[1].(map[string]any)
-	behaviors, _ := button["behaviors"].([]any)
-	if len(behaviors) != 1 {
-		t.Fatalf("resource access button behaviors = %#v", behaviors)
+	markdown, _ := elements[1].(map[string]any)
+	content, _ := markdown["content"].(string)
+	const prefix = "[前往飞书官方授权页面]("
+	start := strings.Index(content, prefix)
+	if start < 0 {
+		t.Fatalf("resource access OAuth link missing from markdown: %#v", markdown)
 	}
-	behavior, _ := behaviors[0].(map[string]any)
-	value, _ := behavior["default_url"].(string)
-	if behavior["type"] != "open_url" || value == "" {
-		t.Fatalf("resource access open URL behavior = %#v", behavior)
+	start += len(prefix)
+	end := strings.Index(content[start:], ")")
+	if end < 0 {
+		t.Fatalf("resource access OAuth link is malformed: %#v", markdown)
 	}
-	return value
+	return content[start : start+end]
 }
 
 func resourceAccessCardState(t *testing.T, raw string) string {
@@ -741,6 +790,19 @@ func cardButtonAction(button map[string]any) string {
 	value, _ := behavior["value"].(map[string]any)
 	action, _ := value["action"].(string)
 	return action
+}
+
+func assertResourceAccessCardButtonBinding(t *testing.T, button map[string]any, requestID, action string) {
+	t.Helper()
+	behaviors, _ := button["behaviors"].([]any)
+	if len(behaviors) != 1 {
+		t.Fatalf("resource access button behaviors = %#v", behaviors)
+	}
+	behavior, _ := behaviors[0].(map[string]any)
+	value, _ := behavior["value"].(map[string]any)
+	if behavior["type"] != "callback" || value["kind"] != resourceAccessCardActionKind || value["request_id"] != requestID || value["action"] != action {
+		t.Fatalf("resource access button callback = %#v", behavior)
+	}
 }
 
 func resourceAccessCardEvent(requestID, openID, chatID, messageID string) *callback.CardActionTriggerEvent {

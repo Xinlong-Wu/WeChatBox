@@ -14,7 +14,7 @@ const (
 	resourceAccessCardActionKind        = "lingobridge_resource_access"
 	resourceAccessCardActionSubmitOAuth = "submit_oauth_callback"
 	resourceAccessCardActionReject      = "reject"
-	resourceAccessOAuthResultField      = "oauth_result"
+	resourceAccessOAuthResultField      = "information_1"
 	resourceAccessOAuthResultMaxLength  = 1000
 )
 
@@ -40,7 +40,8 @@ func (c pendingResourceAccessCard) JSON() (string, error) {
 	}
 	lines = append(lines,
 		"",
-		"点击下方按钮会打开飞书官方 OAuth 授权页。LingoBridge 仅使用本次返回的 user_access_token 完成授权，不保存 user_access_token 或 refresh_token。",
+		"[前往飞书官方授权页面]("+c.authURL+")",
+		"LingoBridge 仅使用本次返回的 user_access_token 完成授权，不保存 user_access_token 或 refresh_token。",
 		"如果授权后浏览器无法返回 LingoBridge，请复制地址栏中的完整回调 URL，返回本卡片粘贴并提交；也可以只粘贴授权码。",
 		fmt.Sprintf("本请求将于 %s 过期。", c.request.ExpiresAt.UTC().Format("2006-01-02 15:04 UTC")),
 	)
@@ -53,45 +54,55 @@ func (c pendingResourceAccessCard) JSON() (string, error) {
 	}
 	card := map[string]interface{}{
 		"schema": "2.0",
-		"config": map[string]interface{}{"update_multi": true},
+		"config": map[string]interface{}{
+			"update_multi": true,
+			"style": map[string]interface{}{
+				"text_size": map[string]interface{}{
+					"normal_v2": map[string]interface{}{
+						"default": "normal",
+						"pc":      "normal",
+						"mobile":  "heading",
+					},
+				},
+			},
+		},
 		"header": map[string]interface{}{
 			"title": map[string]interface{}{"tag": "plain_text", "content": "飞书文档权限申请"},
 			"subtitle": map[string]interface{}{
 				"tag":     "plain_text",
-				"content": permissionLabel + "权限 · " + c.request.ResourceType,
+				"content": "",
 			},
 			"text_tag_list": []interface{}{
 				map[string]interface{}{
 					"tag":   "text_tag",
-					"text":  map[string]interface{}{"tag": "plain_text", "content": "待授权"},
-					"color": "orange",
+					"text":  map[string]interface{}{"tag": "plain_text", "content": "安全加密"},
+					"color": "blue",
 				},
 			},
 			"template": "blue",
+			"padding":  "12px 8px 12px 8px",
 		},
 		"body": map[string]interface{}{
-			"direction":          "vertical",
-			"horizontal_spacing": "8px",
-			"vertical_spacing":   "8px",
-			"horizontal_align":   "left",
-			"vertical_align":     "top",
+			"direction": "vertical",
 			"elements": []interface{}{
 				map[string]interface{}{
-					"tag":        "markdown",
-					"content":    strings.Join(lines, "\n"),
-					"text_align": "left",
-					"text_size":  "normal",
+					"tag": "div",
+					"text": map[string]interface{}{
+						"tag":        "plain_text",
+						"content":    "飞书资源授权",
+						"text_size":  "normal_v2",
+						"text_align": "left",
+						"text_color": "default",
+					},
+					"margin": "0px 0px 0px 0px",
 				},
 				map[string]interface{}{
-					"tag":  "button",
-					"text": map[string]interface{}{"tag": "plain_text", "content": "前往飞书授权"},
-					"type": "primary",
-					"behaviors": []interface{}{
-						map[string]interface{}{
-							"type":        "open_url",
-							"default_url": c.authURL,
-						},
-					},
+					"tag":        "markdown",
+					"content":    "为了更好地为您提供服务，需要收集以下必要信息。\n" + strings.Join(lines, "\n"),
+					"text_align": "left",
+					"text_size":  "normal_v2",
+					"margin":     "0px 0px 0px 0px",
+					"element_id": "KNJPSduXTksKaRe28qq6",
 				},
 				map[string]interface{}{
 					"tag": "form",
@@ -100,20 +111,88 @@ func (c pendingResourceAccessCard) JSON() (string, error) {
 							"tag": "input",
 							"placeholder": map[string]interface{}{
 								"tag":     "plain_text",
-								"content": "粘贴完整回调 URL 或授权码",
+								"content": "",
 							},
-							"name":       resourceAccessOAuthResultField,
-							"required":   true,
-							"max_length": resourceAccessOAuthResultMaxLength,
+							"default_value": "",
+							"width":         "default",
+							"label": map[string]interface{}{
+								"tag":     "plain_text",
+								"content": "授权回调 URL 或授权码",
+							},
+							"label_position": "left",
+							"required":       false,
+							"name":           resourceAccessOAuthResultField,
+							"element_id":     "e45nAhDEUoVmMTaWcZKP",
 						},
-						approvalFormButton("提交授权结果", "primary_filled", "Button_submit_oauth_result", value(resourceAccessCardActionSubmitOAuth)),
+						map[string]interface{}{
+							"tag":   "button",
+							"text":  map[string]interface{}{"tag": "plain_text", "content": "提交授权结果"},
+							"type":  "primary_filled",
+							"width": "fill",
+							"behaviors": []interface{}{
+								map[string]interface{}{"type": "callback", "value": value(resourceAccessCardActionSubmitOAuth)},
+							},
+							"form_action_type": "submit",
+							"name":             "submit_btn",
+							"margin":           "4px 0px 4px 0px",
+							"element_id":       "yJZDKLb72aTt6mKHuVam",
+						},
+						map[string]interface{}{
+							"tag":                "column_set",
+							"horizontal_spacing": "8px",
+							"horizontal_align":   "left",
+							"columns": []interface{}{
+								map[string]interface{}{
+									"tag":    "column",
+									"width":  "weighted",
+									"weight": 1,
+									"elements": []interface{}{
+										map[string]interface{}{
+											"tag": "input",
+											"placeholder": map[string]interface{}{
+												"tag":     "plain_text",
+												"content": "请输入建议",
+											},
+											"default_value": "",
+											"width":         "fill",
+											"name":          "Input_9luq5y9ljxa",
+											"margin":        "0px 0px 0px 0px",
+										},
+									},
+									"vertical_align": "top",
+								},
+								map[string]interface{}{
+									"tag":   "column",
+									"width": "auto",
+									"elements": []interface{}{
+										map[string]interface{}{
+											"tag":   "button",
+											"text":  map[string]interface{}{"tag": "plain_text", "content": "拒绝"},
+											"type":  "danger",
+											"width": "default",
+											"size":  "medium",
+											"behaviors": []interface{}{
+												map[string]interface{}{"type": "callback", "value": value(resourceAccessCardActionReject)},
+											},
+											"form_action_type": "submit",
+											"name":             "Button_ylh56j56ycl",
+											"margin":           "0px 0px 0px 0px",
+										},
+									},
+									"vertical_align": "top",
+								},
+							},
+							"margin": "0px 0px 0px 0px",
+						},
 					},
 					"direction":        "vertical",
 					"horizontal_align": "left",
 					"vertical_align":   "top",
-					"name":             "Form_resource_oauth_result",
+					"padding":          "12px 12px 12px 12px",
+					"margin":           "0px 0px 0px 0px",
+					"name":             "privacy_form",
+					"element_id":       "STIJ_lgxwvFvn9xFUnT8",
 				},
-				resourceAccessCallbackButton("拒绝", "danger", "Button_reject_resource_access", value(resourceAccessCardActionReject)),
 			},
 		},
 	}
@@ -141,19 +220,4 @@ func resourceAccessCardOAuthResult(event *callback.CardActionTriggerEvent) strin
 		return ""
 	}
 	return strings.TrimSpace(stringApprovalValue(event.Event.Action.FormValue, resourceAccessOAuthResultField))
-}
-
-func resourceAccessCallbackButton(text, buttonType, name string, value map[string]interface{}) map[string]interface{} {
-	return map[string]interface{}{
-		"tag":   "button",
-		"text":  map[string]interface{}{"tag": "plain_text", "content": text},
-		"type":  buttonType,
-		"width": "default",
-		"size":  "medium",
-		"behaviors": []interface{}{
-			map[string]interface{}{"type": "callback", "value": value},
-		},
-		"name":   name,
-		"margin": "4px 0px 4px 0px",
-	}
 }
