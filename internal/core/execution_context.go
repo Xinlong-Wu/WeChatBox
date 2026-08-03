@@ -9,7 +9,7 @@ import (
 	tooltypes "lingobridge/internal/tools"
 )
 
-func bindToolExecutionContext(ctx context.Context, msg InboundMessage, sessionID string) (context.Context, tooltypes.ExecutionContext, error) {
+func bindToolExecutionContext(ctx context.Context, msg InboundMessage, sessionID string, conversationRevision int64) (context.Context, tooltypes.ExecutionContext, error) {
 	execution, _ := tooltypes.ExecutionContextFromContext(ctx)
 	turnID, err := newTurnID()
 	if err != nil {
@@ -19,7 +19,7 @@ func bindToolExecutionContext(ctx context.Context, msg InboundMessage, sessionID
 	execution.AccountID = msg.AccountID
 	execution.UserKey = msg.UserKey
 	execution.SessionID = sessionID
-	execution.ConversationRevision = 0
+	execution.ConversationRevision = conversationRevision
 	execution.TurnID = turnID
 	execution.ToolCallID = ""
 	execution.ToolName = ""

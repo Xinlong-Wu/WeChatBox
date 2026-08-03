@@ -75,7 +75,7 @@ type ConversationManager interface {
 	commands.SessionManager
 	GetOrCreateCurrentSession(userID string) (*store.Session, error)
 	LoadHistory(userID, sessionID string) (*store.Conversation, error)
-	SaveHistory(userID, sessionID string, conv *store.Conversation) error
+	SaveHistoryCAS(userID, sessionID string, expectedRevision int64, conv *store.Conversation) (int64, error)
 }
 
 type LLMFactory func(config.ResolvedModel) llm.Client
@@ -86,6 +86,8 @@ type Bot struct {
 	LLMConfig           config.LLMConfig
 	LLMClients          map[string]llm.Client
 	mu                  sync.Mutex
+	laneMu              sync.Mutex
+	lanes               *sessionLaneSet
 	NewLLM              LLMFactory
 	MutateResponse      ResponseMutator
 	ErrorNotice         func(error) string
@@ -99,6 +101,7 @@ func New(sessions ConversationManager, cfg config.LLMConfig) *Bot {
 		Sessions:            sessions,
 		LLMConfig:           cfg,
 		LLMClients:          map[string]llm.Client{},
+		lanes:               newSessionLaneSet(),
 		NewLLM:              defaultLLMFactory,
 		EnableTextStreaming: false,
 	}
@@ -114,22 +117,57 @@ func (b *Bot) Handle(ctx context.Context, msg InboundMessage, sender Sender) err
 	selection := b.resolveToolsForMessage(ctx, msg)
 	msg.Tools = selection.Tools
 	commandTools := commandToolSummaries(msg.Tools)
-	if resp, handled, err := commands.HandleWithOptions(msg.CommandText, msg.UserKey, b.Sessions, commands.HandleOptions{
+	commandOptions := commands.HandleOptions{
 		Policy: msg.CommandPolicy,
 		Tools:  commandTools,
-	}); handled {
+	}
+	if commandUsesCurrentSessionLane(msg.CommandText) {
+		sess, err := b.Sessions.GetOrCreateCurrentSession(msg.UserKey)
 		if err != nil {
-			coreLog.Warn(ctx, "command error: %v", err)
-			_ = sender.Send(ctx, OutboundMessage{Text: fmt.Sprintf("❌ 错误：%v", err)})
-			return nil
+			coreLog.Error(ctx, "get session for command: %v", err)
+			_ = sender.Send(ctx, OutboundMessage{Text: "❌ 会话加载失败，请重试。"})
+			return err
 		}
-		coreLog.Debug(ctx, "command handled command=%s tools=%d", commandName(msg.CommandText), len(commandTools))
-		return sender.Send(ctx, OutboundMessage{Text: resp})
+		var handled bool
+		err = b.withSessionLane(ctx, msg, sess.ID, func(laneCtx context.Context) error {
+			var commandErr error
+			handled, commandErr = b.handleSharedCommand(laneCtx, msg, sender, commandOptions, len(commandTools))
+			return commandErr
+		})
+		if handled || err != nil {
+			return err
+		}
+	}
+	if handled, err := b.handleSharedCommand(ctx, msg, sender, commandOptions, len(commandTools)); handled || err != nil {
+		return err
 	}
 	if strings.TrimSpace(msg.LLMText) == "" && msg.PrepareUserMessage == nil {
 		return nil
 	}
 	return b.reply(ctx, msg, sender, selection.Options)
+}
+
+func (b *Bot) handleSharedCommand(ctx context.Context, msg InboundMessage, sender Sender, opts commands.HandleOptions, toolCount int) (bool, error) {
+	resp, handled, err := commands.HandleWithOptions(msg.CommandText, msg.UserKey, b.Sessions, opts)
+	if !handled {
+		return false, nil
+	}
+	if err != nil {
+		coreLog.Warn(ctx, "command error: %v", err)
+		_ = sender.Send(ctx, OutboundMessage{Text: fmt.Sprintf("❌ 错误：%v", err)})
+		return true, nil
+	}
+	coreLog.Debug(ctx, "command handled command=%s tools=%d", commandName(msg.CommandText), toolCount)
+	return true, sender.Send(ctx, OutboundMessage{Text: resp})
+}
+
+func commandUsesCurrentSessionLane(text string) bool {
+	switch commandName(text) {
+	case "/current", "/rename", "/archive", "/clear", "/model":
+		return true
+	default:
+		return false
+	}
 }
 
 func (b *Bot) resolveToolsForMessage(ctx context.Context, msg InboundMessage) tooltypes.Selection {
@@ -231,19 +269,12 @@ func (b *Bot) reply(ctx context.Context, msg InboundMessage, sender Sender, tool
 		_ = sender.Send(ctx, OutboundMessage{Text: "❌ 会话加载失败，请重试。"})
 		return err
 	}
-	if len(msg.Tools) > 0 {
-		var execution tooltypes.ExecutionContext
-		ctx, execution, err = bindToolExecutionContext(ctx, msg, sess.ID)
-		if err != nil {
-			coreLog.Error(ctx, "bind tool execution context: %v", err)
-			_ = sender.Send(ctx, OutboundMessage{Text: "❌ 工具执行上下文初始化失败，请重试。"})
-			return err
-		}
-		coreLog.Debug(ctx, "bound trusted tool context platform=%s account=%s session=%s turn=%s chat_present=%t actor_present=%t revision=%d",
-			execution.Platform, execution.AccountID, execution.SessionID, execution.TurnID,
-			execution.ChatID != "", execution.ActorOpenID != "" || execution.ActorUserID != "", execution.ConversationRevision)
-	}
+	return b.withSessionLane(ctx, msg, sess.ID, func(laneCtx context.Context) error {
+		return b.replyInSession(laneCtx, msg, sender, toolOptions, sess)
+	})
+}
 
+func (b *Bot) replyInSession(ctx context.Context, msg InboundMessage, sender Sender, toolOptions tooltypes.Options, sess *store.Session) error {
 	model, llmClient, err := b.llmForMessage(ctx, msg, sess.ID)
 	if err != nil {
 		coreLog.Error(ctx, "resolve LLM: %v", err)
@@ -267,6 +298,22 @@ func (b *Bot) reply(ctx context.Context, msg InboundMessage, sender Sender, tool
 	if err != nil {
 		coreLog.Warn(ctx, "load history: %v", err)
 		conv = &store.Conversation{}
+	}
+	if conv == nil {
+		conv = &store.Conversation{}
+	}
+	expectedRevision := conv.Revision
+	if len(msg.Tools) > 0 {
+		var execution tooltypes.ExecutionContext
+		ctx, execution, err = bindToolExecutionContext(ctx, msg, sess.ID, expectedRevision)
+		if err != nil {
+			coreLog.Error(ctx, "bind tool execution context: %v", err)
+			_ = sender.Send(ctx, OutboundMessage{Text: "❌ 工具执行上下文初始化失败，请重试。"})
+			return err
+		}
+		coreLog.Debug(ctx, "bound trusted tool context platform=%s account=%s session=%s turn=%s chat_present=%t actor_present=%t revision=%d",
+			execution.Platform, execution.AccountID, execution.SessionID, execution.TurnID,
+			execution.ChatID != "", execution.ActorOpenID != "" || execution.ActorUserID != "", execution.ConversationRevision)
 	}
 
 	compact := llm.CompactConfig{
@@ -378,9 +425,18 @@ func (b *Bot) reply(ctx context.Context, msg InboundMessage, sender Sender, tool
 	}
 	conv.Messages = append(historyForSave, userMsg, assistantHistory)
 
-	if err := b.Sessions.SaveHistory(msg.UserKey, sess.ID, conv); err != nil {
-		coreLog.Warn(ctx, "save history: %v", err)
-	} else if preCompacted {
+	newRevision, err := b.Sessions.SaveHistoryCAS(msg.UserKey, sess.ID, expectedRevision, conv)
+	if err != nil {
+		coreLog.Error(ctx, "save history with revision cas session=%s expected_revision=%d: %v", sess.ID, expectedRevision, err)
+		notice := "❌ 会话保存失败，本次回复可能未写入历史，请重试。"
+		if errors.Is(err, store.ErrConversationConflict) {
+			notice = "❌ 会话在处理期间发生变化，本次回复未写入历史，请重试。"
+		}
+		_ = sender.Send(ctx, OutboundMessage{Text: notice})
+		return err
+	}
+	coreLog.Debug(ctx, "saved conversation session=%s revision=%d messages=%d", sess.ID, newRevision, len(conv.Messages))
+	if preCompacted {
 		if err := finishCompactNotice(ctx, sender, compactNoticeHandle, preCompactNotice); err != nil {
 			return err
 		}

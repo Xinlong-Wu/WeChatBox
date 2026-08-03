@@ -734,16 +734,16 @@ saved per-session model preference that no longer exists back to
     wechat/
       data/
         lingobridge.db                   # WeChat accounts, sessions with model preferences, current-session pointers, sync cursors
-        sessions/{userId}/{sessionId}.jsonl # Conversation snapshots; may include compact provider_contexts and tool_traces
+        sessions/{userId}/{sessionId}.jsonl # Revisioned conversation snapshots with compact provider_contexts and tool_traces
         media/{safeUserId}/{safeSessionId}/
     feishu/
       data/
         lingobridge.db                   # Feishu sessions, workflow requests, chat-bound Docs metadata, Bot resources, resource grants, operation approvals, and scoped 24-hour grants
-        sessions/{userId}/{sessionId}.jsonl # Conversation snapshots; may include compact provider_contexts and tool_traces
+        sessions/{userId}/{sessionId}.jsonl # Revisioned conversation snapshots with compact provider_contexts and tool_traces
     github/
       data/
         lingobridge.db                   # GitHub review sessions, sync cursors, and legacy account rows
-        sessions/{reviewKey}/{sessionId}.jsonl # Synthetic review history and tool_traces
+        sessions/{reviewKey}/{sessionId}.jsonl # Revisioned synthetic review history and tool_traces
 ```
 
 Each platform has its own SQLite database and data directory. The middle layer
@@ -763,6 +763,10 @@ account-id scoped.
 Each SQLite `sessions` row owns its `model_name`. During the schema migration
 from older databases, the former user-level model preference is copied to all
 existing sessions for that user and the legacy preference column is removed.
+Each JSONL conversation snapshot also carries a monotonic `revision`. Saves use
+compare-and-swap against the revision loaded at turn start, so a stale turn
+cannot replace newer history. Legacy snapshots without the field load as
+revision zero and receive revision one on their next successful save.
 
 ## Internal Architecture
 
@@ -806,6 +810,10 @@ trusted account, chat, source-message, and actor identity through Go context;
 the core then binds the exact user, session, turn, provider call ID, and resolved
 tool name immediately before execution. These runtime fields are not part of a
 tool's JSON Schema and cannot be supplied or overridden by model arguments.
+Core user turns, manual compaction, and current-session mutation commands run
+through a lane keyed by platform, account, user, and session. Work for one
+session is serialized while different sessions can proceed independently; the
+loaded conversation revision is included in the trusted tool context.
 
 ## Tech Stack
 

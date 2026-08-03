@@ -139,9 +139,10 @@ func (f *fakeConversationManager) LoadHistory(userID, sessionID string) (*store.
 	return &store.Conversation{}, nil
 }
 
-func (f *fakeConversationManager) SaveHistory(userID, sessionID string, conv *store.Conversation) error {
+func (f *fakeConversationManager) SaveHistoryCAS(userID, sessionID string, expectedRevision int64, conv *store.Conversation) (int64, error) {
+	conv.Revision = expectedRevision + 1
 	f.saved = conv
-	return nil
+	return conv.Revision, nil
 }
 
 func (f *fakeConversationManager) CreateSession(userID, name string) (*store.Session, error) {

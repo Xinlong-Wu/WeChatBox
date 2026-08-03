@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -51,9 +52,11 @@ func (f *fakeSessions) LoadHistory(userID, sessionID string) (*store.Conversatio
 	return &store.Conversation{}, nil
 }
 
-func (f *fakeSessions) SaveHistory(userID, sessionID string, conv *store.Conversation) error {
+func (f *fakeSessions) SaveHistoryCAS(userID, sessionID string, expectedRevision int64, conv *store.Conversation) (int64, error) {
+	conv.Revision = expectedRevision + 1
 	f.saved = conv
-	return nil
+	f.conv = conv
+	return conv.Revision, nil
 }
 
 func (f *fakeSessions) CurrentSession(userID string) (*store.Session, error) {
@@ -98,6 +101,50 @@ type fakeLLM struct {
 	streamErrs      []error
 	streamErr       error
 	systemPrompts   []string
+}
+
+type blockingLaneLLM struct {
+	entered chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	active  int
+	max     int
+	calls   int
+}
+
+func (b *blockingLaneLLM) PrepareUserMessage(content string, attachments []llm.InputAttachment) (store.Message, error) {
+	return store.Message{Role: "user", Content: content}, nil
+}
+
+func (b *blockingLaneLLM) Chat(systemPrompt string, messages []store.Message) (llm.Response, error) {
+	return b.ChatStream(systemPrompt, messages, nil)
+}
+
+func (b *blockingLaneLLM) ChatStream(systemPrompt string, messages []store.Message, onChunk func(chunk string) error) (llm.Response, error) {
+	b.mu.Lock()
+	b.active++
+	b.calls++
+	call := b.calls
+	if b.active > b.max {
+		b.max = b.active
+	}
+	b.mu.Unlock()
+	b.entered <- struct{}{}
+	<-b.release
+	b.mu.Lock()
+	b.active--
+	b.mu.Unlock()
+	return llm.Response{Text: "reply-" + strconv.Itoa(call)}, nil
+}
+
+func (b *blockingLaneLLM) AssistantMessage(resp llm.Response) (store.Message, error) {
+	return store.Message{Role: "assistant", Content: resp.Text}, nil
+}
+
+func (b *blockingLaneLLM) snapshot() (calls, maxActive int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.calls, b.max
 }
 
 func (f *fakeLLM) PrepareUserMessage(content string, attachments []llm.InputAttachment) (store.Message, error) {
@@ -663,7 +710,10 @@ func TestHandleTextRunsToolsAndSavesTrace(t *testing.T) {
 }
 
 func TestHandleTextBindsTrustedExecutionContextOutsideToolArguments(t *testing.T) {
-	sessions := &fakeSessions{sess: &store.Session{ID: "sess_current", UserID: "trusted_user", Name: "default", Current: true}}
+	sessions := &fakeSessions{
+		sess: &store.Session{ID: "sess_current", UserID: "trusted_user", Name: "default", Current: true},
+		conv: &store.Conversation{Revision: 7},
+	}
 	llmClient := &fakeToolLLM{
 		calls: []tooltypes.Call{{
 			ID:        "call_1",
@@ -707,8 +757,58 @@ func TestHandleTextBindsTrustedExecutionContextOutsideToolArguments(t *testing.T
 	if execution.ChatID != "oc_trusted" || execution.SourceMessageID != "om_trusted" || execution.ActorOpenID != "ou_trusted" || execution.ActorUserID != "u_trusted" || !execution.ChatIsGroup {
 		t.Fatalf("platform scope = %#v, want trusted Feishu chat and actor", execution)
 	}
-	if !strings.HasPrefix(execution.TurnID, "turn_") || execution.ToolCallID != "call_1" || execution.ToolName != "fake_tool" || execution.ConversationRevision != 0 {
+	if !strings.HasPrefix(execution.TurnID, "turn_") || execution.ToolCallID != "call_1" || execution.ToolName != "fake_tool" || execution.ConversationRevision != 7 {
 		t.Fatalf("call scope = %#v, want generated turn and runtime-bound call", execution)
+	}
+}
+
+func TestHandleSerializesTurnsForSameSession(t *testing.T) {
+	sessions := &fakeSessions{sess: &store.Session{ID: "session", UserID: "user", Name: "default", Current: true}}
+	client := &blockingLaneLLM{
+		entered: make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	bot := New(sessions, testLLMConfig())
+	bot.NewLLM = func(config.ResolvedModel) llm.Client { return client }
+	errs := make(chan error, 2)
+	go func() {
+		errs <- bot.Handle(context.Background(), InboundMessage{Platform: "feishu", AccountID: "feishu:cli", UserKey: "user", LLMText: "first"}, &fakeSender{})
+	}()
+	select {
+	case <-client.entered:
+	case <-time.After(time.Second):
+		close(client.release)
+		t.Fatal("first turn did not enter LLM")
+	}
+	go func() {
+		errs <- bot.Handle(context.Background(), InboundMessage{Platform: "feishu", AccountID: "feishu:cli", UserKey: "user", LLMText: "second"}, &fakeSender{})
+	}()
+	enteredConcurrently := false
+	select {
+	case <-client.entered:
+		enteredConcurrently = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(client.release)
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatalf("Handle returned error: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for serialized turns")
+		}
+	}
+	if enteredConcurrently {
+		t.Fatal("second turn entered the LLM before the first session turn completed")
+	}
+	calls, maxActive := client.snapshot()
+	if calls != 2 || maxActive != 1 {
+		t.Fatalf("LLM concurrency = calls:%d max_active:%d, want 2/1", calls, maxActive)
+	}
+	if sessions.saved == nil || sessions.saved.Revision != 2 || len(sessions.saved.Messages) != 4 {
+		t.Fatalf("saved conversation = %#v, want two serialized turns at revision 2", sessions.saved)
 	}
 }
 

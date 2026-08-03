@@ -52,9 +52,9 @@ func (m *Manager) LoadHistory(userID, sessionID string) (*store.Conversation, er
 	return m.store.LoadConversation(userID, sessionID)
 }
 
-// SaveHistory saves a conversation snapshot for a session.
-func (m *Manager) SaveHistory(userID, sessionID string, conv *store.Conversation) error {
-	return m.store.SaveConversation(userID, sessionID, conv)
+// SaveHistoryCAS saves a conversation snapshot if its expected revision is current.
+func (m *Manager) SaveHistoryCAS(userID, sessionID string, expectedRevision int64, conv *store.Conversation) (int64, error) {
+	return m.store.SaveConversationCAS(userID, sessionID, expectedRevision, conv)
 }
 
 // CreateSession creates a new session for a user and sets it as current.

@@ -2,10 +2,15 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 )
+
+// ErrConversationConflict is returned when a snapshot is saved against a
+// stale conversation revision.
+var ErrConversationConflict = errors.New("conversation revision conflict")
 
 // Attachment represents non-text content associated with a chat message.
 type Attachment struct {
@@ -52,6 +57,7 @@ func (c ProviderContext) IsEmpty() bool {
 
 // Conversation is a snapshot of a full conversation (one JSONL line).
 type Conversation struct {
+	Revision         int64                      `json:"revision"`
 	Messages         []Message                  `json:"messages"`
 	ProviderContexts map[string]ProviderContext `json:"provider_contexts,omitempty"`
 }
@@ -69,7 +75,10 @@ func (s *Store) SessionPath(userID, sessionID string) string {
 // LoadConversation reads the last line of a JSONL file as the current conversation.
 // Returns an empty conversation if the file doesn't exist.
 func (s *Store) LoadConversation(userID, sessionID string) (*Conversation, error) {
-	path := s.SessionPath(userID, sessionID)
+	return loadConversationFile(s.SessionPath(userID, sessionID))
+}
+
+func loadConversationFile(path string) (*Conversation, error) {
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -89,42 +98,69 @@ func (s *Store) LoadConversation(userID, sessionID string) (*Conversation, error
 		if err := json.Unmarshal([]byte(lines[i]), &conv); err != nil {
 			return nil, fmt.Errorf("parse JSONL line %d: %w", i+1, err)
 		}
+		if conv.Revision < 0 {
+			return nil, fmt.Errorf("parse JSONL line %d: negative conversation revision %d", i+1, conv.Revision)
+		}
 		return &conv, nil
 	}
 
 	return &Conversation{}, nil
 }
 
-// SaveConversation writes a conversation snapshot as a single JSONL line,
-// atomically replacing any previous content via write-to-temp + rename.
-func (s *Store) SaveConversation(userID, sessionID string, conv *Conversation) error {
+// SaveConversationCAS writes a conversation snapshot only when expectedRevision
+// matches the latest persisted revision. A successful save increments the
+// revision and atomically replaces the previous file.
+func (s *Store) SaveConversationCAS(userID, sessionID string, expectedRevision int64, conv *Conversation) (int64, error) {
+	if expectedRevision < 0 {
+		return 0, fmt.Errorf("save conversation: negative expected revision %d", expectedRevision)
+	}
+	if conv == nil {
+		return 0, fmt.Errorf("save conversation: nil snapshot")
+	}
 	path := s.SessionPath(userID, sessionID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	current, err := loadConversationFile(path)
+	if err != nil {
+		return 0, err
+	}
+	if current.Revision != expectedRevision {
+		return current.Revision, fmt.Errorf("%w: expected=%d actual=%d", ErrConversationConflict, expectedRevision, current.Revision)
+	}
+	nextRevision := expectedRevision + 1
+	snapshot := *conv
+	snapshot.Revision = nextRevision
 
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("create session dir: %w", err)
+		return current.Revision, fmt.Errorf("create session dir: %w", err)
 	}
 
-	line, err := json.Marshal(conv)
+	line, err := json.Marshal(&snapshot)
 	if err != nil {
-		return fmt.Errorf("marshal conversation: %w", err)
+		return current.Revision, fmt.Errorf("marshal conversation: %w", err)
 	}
 
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, append(line, '\n'), 0600); err != nil {
-		return fmt.Errorf("write session temp file: %w", err)
+		return current.Revision, fmt.Errorf("write session temp file: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp)
-		return fmt.Errorf("rename session file: %w", err)
+		return current.Revision, fmt.Errorf("rename session file: %w", err)
 	}
 
-	return nil
+	conv.Revision = nextRevision
+	return nextRevision, nil
 }
 
 // TruncateConversation removes all history for a session in this platform store.
 func (s *Store) TruncateConversation(userID, sessionID string) error {
 	path := s.SessionPath(userID, sessionID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	// Just delete the file; next append will recreate it
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("truncate session: %w", err)
