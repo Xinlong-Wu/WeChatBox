@@ -780,6 +780,9 @@ func TestReviewPullRequestPassesAccountModel(t *testing.T) {
 		if handler.model != "claude" {
 			t.Fatalf("msg.Model = %q, want claude", handler.model)
 		}
+		if handler.userKey != pullRequestUserKey(pr) {
+			t.Fatalf("msg.UserKey = %q, want shared PR key %q", handler.userKey, pullRequestUserKey(pr))
+		}
 	})
 
 	t.Run("empty model stays empty", func(t *testing.T) {
@@ -939,6 +942,14 @@ type fakeAPIClient struct {
 	instructions      ReviewInstructions
 	instructionsOK    bool
 	instructionsCalls int
+
+	issueComments   []IssueComment
+	reviewComments  []ReviewComment
+	createdComments []string
+	createdReplies  []struct {
+		CommentID int64
+		Body      string
+	}
 }
 
 func (f *fakeAPIClient) ListOpenPullRequests(ctx context.Context, repo Repository) ([]PullRequest, error) {
@@ -950,6 +961,39 @@ func (f *fakeAPIClient) ReviewInstructions(ctx context.Context, pr PullRequest) 
 	return f.instructions, f.instructionsOK, nil
 }
 
+func (f *fakeAPIClient) ListIssueComments(ctx context.Context, repo Repository, prNumber int, since time.Time) ([]IssueComment, error) {
+	var out []IssueComment
+	for _, c := range f.issueComments {
+		if since.IsZero() || !c.CreatedAt.Before(since) {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeAPIClient) ListReviewComments(ctx context.Context, repo Repository, prNumber int, since time.Time) ([]ReviewComment, error) {
+	var out []ReviewComment
+	for _, c := range f.reviewComments {
+		if since.IsZero() || !c.CreatedAt.Before(since) {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeAPIClient) CreateIssueComment(ctx context.Context, repo Repository, prNumber int, body string) error {
+	f.createdComments = append(f.createdComments, body)
+	return nil
+}
+
+func (f *fakeAPIClient) CreateReviewCommentReply(ctx context.Context, repo Repository, prNumber int, commentID int64, body string) error {
+	f.createdReplies = append(f.createdReplies, struct {
+		CommentID int64
+		Body      string
+	}{commentID, body})
+	return nil
+}
+
 type fakeHandler struct{}
 
 func (fakeHandler) Handle(ctx context.Context, msg core.InboundMessage, sender core.Sender) error {
@@ -957,11 +1001,13 @@ func (fakeHandler) Handle(ctx context.Context, msg core.InboundMessage, sender c
 }
 
 type recordingHandler struct {
-	model string
+	model   string
+	userKey string
 }
 
 func (h *recordingHandler) Handle(ctx context.Context, msg core.InboundMessage, sender core.Sender) error {
 	h.model = msg.Model
+	h.userKey = msg.UserKey
 	return nil
 }
 
@@ -1016,6 +1062,363 @@ func (f *fakeMCPHost) Resolve(scope tooltypes.Scope) tooltypes.Selection {
 }
 
 func (f *fakeMCPHost) Close(ctx context.Context) error {
+	return nil
+}
+
+func TestParseCommentCommand(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantCmd CommentCommand
+	}{
+		{name: "empty", body: "", wantCmd: CommentCommand{}},
+		{name: "no command", body: "just a comment", wantCmd: CommentCommand{}},
+		{name: "review exact", body: "/review", wantCmd: CommentCommand{Type: "review"}},
+		{name: "review case insensitive", body: "/Review", wantCmd: CommentCommand{Type: "review"}},
+		{name: "review with trailing text", body: "/review please", wantCmd: CommentCommand{Type: "review"}},
+		{name: "review with whitespace", body: "  /review  ", wantCmd: CommentCommand{Type: "review"}},
+		{name: "bot with message", body: "/bot hello world", wantCmd: CommentCommand{Type: "bot", Message: "hello world"}},
+		{name: "bot case insensitive", body: "/Bot what is this PR about?", wantCmd: CommentCommand{Type: "bot", Message: "what is this PR about?"}},
+		{name: "bot without message", body: "/bot", wantCmd: CommentCommand{}},
+		{name: "bot with only spaces", body: "/bot   ", wantCmd: CommentCommand{}},
+		{name: "bot multiline", body: "/bot explain this\nand also that", wantCmd: CommentCommand{Type: "bot", Message: "explain this\nand also that"}},
+		{name: "not a command slash", body: "/unknown command", wantCmd: CommentCommand{}},
+		{name: "command not on first line", body: "hello\n/review", wantCmd: CommentCommand{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseCommentCommand(tc.body)
+			if got.Type != tc.wantCmd.Type || got.Message != tc.wantCmd.Message {
+				t.Fatalf("parseCommentCommand(%q) = %#v, want %#v", tc.body, got, tc.wantCmd)
+			}
+		})
+	}
+}
+
+func TestCursorCommentCheckSince(t *testing.T) {
+	t.Run("prefers LastCommentCheck", func(t *testing.T) {
+		entry := cursorEntry{
+			UpdatedAt:        "2026-01-01T00:00:00Z",
+			LastCommentCheck: "2026-01-02T00:00:00Z",
+		}
+		got := commentCheckSince(entry)
+		want, _ := time.Parse(time.RFC3339, "2026-01-02T00:00:00Z")
+		if !got.Equal(want) {
+			t.Fatalf("commentCheckSince = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("falls back to UpdatedAt", func(t *testing.T) {
+		entry := cursorEntry{UpdatedAt: "2026-01-01T00:00:00Z"}
+		got := commentCheckSince(entry)
+		want, _ := time.Parse(time.RFC3339, "2026-01-01T00:00:00Z")
+		if !got.Equal(want) {
+			t.Fatalf("commentCheckSince = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("zero when both empty", func(t *testing.T) {
+		entry := cursorEntry{}
+		got := commentCheckSince(entry)
+		if !got.IsZero() {
+			t.Fatalf("commentCheckSince = %v, want zero", got)
+		}
+	})
+}
+
+func TestMarkCommentCheck(t *testing.T) {
+	pr := testPullRequest()
+	now := time.Date(2026, 6, 20, 12, 0, 0, 0, time.UTC)
+	state := cursorState{PRs: map[string]cursorEntry{
+		cursorKey(pr): {HeadSHA: pr.Head.SHA, Status: cursorStatusReviewed, UpdatedAt: "2026-01-01T00:00:00Z"},
+	}}
+	state = markCommentCheck(state, pr, now)
+	entry := state.PRs[cursorKey(pr)]
+	if entry.LastCommentCheck != "2026-06-20T12:00:00Z" {
+		t.Fatalf("LastCommentCheck = %q, want 2026-06-20T12:00:00Z", entry.LastCommentCheck)
+	}
+	if entry.Status != cursorStatusReviewed || entry.HeadSHA != pr.Head.SHA {
+		t.Fatalf("markCommentCheck changed status or SHA: %#v", entry)
+	}
+}
+
+func TestPollCommentsReviewCommand(t *testing.T) {
+	pr := testPullRequest()
+	now := time.Date(2026, 6, 20, 12, 0, 0, 0, time.UTC)
+	st := &fakeCursorStore{}
+
+	// Pre-populate cursor as "reviewed".
+	initialState := markCursor(cursorState{PRs: map[string]cursorEntry{}}, pr, cursorStatusReviewed, now.Add(-time.Hour))
+	if err := saveCursor(st, "github:456", initialState); err != nil {
+		t.Fatalf("saveCursor: %v", err)
+	}
+
+	reviewWriteTool := &fakeTool{spec: tooltypes.Spec{Name: "mcp_github_pull_request_review_write"}}
+	p := &Platform{
+		account: store.Account{ID: "github:456", Name: "reviewer", Platform: store.PlatformGitHub},
+		store:   st,
+		now:     func() time.Time { return now },
+		newMCPHost: func() mcpHost {
+			return &fakeMCPHost{tools: []tooltypes.Tool{reviewWriteTool}}
+		},
+	}
+
+	client := &fakeAPIClient{
+		prs:            []PullRequest{pr},
+		instructions:   ReviewInstructions{Text: "review carefully", Source: "base"},
+		instructionsOK: true,
+		issueComments: []IssueComment{
+			{
+				ID:        100,
+				Body:      "/review",
+				User:      CommentUser{Login: "human", Type: "User"},
+				CreatedAt: now.Add(-30 * time.Minute),
+			},
+		},
+	}
+
+	handler := &submittingReviewHandler{t: t}
+	accountCfg := normalizeAccountConfig(AccountConfig{
+		Repositories: []string{"base/repo"},
+		MCP:          MCPConfig{Command: "github-mcp-server"},
+	})
+	err := p.pollOnce(context.Background(), handler, accountCfg, client, staticTokenSource{})
+	if err != nil {
+		t.Fatalf("pollOnce: %v", err)
+	}
+	if !handler.called {
+		t.Fatal("review handler was not called for /review command")
+	}
+
+	state, err := loadCursor(st, "github:456")
+	if err != nil {
+		t.Fatalf("loadCursor: %v", err)
+	}
+	entry := state.PRs[cursorKey(pr)]
+	if entry.Status != cursorStatusReviewed {
+		t.Fatalf("status = %q, want reviewed", entry.Status)
+	}
+}
+
+func TestPollCommentsBotCommand(t *testing.T) {
+	pr := testPullRequest()
+	now := time.Date(2026, 6, 20, 12, 0, 0, 0, time.UTC)
+	st := &fakeCursorStore{}
+
+	initialState := markCursor(cursorState{PRs: map[string]cursorEntry{}}, pr, cursorStatusReviewed, now.Add(-time.Hour))
+	if err := saveCursor(st, "github:456", initialState); err != nil {
+		t.Fatalf("saveCursor: %v", err)
+	}
+
+	reviewWriteTool := &fakeTool{spec: tooltypes.Spec{Name: "mcp_github_pull_request_review_write"}}
+	p := &Platform{
+		account: store.Account{ID: "github:456", Name: "reviewer", Platform: store.PlatformGitHub},
+		store:   st,
+		now:     func() time.Time { return now },
+		newMCPHost: func() mcpHost {
+			return &fakeMCPHost{tools: []tooltypes.Tool{reviewWriteTool}}
+		},
+	}
+
+	client := &fakeAPIClient{
+		prs: []PullRequest{pr},
+		issueComments: []IssueComment{
+			{
+				ID:        200,
+				Body:      "/bot what does this PR do?",
+				User:      CommentUser{Login: "human", Type: "User"},
+				CreatedAt: now.Add(-30 * time.Minute),
+			},
+		},
+	}
+
+	handler := &chatRecordingHandler{}
+	accountCfg := normalizeAccountConfig(AccountConfig{
+		Repositories: []string{"base/repo"},
+		MCP:          MCPConfig{Command: "github-mcp-server"},
+	})
+	err := p.pollOnce(context.Background(), handler, accountCfg, client, staticTokenSource{})
+	if err != nil {
+		t.Fatalf("pollOnce: %v", err)
+	}
+	if !handler.called {
+		t.Fatal("chat handler was not called for /bot command")
+	}
+	if !strings.Contains(handler.llmText, "what does this PR do?") {
+		t.Fatalf("LLMText = %q, want containing bot message", handler.llmText)
+	}
+	if !strings.Contains(handler.systemPrompt, "helpful assistant") {
+		t.Fatalf("SystemPromptSuffix = %q, want chat prompt", handler.systemPrompt)
+	}
+	if handler.userKey != pullRequestUserKey(pr) {
+		t.Fatalf("UserKey = %q, want shared PR key %q", handler.userKey, pullRequestUserKey(pr))
+	}
+}
+
+func TestPullRequestUserKeyIsStableAcrossReviewsAndHeadChanges(t *testing.T) {
+	pr := testPullRequest()
+	want := "github:base:repo:pr:7"
+	if got := pullRequestUserKey(pr); got != want {
+		t.Fatalf("pullRequestUserKey() = %q, want %q", got, want)
+	}
+
+	pr.Head.SHA = "new-head-sha"
+	if got := pullRequestUserKey(pr); got != want {
+		t.Fatalf("pullRequestUserKey() after head change = %q, want %q", got, want)
+	}
+}
+
+func TestPollCommentsFiltersBotUsers(t *testing.T) {
+	pr := testPullRequest()
+	now := time.Date(2026, 6, 20, 12, 0, 0, 0, time.UTC)
+	st := &fakeCursorStore{}
+
+	initialState := markCursor(cursorState{PRs: map[string]cursorEntry{}}, pr, cursorStatusReviewed, now.Add(-time.Hour))
+	if err := saveCursor(st, "github:456", initialState); err != nil {
+		t.Fatalf("saveCursor: %v", err)
+	}
+
+	p := &Platform{
+		account: store.Account{ID: "github:456", Name: "reviewer", Platform: store.PlatformGitHub},
+		store:   st,
+		now:     func() time.Time { return now },
+	}
+
+	client := &fakeAPIClient{
+		prs: []PullRequest{pr},
+		issueComments: []IssueComment{
+			{
+				ID:        300,
+				Body:      "/review",
+				User:      CommentUser{Login: "my-bot[bot]", Type: "Bot"},
+				CreatedAt: now.Add(-30 * time.Minute),
+			},
+		},
+	}
+
+	handler := &chatRecordingHandler{}
+	accountCfg := normalizeAccountConfig(AccountConfig{
+		Repositories: []string{"base/repo"},
+		MCP:          MCPConfig{Command: "github-mcp-server"},
+	})
+	err := p.pollOnce(context.Background(), handler, accountCfg, client, staticTokenSource{})
+	if err != nil {
+		t.Fatalf("pollOnce: %v", err)
+	}
+	if handler.called {
+		t.Fatal("handler should not be called for bot user comments")
+	}
+}
+
+func TestPollCommentsNoNewComments(t *testing.T) {
+	pr := testPullRequest()
+	now := time.Date(2026, 6, 20, 12, 0, 0, 0, time.UTC)
+	st := &fakeCursorStore{}
+
+	initialState := markCursor(cursorState{PRs: map[string]cursorEntry{}}, pr, cursorStatusReviewed, now.Add(-time.Hour))
+	if err := saveCursor(st, "github:456", initialState); err != nil {
+		t.Fatalf("saveCursor: %v", err)
+	}
+
+	p := &Platform{
+		account: store.Account{ID: "github:456", Name: "reviewer", Platform: store.PlatformGitHub},
+		store:   st,
+		now:     func() time.Time { return now },
+	}
+
+	client := &fakeAPIClient{prs: []PullRequest{pr}}
+
+	err := p.pollOnce(context.Background(), fakeHandler{}, normalizeAccountConfig(AccountConfig{
+		Repositories: []string{"base/repo"},
+		MCP:          MCPConfig{Command: "github-mcp-server"},
+	}), client, staticTokenSource{})
+	if err != nil {
+		t.Fatalf("pollOnce: %v", err)
+	}
+
+	state, err := loadCursor(st, "github:456")
+	if err != nil {
+		t.Fatalf("loadCursor: %v", err)
+	}
+	entry := state.PRs[cursorKey(pr)]
+	if entry.LastCommentCheck != now.UTC().Format(time.RFC3339) {
+		t.Fatalf("LastCommentCheck = %q, want %s", entry.LastCommentCheck, now.UTC().Format(time.RFC3339))
+	}
+}
+
+func TestPollCommentsBotReplyToReviewComment(t *testing.T) {
+	pr := testPullRequest()
+	now := time.Date(2026, 6, 20, 12, 0, 0, 0, time.UTC)
+	st := &fakeCursorStore{}
+
+	initialState := markCursor(cursorState{PRs: map[string]cursorEntry{}}, pr, cursorStatusReviewed, now.Add(-time.Hour))
+	if err := saveCursor(st, "github:456", initialState); err != nil {
+		t.Fatalf("saveCursor: %v", err)
+	}
+
+	reviewWriteTool := &fakeTool{spec: tooltypes.Spec{Name: "mcp_github_pull_request_review_write"}}
+	p := &Platform{
+		account: store.Account{ID: "github:456", Name: "reviewer", Platform: store.PlatformGitHub},
+		store:   st,
+		now:     func() time.Time { return now },
+		newMCPHost: func() mcpHost {
+			return &fakeMCPHost{tools: []tooltypes.Tool{reviewWriteTool}}
+		},
+	}
+
+	client := &fakeAPIClient{
+		prs: []PullRequest{pr},
+		reviewComments: []ReviewComment{
+			{
+				ID:        500,
+				Body:      "/bot explain this code",
+				User:      CommentUser{Login: "human", Type: "User"},
+				CreatedAt: now.Add(-30 * time.Minute),
+				Path:      "main.go",
+				InReplyTo: 400,
+			},
+		},
+	}
+
+	handler := &chatRecordingHandler{responseText: "This code does X"}
+	accountCfg := normalizeAccountConfig(AccountConfig{
+		Repositories: []string{"base/repo"},
+		MCP:          MCPConfig{Command: "github-mcp-server"},
+	})
+	err := p.pollOnce(context.Background(), handler, accountCfg, client, staticTokenSource{})
+	if err != nil {
+		t.Fatalf("pollOnce: %v", err)
+	}
+	if !handler.called {
+		t.Fatal("chat handler was not called for review comment /bot command")
+	}
+	if len(client.createdReplies) != 1 {
+		t.Fatalf("createdReplies = %d, want 1", len(client.createdReplies))
+	}
+	if client.createdReplies[0].CommentID != 500 {
+		t.Fatalf("reply comment ID = %d, want 500", client.createdReplies[0].CommentID)
+	}
+	if client.createdReplies[0].Body != "This code does X" {
+		t.Fatalf("reply body = %q, want response text", client.createdReplies[0].Body)
+	}
+}
+
+type chatRecordingHandler struct {
+	called       bool
+	llmText      string
+	systemPrompt string
+	userKey      string
+	responseText string
+}
+
+func (h *chatRecordingHandler) Handle(ctx context.Context, msg core.InboundMessage, sender core.Sender) error {
+	h.called = true
+	h.llmText = msg.LLMText
+	h.systemPrompt = msg.SystemPromptSuffix
+	h.userKey = msg.UserKey
+	if h.responseText != "" {
+		return sender.Send(ctx, core.OutboundMessage{Text: h.responseText})
+	}
 	return nil
 }
 

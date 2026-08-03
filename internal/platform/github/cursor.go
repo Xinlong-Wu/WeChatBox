@@ -22,9 +22,10 @@ type cursorState struct {
 }
 
 type cursorEntry struct {
-	HeadSHA   string `json:"head_sha"`
-	Status    string `json:"status"`
-	UpdatedAt string `json:"updated_at,omitempty"`
+	HeadSHA          string `json:"head_sha"`
+	Status           string `json:"status"`
+	UpdatedAt        string `json:"updated_at,omitempty"`
+	LastCommentCheck string `json:"last_comment_check,omitempty"`
 }
 
 func loadCursor(st cursorStore, accountID string) (cursorState, error) {
@@ -75,10 +76,41 @@ func markCursor(state cursorState, pr PullRequest, status string, now time.Time)
 	if state.PRs == nil {
 		state.PRs = map[string]cursorEntry{}
 	}
+	nowStr := now.UTC().Format(time.RFC3339)
 	state.PRs[cursorKey(pr)] = cursorEntry{
-		HeadSHA:   strings.TrimSpace(pr.Head.SHA),
-		Status:    status,
-		UpdatedAt: now.UTC().Format(time.RFC3339),
+		HeadSHA:          strings.TrimSpace(pr.Head.SHA),
+		Status:           status,
+		UpdatedAt:        nowStr,
+		LastCommentCheck: nowStr,
 	}
+	return state
+}
+
+// commentCheckSince returns the effective "since" time for comment polling.
+// It prefers LastCommentCheck, falls back to UpdatedAt.
+func commentCheckSince(entry cursorEntry) time.Time {
+	if s := strings.TrimSpace(entry.LastCommentCheck); s != "" {
+		if t, err := time.Parse(time.RFC3339, s); err == nil {
+			return t
+		}
+	}
+	if s := strings.TrimSpace(entry.UpdatedAt); s != "" {
+		if t, err := time.Parse(time.RFC3339, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+// markCommentCheck updates only the LastCommentCheck timestamp without
+// changing status or HeadSHA.
+func markCommentCheck(state cursorState, pr PullRequest, now time.Time) cursorState {
+	if state.PRs == nil {
+		state.PRs = map[string]cursorEntry{}
+	}
+	key := cursorKey(pr)
+	entry := state.PRs[key]
+	entry.LastCommentCheck = now.UTC().Format(time.RFC3339)
+	state.PRs[key] = entry
 	return state
 }

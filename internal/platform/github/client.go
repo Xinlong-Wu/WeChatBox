@@ -1,6 +1,7 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ErrNotFound is returned when the GitHub API responds with 404.
@@ -35,6 +37,10 @@ func (e *NotFoundError) Unwrap() error { return ErrNotFound }
 type apiClient interface {
 	ListOpenPullRequests(ctx context.Context, repo Repository) ([]PullRequest, error)
 	ReviewInstructions(ctx context.Context, pr PullRequest) (ReviewInstructions, bool, error)
+	ListIssueComments(ctx context.Context, repo Repository, prNumber int, since time.Time) ([]IssueComment, error)
+	ListReviewComments(ctx context.Context, repo Repository, prNumber int, since time.Time) ([]ReviewComment, error)
+	CreateIssueComment(ctx context.Context, repo Repository, prNumber int, body string) error
+	CreateReviewCommentReply(ctx context.Context, repo Repository, prNumber int, commentID int64, body string) error
 }
 
 type githubClient struct {
@@ -62,6 +68,29 @@ type PullRequestRef struct {
 type ReviewInstructions struct {
 	Text   string
 	Source string
+}
+
+type CommentUser struct {
+	Login string
+	Type  string // "User", "Bot", "Organization"
+}
+
+type IssueComment struct {
+	ID        int64
+	Body      string
+	User      CommentUser
+	CreatedAt time.Time
+	HTMLURL   string
+}
+
+type ReviewComment struct {
+	ID        int64
+	Body      string
+	User      CommentUser
+	CreatedAt time.Time
+	HTMLURL   string
+	Path      string
+	InReplyTo int64 // non-zero if this is a reply
 }
 
 func newGitHubClient(baseURL string, tokenSource tokenSource, httpClient *http.Client) *githubClient {
@@ -163,6 +192,9 @@ func (c *githubClient) doJSON(ctx context.Context, method, apiPath string, query
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	// githubLog.Debug(ctx, "github request %s", req)
 
@@ -238,6 +270,116 @@ func (r rawPRRef) toRef() PullRequestRef {
 		}
 	}
 	return ref
+}
+
+type rawIssueComment struct {
+	ID        int64  `json:"id"`
+	Body      string `json:"body"`
+	HTMLURL   string `json:"html_url"`
+	CreatedAt string `json:"created_at"`
+	User      struct {
+		Login string `json:"login"`
+		Type  string `json:"type"`
+	} `json:"user"`
+}
+
+func (r rawIssueComment) toIssueComment() IssueComment {
+	t, _ := time.Parse(time.RFC3339, r.CreatedAt)
+	return IssueComment{
+		ID:        r.ID,
+		Body:      r.Body,
+		User:      CommentUser{Login: r.User.Login, Type: r.User.Type},
+		CreatedAt: t,
+		HTMLURL:   r.HTMLURL,
+	}
+}
+
+type rawReviewComment struct {
+	ID        int64  `json:"id"`
+	Body      string `json:"body"`
+	HTMLURL   string `json:"html_url"`
+	Path      string `json:"path"`
+	CreatedAt string `json:"created_at"`
+	InReplyTo int64  `json:"in_reply_to_id"`
+	User      struct {
+		Login string `json:"login"`
+		Type  string `json:"type"`
+	} `json:"user"`
+}
+
+func (r rawReviewComment) toReviewComment() ReviewComment {
+	t, _ := time.Parse(time.RFC3339, r.CreatedAt)
+	return ReviewComment{
+		ID:        r.ID,
+		Body:      r.Body,
+		User:      CommentUser{Login: r.User.Login, Type: r.User.Type},
+		CreatedAt: t,
+		HTMLURL:   r.HTMLURL,
+		Path:      r.Path,
+		InReplyTo: r.InReplyTo,
+	}
+}
+
+func (c *githubClient) ListIssueComments(ctx context.Context, repo Repository, prNumber int, since time.Time) ([]IssueComment, error) {
+	var out []IssueComment
+	for page := 1; ; page++ {
+		var raws []rawIssueComment
+		query := url.Values{}
+		if !since.IsZero() {
+			query.Set("since", since.UTC().Format(time.RFC3339))
+		}
+		query.Set("per_page", "100")
+		query.Set("page", strconv.Itoa(page))
+		if err := c.doJSON(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s/issues/%d/comments", pathPart(repo.Owner), pathPart(repo.Name), prNumber), query, nil, &raws); err != nil {
+			return nil, err
+		}
+		for _, raw := range raws {
+			out = append(out, raw.toIssueComment())
+		}
+		if len(raws) < 100 {
+			return out, nil
+		}
+	}
+}
+
+func (c *githubClient) ListReviewComments(ctx context.Context, repo Repository, prNumber int, since time.Time) ([]ReviewComment, error) {
+	var out []ReviewComment
+	for page := 1; ; page++ {
+		var raws []rawReviewComment
+		query := url.Values{}
+		if !since.IsZero() {
+			query.Set("since", since.UTC().Format(time.RFC3339))
+		}
+		query.Set("sort", "created")
+		query.Set("direction", "asc")
+		query.Set("per_page", "100")
+		query.Set("page", strconv.Itoa(page))
+		if err := c.doJSON(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s/pulls/%d/comments", pathPart(repo.Owner), pathPart(repo.Name), prNumber), query, nil, &raws); err != nil {
+			return nil, err
+		}
+		for _, raw := range raws {
+			out = append(out, raw.toReviewComment())
+		}
+		if len(raws) < 100 {
+			return out, nil
+		}
+	}
+}
+
+func (c *githubClient) CreateIssueComment(ctx context.Context, repo Repository, prNumber int, body string) error {
+	payload, err := json.Marshal(map[string]string{"body": body})
+	if err != nil {
+		return fmt.Errorf("marshal issue comment body: %w", err)
+	}
+	return c.doJSON(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/%s/issues/%d/comments", pathPart(repo.Owner), pathPart(repo.Name), prNumber), nil, bytes.NewReader(payload), nil)
+}
+
+func (c *githubClient) CreateReviewCommentReply(ctx context.Context, repo Repository, prNumber int, commentID int64, body string) error {
+	payload, err := json.Marshal(map[string]string{"body": body})
+	if err != nil {
+		return fmt.Errorf("marshal review comment reply body: %w", err)
+	}
+	return c.doJSON(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls/%d/comments/%d/replies", pathPart(repo.Owner), pathPart(repo.Name), prNumber, commentID), nil, bytes.NewReader(payload), nil)
 }
 
 func pathPart(value string) string {
