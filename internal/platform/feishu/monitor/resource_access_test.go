@@ -698,6 +698,9 @@ func TestResourceAccessOAuthTokenErrorDoesNotExposeSupportInstructions(t *testin
 	if err != nil {
 		t.Fatalf("RequestAccess returned error: %v", err)
 	}
+	if _, _, err := st.CommitWorkflowContinuation(result.RequestID, "feishu:cli_test", 8, manager.currentTime()); err != nil {
+		t.Fatalf("CommitWorkflowContinuation returned error: %v", err)
+	}
 	cards, _, _ := sender.snapshot()
 	if len(cards) != 1 {
 		t.Fatalf("sent cards = %#v", cards)
@@ -724,6 +727,18 @@ func TestResourceAccessOAuthTokenErrorDoesNotExposeSupportInstructions(t *testin
 	workflowResult, err := st.GetWorkflowResult(result.RequestID, "feishu:cli_test")
 	if err != nil || workflowResult.State != store.WorkflowResultStateFailed || !strings.Contains(string(workflowResult.Payload), `"status":"failed"`) {
 		t.Fatalf("failed workflow result = %#v err=%v", workflowResult, err)
+	}
+	resumer := &fakeWorkflowResumer{text: "oauth failure handled"}
+	resumeSender := &fakeWorkflowResumeTextSender{}
+	worker, err := newWorkflowContinuationWorker(st, resumer, resumeSender, store.Account{ID: "feishu:cli_test"}, nil)
+	if err != nil {
+		t.Fatalf("newWorkflowContinuationWorker returned error: %v", err)
+	}
+	worker.now = func() time.Time { return manager.currentTime().Add(time.Second) }
+	worker.processAvailable(t.Context())
+	worker.processAvailable(t.Context())
+	if len(resumer.requests) != 1 || resumer.requests[0].Result.State != store.WorkflowResultStateFailed || len(resumeSender.calls) != 1 {
+		t.Fatalf("OAuth failure resume requests/sends = %#v/%#v", resumer.requests, resumeSender.calls)
 	}
 	_, updates, messages := sender.snapshot()
 	if len(updates) < 2 || updates[len(updates)-1].messageID != "om_card" || !strings.Contains(updates[len(updates)-1].text, "授权失败") || len(messages) != 0 {

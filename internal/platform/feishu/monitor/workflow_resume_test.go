@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"lingobridge/internal/core"
+	feishutools "lingobridge/internal/platform/feishu/tools"
 	"lingobridge/internal/store"
 )
 
@@ -130,6 +133,129 @@ func TestWorkflowContinuationWorkerCancelsArchivedSessionWithoutRetry(t *testing
 	canceled, err := st.GetWorkflowContinuation(continuation.RequestID, continuation.AccountID)
 	if err != nil || canceled.State != store.WorkflowContinuationStateCanceled || canceled.Attempts != 1 || canceled.LastError == "" {
 		t.Fatalf("canceled continuation = %#v err=%v", canceled, err)
+	}
+}
+
+func TestOperationApprovalDuplicateCallbackResumesContinuationOnce(t *testing.T) {
+	st := openFeishuApprovalTestStore(t)
+	cardSender := &fakeApprovalSender{}
+	manager := newTestApprovalManager(t, st, cardSender)
+	executor := &fakeApprovalExecutor{
+		name:   "feishu_docs_create",
+		result: feishutools.OperationApprovalExecution{Message: "document created"},
+		done:   make(chan struct{}),
+	}
+	if err := manager.registerExecutor(executor); err != nil {
+		t.Fatalf("registerExecutor returned error: %v", err)
+	}
+	pending := requestTestApproval(t, manager)
+	if _, _, err := st.CommitWorkflowContinuation(pending.RequestID, "feishu:cli_test", 8, manager.currentTime()); err != nil {
+		t.Fatalf("CommitWorkflowContinuation returned error: %v", err)
+	}
+	event := approvalCardEvent(pending.RequestID, approvalCardActionApproveOnce, "ou_requester", "oc_chat", "om_card", "")
+	response, err := manager.HandleCardAction(t.Context(), event)
+	if err != nil || response == nil || response.Toast == nil || response.Toast.Type != "success" {
+		t.Fatalf("first approval callback response = %#v err=%v", response, err)
+	}
+	duplicate, err := manager.HandleCardAction(t.Context(), event)
+	if err != nil || duplicate == nil || duplicate.Toast == nil || duplicate.Toast.Type != "info" {
+		t.Fatalf("duplicate approval callback response = %#v err=%v", duplicate, err)
+	}
+	select {
+	case <-executor.done:
+	case <-time.After(time.Second):
+		t.Fatal("approved executor was not called")
+	}
+	waitForApprovalState(t, st, pending.RequestID, store.ToolApprovalStateSucceeded)
+
+	resumer := &fakeWorkflowResumer{text: "operation workflow resumed"}
+	resumeSender := &fakeWorkflowResumeTextSender{}
+	worker, err := newWorkflowContinuationWorker(st, resumer, resumeSender, store.Account{ID: "feishu:cli_test"}, nil)
+	if err != nil {
+		t.Fatalf("newWorkflowContinuationWorker returned error: %v", err)
+	}
+	worker.now = func() time.Time { return manager.currentTime().Add(time.Second) }
+	worker.processAvailable(t.Context())
+	worker.processAvailable(t.Context())
+
+	if calls, _ := executor.snapshot(); calls != 1 {
+		t.Fatalf("executor calls = %d, want 1", calls)
+	}
+	if len(resumer.requests) != 1 || len(resumeSender.calls) != 1 || resumeSender.calls[0].text != "operation workflow resumed" {
+		t.Fatalf("resume requests/sends = %#v/%#v, want one delivery", resumer.requests, resumeSender.calls)
+	}
+	continuation, err := st.GetWorkflowContinuation(pending.RequestID, "feishu:cli_test")
+	if err != nil || continuation.State != store.WorkflowContinuationStateDelivered || continuation.Attempts != 1 {
+		t.Fatalf("operation continuation = %#v err=%v", continuation, err)
+	}
+}
+
+func TestResourceApprovalDuplicateCallbackResumesContinuationOnce(t *testing.T) {
+	var authCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+		case "/open-apis/drive/v1/permissions/doxcn_resume/members/auth":
+			authCalls++
+			writeResourceAccessJSON(t, w, map[string]any{"code": 0, "msg": "Success", "data": map[string]any{"auth_result": true}})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	manager, st, cardSender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
+	now := manager.currentTime()
+	if _, err := st.UpsertFeishuResourceCapability(store.FeishuResourceCapability{
+		AccountID: "feishu:cli_test", ResourceType: "docx", ResourceToken: "doxcn_resume",
+		SubjectType: "openid", SubjectID: "ou_bot", Permission: store.FeishuResourcePermissionWrite,
+		SourceActorOpenID: "ou_requester", SourceRequestID: "req_capability",
+		State: store.FeishuResourceCapabilityStateActive, CreatedAt: now, VerifiedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertFeishuResourceCapability returned error: %v", err)
+	}
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType: "docx", ResourceToken: "doxcn_resume", Permission: feishutools.ResourcePermissionRead,
+		OnceDurationMinutes: 30, Reason: "resume original workflow",
+	})
+	if err != nil || result.Status != feishutools.ResourceAccessStatusPending {
+		t.Fatalf("RequestAccess = %#v err=%v", result, err)
+	}
+	if _, _, err := st.CommitWorkflowContinuation(result.RequestID, "feishu:cli_test", 8, now); err != nil {
+		t.Fatalf("CommitWorkflowContinuation returned error: %v", err)
+	}
+	event := resourceAccessCardEvent(result.RequestID, "ou_requester", "oc_chat", "om_card")
+	event.Event.Action.Value["action"] = resourceAccessCardActionApproveOnce
+	response, err := manager.HandleCardAction(t.Context(), event)
+	if err != nil || response == nil || response.Toast == nil || response.Toast.Type != "success" {
+		t.Fatalf("first resource callback response = %#v err=%v", response, err)
+	}
+	duplicate, err := manager.HandleCardAction(t.Context(), event)
+	if err != nil || duplicate == nil || duplicate.Toast == nil || duplicate.Toast.Type != "info" {
+		t.Fatalf("duplicate resource callback response = %#v err=%v", duplicate, err)
+	}
+	waitForResourceAccessCompletion(t, st, cardSender, result.RequestID)
+
+	resumer := &fakeWorkflowResumer{text: "resource workflow resumed"}
+	resumeSender := &fakeWorkflowResumeTextSender{}
+	worker, err := newWorkflowContinuationWorker(st, resumer, resumeSender, store.Account{ID: "feishu:cli_test"}, nil)
+	if err != nil {
+		t.Fatalf("newWorkflowContinuationWorker returned error: %v", err)
+	}
+	worker.now = func() time.Time { return now.Add(time.Second) }
+	worker.processAvailable(t.Context())
+	worker.processAvailable(t.Context())
+
+	if authCalls != 1 {
+		t.Fatalf("live permission checks = %d, want 1", authCalls)
+	}
+	if len(resumer.requests) != 1 || len(resumeSender.calls) != 1 || resumeSender.calls[0].text != "resource workflow resumed" {
+		t.Fatalf("resume requests/sends = %#v/%#v, want one delivery", resumer.requests, resumeSender.calls)
+	}
+	continuation, err := st.GetWorkflowContinuation(result.RequestID, "feishu:cli_test")
+	if err != nil || continuation.State != store.WorkflowContinuationStateDelivered || continuation.Attempts != 1 {
+		t.Fatalf("resource continuation = %#v err=%v", continuation, err)
 	}
 }
 

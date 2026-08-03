@@ -179,6 +179,31 @@ func TestDocsAppendToolReturnsPendingOperationApproval(t *testing.T) {
 	}
 }
 
+func TestDocsAppendMissingResourceGrantDoesNotRequestOperationApproval(t *testing.T) {
+	approver := &fakeApprovalRequester{result: OperationApprovalResult{
+		Status: OperationApprovalStatusPending, RequestID: "req_must_not_exist", ExpiresAt: time.Now().UTC().Add(10 * time.Minute),
+	}}
+	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
+	_, tools, access := newDocsToolsForTest(t, &lark.Client{}, cfg, approver)
+	access.err = NewResourceAuthorizationRequiredError(ResourceAccessRequirement{
+		ResourceType: "docx", ResourceToken: "doxcnmissing12345", Permission: ResourcePermissionWrite,
+	}, "")
+	result := findDocsTool(t, tools, appendToolName).Execute(groupDocsContext(), tooltypes.Call{
+		ID:        "append_missing_resource",
+		Name:      appendToolName,
+		Arguments: json.RawMessage(`{"token":"doxcnmissing12345","content":"must not append"}`),
+	})
+	if !result.IsError || result.PendingWorkflowID != "" || !strings.Contains(result.Content, `"status":"resource_authorization_required"`) {
+		t.Fatalf("missing-resource append result = %#v", result)
+	}
+	if approver.checks != 0 {
+		t.Fatalf("operation approval checks = %d, want 0 before resource authorization", approver.checks)
+	}
+	if len(access.requirements) != 1 || access.requirement.ResourceToken != "doxcnmissing12345" || access.requirement.Permission != ResourcePermissionWrite {
+		t.Fatalf("missing-resource append requirements = %#v", access.requirements)
+	}
+}
+
 func TestDocsAppendApprovedExecutionRevalidatesAndAppends(t *testing.T) {
 	const documentToken = "doxcnapproved12345"
 	var appendCalls int
