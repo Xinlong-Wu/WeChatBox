@@ -782,7 +782,7 @@ internal/platform/feishu/monitor/ # Feishu long-connection monitor, message/text
 internal/platform/feishu/tools/ # Feishu platform-level LLM tools and approval/resource-access contracts, including Docs helpers and LiteLLM invitations
 internal/platform/github/   # GitHub account/runtime definition, App auth, PR polling, review prompt construction, and MCP review tool guards
 internal/core/              # Middle layer: scoped platform config/data APIs, tool orchestration, commands, sessions, LLM orchestration
-internal/tools/             # Shared tool domain interfaces and provider-neutral spec/call/result/options types
+internal/tools/             # Shared tool interfaces, provider-neutral spec/call/result types, and runtime-owned execution context
 internal/mcp/               # Global MCP host/client sessions and MCP tool adapters exposed through tools.Provider
 internal/store/             # Platform-scoped SQLite accounts/sessions/preferences/cursors/tool approvals and grants, JSONL history, media persistence
 internal/llm/               # Backend provider adapters: OpenAI-compatible and Anthropic APIs
@@ -800,6 +800,12 @@ exported `Definition` functions. The app layer and runtime create a
 `core.PlatformContext` for the active platform, and platform code uses that
 context to persist its own config and data without receiving access to other
 platform stores.
+
+Tool arguments contain only model-visible parameters. Platform adapters attach
+trusted account, chat, source-message, and actor identity through Go context;
+the core then binds the exact user, session, turn, provider call ID, and resolved
+tool name immediately before execution. These runtime fields are not part of a
+tool's JSON Schema and cannot be supplied or overridden by model arguments.
 
 ## Tech Stack
 

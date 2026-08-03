@@ -231,6 +231,18 @@ func (b *Bot) reply(ctx context.Context, msg InboundMessage, sender Sender, tool
 		_ = sender.Send(ctx, OutboundMessage{Text: "❌ 会话加载失败，请重试。"})
 		return err
 	}
+	if len(msg.Tools) > 0 {
+		var execution tooltypes.ExecutionContext
+		ctx, execution, err = bindToolExecutionContext(ctx, msg, sess.ID)
+		if err != nil {
+			coreLog.Error(ctx, "bind tool execution context: %v", err)
+			_ = sender.Send(ctx, OutboundMessage{Text: "❌ 工具执行上下文初始化失败，请重试。"})
+			return err
+		}
+		coreLog.Debug(ctx, "bound trusted tool context platform=%s account=%s session=%s turn=%s chat_present=%t actor_present=%t revision=%d",
+			execution.Platform, execution.AccountID, execution.SessionID, execution.TurnID,
+			execution.ChatID != "", execution.ActorOpenID != "" || execution.ActorUserID != "", execution.ConversationRevision)
+	}
 
 	model, llmClient, err := b.llmForMessage(ctx, msg, sess.ID)
 	if err != nil {

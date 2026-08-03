@@ -3,9 +3,9 @@ package tools
 import (
 	"context"
 	"strings"
-)
 
-type chatContextKey struct{}
+	tooltypes "lingobridge/internal/tools"
+)
 
 // ChatContext identifies the trusted Feishu chat that triggered a tool call.
 type ChatContext struct {
@@ -23,7 +23,11 @@ func WithChatContext(ctx context.Context, chat ChatContext) context.Context {
 	if chat.ChatID == "" {
 		return ctx
 	}
-	return context.WithValue(ctx, chatContextKey{}, chat)
+	execution, _ := tooltypes.ExecutionContextFromContext(ctx)
+	execution.ChatID = chat.ChatID
+	execution.SourceMessageID = chat.MessageID
+	execution.ChatIsGroup = chat.IsGroup
+	return tooltypes.WithExecutionContext(ctx, execution)
 }
 
 // ChatContextFromContext returns the trusted Feishu chat attached by WithChatContext.
@@ -31,9 +35,14 @@ func ChatContextFromContext(ctx context.Context) (ChatContext, bool) {
 	if ctx == nil {
 		return ChatContext{}, false
 	}
-	chat, ok := ctx.Value(chatContextKey{}).(ChatContext)
+	execution, ok := tooltypes.ExecutionContextFromContext(ctx)
 	if !ok {
 		return ChatContext{}, false
+	}
+	chat := ChatContext{
+		ChatID:    execution.ChatID,
+		MessageID: execution.SourceMessageID,
+		IsGroup:   execution.ChatIsGroup,
 	}
 	chat = normalizeChatContext(chat)
 	return chat, chat.ChatID != ""

@@ -209,11 +209,12 @@ func (f *fakeToolLLM) ChatStreamWithTools(systemPrompt string, messages []store.
 }
 
 type fakeTool struct {
-	spec   tooltypes.Spec
-	result string
-	err    string
-	block  bool
-	calls  []tooltypes.Call
+	spec       tooltypes.Spec
+	result     string
+	err        string
+	block      bool
+	calls      []tooltypes.Call
+	executions []tooltypes.ExecutionContext
 }
 
 func (f *fakeTool) Spec() tooltypes.Spec {
@@ -225,6 +226,8 @@ func (f *fakeTool) Spec() tooltypes.Spec {
 
 func (f *fakeTool) Execute(ctx context.Context, call tooltypes.Call) tooltypes.Result {
 	f.calls = append(f.calls, call)
+	execution, _ := tooltypes.ExecutionContextFromContext(ctx)
+	f.executions = append(f.executions, execution)
 	if f.block {
 		<-ctx.Done()
 		return tooltypes.Result{CallID: call.ID, Name: call.Name, Content: ctx.Err().Error(), IsError: true}
@@ -656,6 +659,56 @@ func TestHandleTextRunsToolsAndSavesTrace(t *testing.T) {
 	}
 	if traces[0].Name != "fake_tool" || traces[0].Status != "ok" || !strings.Contains(traces[0].Arguments, "roadmap") {
 		t.Fatalf("trace = %#v, want ok fake_tool trace", traces[0])
+	}
+}
+
+func TestHandleTextBindsTrustedExecutionContextOutsideToolArguments(t *testing.T) {
+	sessions := &fakeSessions{sess: &store.Session{ID: "sess_current", UserID: "trusted_user", Name: "default", Current: true}}
+	llmClient := &fakeToolLLM{
+		calls: []tooltypes.Call{{
+			ID:        "call_1",
+			Name:      "fake_tool",
+			Arguments: json.RawMessage(`{"account_id":"model_account","chat_id":"model_chat","session_id":"model_session","actor_open_id":"model_actor"}`),
+		}},
+		finalText: "done",
+	}
+	tool := &fakeTool{result: `{"ok":true}`}
+	bot := New(sessions, testLLMConfig())
+	bot.NewLLM = func(config.ResolvedModel) llm.Client { return llmClient }
+	ctx := tooltypes.WithExecutionContext(context.Background(), tooltypes.ExecutionContext{
+		Platform:        "untrusted_outer_platform",
+		AccountID:       "untrusted_outer_account",
+		UserKey:         "untrusted_outer_user",
+		SessionID:       "untrusted_outer_session",
+		ChatID:          "oc_trusted",
+		SourceMessageID: "om_trusted",
+		ActorOpenID:     "ou_trusted",
+		ActorUserID:     "u_trusted",
+		ChatIsGroup:     true,
+	})
+
+	err := bot.Handle(ctx, InboundMessage{
+		Platform:  "feishu",
+		AccountID: "feishu:cli_trusted",
+		UserKey:   "trusted_user",
+		LLMText:   "run tool",
+		Tools:     []tooltypes.Tool{tool},
+	}, &fakeSender{})
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if len(tool.executions) != 1 {
+		t.Fatalf("execution contexts = %#v, want one", tool.executions)
+	}
+	execution := tool.executions[0]
+	if execution.Platform != "feishu" || execution.AccountID != "feishu:cli_trusted" || execution.UserKey != "trusted_user" || execution.SessionID != "sess_current" {
+		t.Fatalf("runtime scope = %#v, want core-owned platform/account/user/session", execution)
+	}
+	if execution.ChatID != "oc_trusted" || execution.SourceMessageID != "om_trusted" || execution.ActorOpenID != "ou_trusted" || execution.ActorUserID != "u_trusted" || !execution.ChatIsGroup {
+		t.Fatalf("platform scope = %#v, want trusted Feishu chat and actor", execution)
+	}
+	if !strings.HasPrefix(execution.TurnID, "turn_") || execution.ToolCallID != "call_1" || execution.ToolName != "fake_tool" || execution.ConversationRevision != 0 {
+		t.Fatalf("call scope = %#v, want generated turn and runtime-bound call", execution)
 	}
 }
 

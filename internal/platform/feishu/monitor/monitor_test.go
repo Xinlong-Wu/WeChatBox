@@ -41,6 +41,8 @@ type fakeProcessor struct {
 	actorOK     bool
 	chat        feishutools.ChatContext
 	chatOK      bool
+	execution   tooltypes.ExecutionContext
+	executionOK bool
 	tools       int
 	called      bool
 	calls       int
@@ -60,6 +62,8 @@ type fakeProcessorSnapshot struct {
 	actorOK     bool
 	chat        feishutools.ChatContext
 	chatOK      bool
+	execution   tooltypes.ExecutionContext
+	executionOK bool
 	tools       int
 	called      bool
 	calls       int
@@ -68,6 +72,7 @@ type fakeProcessorSnapshot struct {
 func (f *fakeProcessor) Handle(ctx context.Context, msg core.InboundMessage, sender core.Sender) error {
 	actor, actorOK := feishutools.ActorFromContext(ctx)
 	chat, chatOK := feishutools.ChatContextFromContext(ctx)
+	execution, executionOK := tooltypes.ExecutionContextFromContext(ctx)
 	f.mu.Lock()
 	f.called = true
 	f.platform = msg.Platform
@@ -81,6 +86,8 @@ func (f *fakeProcessor) Handle(ctx context.Context, msg core.InboundMessage, sen
 	f.actorOK = actorOK
 	f.chat = chat
 	f.chatOK = chatOK
+	f.execution = execution
+	f.executionOK = executionOK
 	f.tools = len(msg.Tools)
 	f.calls++
 	started := f.started
@@ -308,6 +315,8 @@ func (f *fakeProcessor) snapshot() fakeProcessorSnapshot {
 		actorOK:     f.actorOK,
 		chat:        f.chat,
 		chatOK:      f.chatOK,
+		execution:   f.execution,
+		executionOK: f.executionOK,
 		tools:       f.tools,
 		called:      f.called,
 		calls:       f.calls,
@@ -935,7 +944,13 @@ func TestHandleTextMessageUsesBridgeAndReplies(t *testing.T) {
 func TestHandleGroupTextMessageRepliesToOriginal(t *testing.T) {
 	processor := &fakeProcessor{}
 	sender := &fakeSender{}
-	b := &bot{handler: processor, sender: sender, botOpenID: testBotOpenID, tools: []tooltypes.Tool{fakeCoreTool{}}}
+	b := &bot{
+		handler:   processor,
+		sender:    sender,
+		botOpenID: testBotOpenID,
+		account:   store.Account{ID: "feishu:cli_test", Name: "admin-bot"},
+		tools:     []tooltypes.Tool{fakeCoreTool{}},
+	}
 	mentions := []*larkim.MentionEvent{
 		feishuMentionWithName("@_bot_1", "bot", testBotOpenID, "", "LingoBridge"),
 	}
@@ -959,6 +974,9 @@ func TestHandleGroupTextMessageRepliesToOriginal(t *testing.T) {
 	}
 	if !processorSnap.chatOK || processorSnap.chat.ChatID != "oc_chat" || processorSnap.chat.MessageID != "om_message" || !processorSnap.chat.IsGroup {
 		t.Fatalf("processor chat = %#v ok=%v, want current group chat", processorSnap.chat, processorSnap.chatOK)
+	}
+	if !processorSnap.executionOK || processorSnap.execution.Platform != store.PlatformFeishu || processorSnap.execution.AccountID != "feishu:cli_test" || processorSnap.execution.UserKey != "feishu:group:oc_chat" {
+		t.Fatalf("processor execution context = %#v ok=%v, want trusted runtime scope", processorSnap.execution, processorSnap.executionOK)
 	}
 	if len(senderSnap.replyCreates) != 1 || senderSnap.replyCreates[0].messageID != "om_message" || senderSnap.replyCreates[0].text != "ok" {
 		t.Fatalf("reply creates = %#v, want ok reply to om_message", senderSnap.replyCreates)

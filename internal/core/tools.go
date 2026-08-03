@@ -219,7 +219,12 @@ func runTool(ctx context.Context, tool tooltypes.Tool, call tooltypes.Call, time
 		return result, trace, nil
 	}
 
-	toolCtx, cancel := context.WithTimeout(ctx, timeout)
+	resolvedToolName := toolName(tool)
+	if resolvedToolName == "" {
+		resolvedToolName = call.Name
+	}
+	executionCtx := tooltypes.WithToolCall(ctx, call.ID, resolvedToolName)
+	toolCtx, cancel := context.WithTimeout(executionCtx, timeout)
 	defer cancel()
 
 	done := make(chan tooltypes.Result, 1)

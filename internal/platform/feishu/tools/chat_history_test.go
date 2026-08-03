@@ -36,6 +36,38 @@ func TestChatContextRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFeishuContextAdaptersUseSharedExecutionContext(t *testing.T) {
+	ctx := tooltypes.WithExecutionContext(context.Background(), tooltypes.ExecutionContext{
+		Platform:  "feishu",
+		AccountID: "feishu:cli_test",
+		UserKey:   "feishu:group:oc_current",
+	})
+	ctx = WithActor(ctx, Actor{OpenID: " ou_sender ", UserID: " u_sender ", Name: " Alice ", Email: " alice@example.com "})
+	ctx = WithChatContext(ctx, ChatContext{ChatID: " oc_current ", MessageID: " om_current ", IsGroup: true})
+
+	execution, ok := tooltypes.ExecutionContextFromContext(ctx)
+	if !ok {
+		t.Fatal("ExecutionContextFromContext returned ok=false")
+	}
+	if execution.Platform != "feishu" || execution.AccountID != "feishu:cli_test" || execution.UserKey != "feishu:group:oc_current" {
+		t.Fatalf("shared execution scope = %#v", execution)
+	}
+	if execution.ActorOpenID != "ou_sender" || execution.ActorUserID != "u_sender" || execution.ActorName != "Alice" || execution.ActorEmail != "alice@example.com" {
+		t.Fatalf("shared actor scope = %#v", execution)
+	}
+	if execution.ChatID != "oc_current" || execution.SourceMessageID != "om_current" || !execution.ChatIsGroup {
+		t.Fatalf("shared chat scope = %#v", execution)
+	}
+	actor, actorOK := ActorFromContext(ctx)
+	chat, chatOK := ChatContextFromContext(ctx)
+	if !actorOK || actor.OpenID != "ou_sender" || actor.UserID != "u_sender" || actor.Name != "Alice" || actor.Email != "alice@example.com" {
+		t.Fatalf("actor adapter = %#v ok=%v", actor, actorOK)
+	}
+	if !chatOK || chat.ChatID != "oc_current" || chat.MessageID != "om_current" || !chat.IsGroup {
+		t.Fatalf("chat adapter = %#v ok=%v", chat, chatOK)
+	}
+}
+
 func TestChatHistoryToolRegistration(t *testing.T) {
 	client := &lark.Client{}
 	cfg := NormalizeConfig(Config{})

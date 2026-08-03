@@ -3,9 +3,9 @@ package tools
 import (
 	"context"
 	"strings"
-)
 
-type actorContextKey struct{}
+	tooltypes "lingobridge/internal/tools"
+)
 
 // Actor describes the Feishu user who triggered a tool call.
 type Actor struct {
@@ -24,7 +24,12 @@ func WithActor(ctx context.Context, actor Actor) context.Context {
 	if actor.OpenID == "" && actor.UserID == "" && actor.Name == "" && actor.Email == "" {
 		return ctx
 	}
-	return context.WithValue(ctx, actorContextKey{}, actor)
+	execution, _ := tooltypes.ExecutionContextFromContext(ctx)
+	execution.ActorOpenID = actor.OpenID
+	execution.ActorUserID = actor.UserID
+	execution.ActorName = actor.Name
+	execution.ActorEmail = actor.Email
+	return tooltypes.WithExecutionContext(ctx, execution)
 }
 
 // ActorFromContext returns the Feishu sender attached by WithActor.
@@ -32,9 +37,15 @@ func ActorFromContext(ctx context.Context) (Actor, bool) {
 	if ctx == nil {
 		return Actor{}, false
 	}
-	actor, ok := ctx.Value(actorContextKey{}).(Actor)
+	execution, ok := tooltypes.ExecutionContextFromContext(ctx)
 	if !ok {
 		return Actor{}, false
+	}
+	actor := Actor{
+		OpenID: execution.ActorOpenID,
+		UserID: execution.ActorUserID,
+		Name:   execution.ActorName,
+		Email:  execution.ActorEmail,
 	}
 	actor = normalizeActor(actor)
 	return actor, actor.OpenID != "" || actor.UserID != "" || actor.Name != "" || actor.Email != ""
