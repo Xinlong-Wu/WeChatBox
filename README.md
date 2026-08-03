@@ -557,21 +557,33 @@ OAuth token, and both must be active before reuse. Resource request IDs remain
 workflow and audit identifiers; the reusable authority is the scoped local
 grant plus the live Feishu capability, not one-time consumption of a request.
 
-The app needs a message permission that can both send and update bot cards;
-`im:message:send_as_bot` is the recommended narrow permission, while
-`im:message` is the broader alternative. The Card action trigger callback
-itself has no API-scope requirement. Recommended narrow document/Drive scopes
-for this workflow are:
+The following matrix lists the narrow Feishu scopes used by the current API
+calls. Tenant scopes are used with the Bot application's
+`tenant_access_token`. User OAuth scopes must also be enabled for the app and
+published, but LingoBridge requests them on `user_access_token` only when an
+external resource needs a new collaborator or collaborator upgrade.
 
-- `drive:drive.metadata:readonly` for Bot root metadata;
-- `space:folder:create` for Bot folder creation (`drive:drive` is the broader
-  alternative);
-- `docs:permission.member:auth` for live permission checks;
-- `docs:permission.member:create` for adding document/folder collaborators;
-- `docs:permission.member:update` for upgrading an existing collaborator from
-  read to write access;
-- `docx:document:create` and `docx:document:write_only` for document creation
-  with optional initial content (`docx:document` is the broader alternative).
+| LingoBridge path | Feishu API use | Tenant app scope | User OAuth scope |
+| --- | --- | --- | --- |
+| Bot replies, cards, message/card updates | Send/reply/update messages and delayed Card V2 updates | `im:message:send_as_bot` | — |
+| `feishu_chat_history_get` in a private chat | List messages for the trusted p2p `chat_id` | `im:message:readonly` | — |
+| `feishu_chat_history_get` in a group | List messages for the trusted group `chat_id` | `im:message:readonly` plus `im:message.group_msg` | — |
+| `feishu_docs_search` | Search documents and Wiki pages inside bound folders | `search:docs:read` | — |
+| `feishu_docs_read` | Read Docx raw text | `docx:document:readonly` | — |
+| `feishu_docs_folder_list` | Read LingoBridge's local chat-folder bindings | No additional Feishu API scope | — |
+| External document live verification | Check whether the Bot can view/edit the exact resource | `docs:permission.member:auth` | — |
+| External folder live verification | List the exact folder's collaborators | `docs:permission.member:retrieve` | — |
+| External resource authorization | Identify the authorizing user, add a collaborator, or upgrade it from read to write | — | `auth:user.id:read`, `docs:permission.member:create`, `docs:permission.member:update`, `offline_access` |
+| `feishu_docs_folder_create` | Read Bot root metadata, create a Bot folder, and share it with the current user/group | `drive:drive.metadata:readonly`, `space:folder:create`, `docs:permission.member:create` | — |
+| `feishu_docs_create` without initial content | Create a Docx in a Bot-owned folder | `docx:document:create` | — |
+| `feishu_docs_create` with initial content and `feishu_docs_append` | Read the current top-level child count, then create Docx child blocks | `docx:document:readonly`, `docx:document:write_only` | — |
+
+The broader `im:message`, `drive:drive`, and `docx:document` permissions can
+replace their narrower alternatives where the corresponding official API
+lists them. The Card action trigger callback itself has no API-scope
+requirement. `contact:user.employee_id:readonly` is not required because the
+current implementation does not request `user_id`-typed response fields from
+the Docx APIs.
 
 The official OAuth page requests the user scopes `auth:user.id:read`,
 `docs:permission.member:create`, `docs:permission.member:update`, and
@@ -593,10 +605,16 @@ The card and document integration is aligned with Feishu's official
 [delayed card updates](https://open.feishu.cn/document/server-docs/im-v1/message-card/delay-update-message-card.md),
 [OAuth authorization codes](https://open.feishu.cn/document/authentication-management/access-token/obtain-oauth-code.md),
 [permission checks](https://open.feishu.cn/document/server-docs/docs/permission/permission-member/auth.md),
+[listing collaborators](https://open.feishu.cn/document/server-docs/docs/permission/permission-member/list.md),
 [adding collaborators](https://open.feishu.cn/document/server-docs/docs/permission/permission-member/create.md),
 [updating collaborators](https://open.feishu.cn/document/server-docs/docs/permission/permission-member/update.md),
 [Create folder](https://open.feishu.cn/document/server-docs/docs/drive-v1/folder/create_folder.md),
-and [Create document](https://open.feishu.cn/document/server-docs/docs/docs/docx-v1/document/create.md).
+[Create document](https://open.feishu.cn/document/server-docs/docs/docs/docx-v1/document/create.md),
+[searching documents and Wiki](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/search-v2/doc_wiki/search.md),
+[reading Docx raw content](https://open.feishu.cn/document/ukTMukTMukTM/uUDN04SN0QjL1QDN/document-docx/docx-v1/document/raw_content.md),
+[reading Docx child blocks](https://open.feishu.cn/document/ukTMukTMukTM/uUDN04SN0QjL1QDN/document-docx/docx-v1/document-block-children/get.md),
+[creating Docx child blocks](https://open.feishu.cn/document/ukTMukTMukTM/uUDN04SN0QjL1QDN/document-docx/docx-v1/document-block-children/create.md),
+and [listing chat history](https://open.feishu.cn/document/server-docs/im-v1/message/list.md).
 
 Feishu can also expose `feishu_chat_history_get` to read recent messages from
 the Feishu chat that triggered the current LLM turn. Enable it under
@@ -608,11 +626,16 @@ the Feishu message history API, returned in chronological order, and bounded by
 rendered as readable content; other message types use safe placeholders rather
 than exposing file or image keys.
 
-Chat history is disabled by default. Reading p2p history requires the app's
-normal message-history capability. Reading group history additionally requires
-the Feishu permission shown as `获取群组中所有消息`, and the bot must be a member
-of that group. API or permission failures are returned to the model as tool
-errors with an actionable group-permission hint.
+Chat history is disabled by default. This implementation uses the Bot's
+`tenant_access_token`, so the recommended narrow p2p scope is
+`im:message:readonly`; the broader `im:message` or historical
+`im:message.history:readonly` scope is also accepted by Feishu. Group history
+additionally requires `im:message.group_msg` (`获取群组中所有消息`), and the Bot
+must be a member of that group. The user-identity-only
+`im:message.p2p_msg:get_as_user` and `im:message.group_msg:get_as_user` scopes do
+not apply to this tenant-identity implementation. API or permission failures
+are returned to the model as tool errors with an actionable group-permission
+hint.
 
 Feishu can also expose `feishu_litellm_invite_create` for LiteLLM account
 requests. Enable it under `platforms.feishu.tools.litellm` and use a
