@@ -250,11 +250,10 @@ func TestResourceAccessOAuthTokenErrorDoesNotExposeSupportInstructions(t *testin
 		t.Fatalf("failed request = %#v err=%v", failed, err)
 	}
 	_, updates, messages := sender.snapshot()
-	if len(updates) != 1 || updates[0].messageID != "om_card" || !strings.Contains(updates[0].text, "授权失败") ||
-		len(messages) != 1 || !strings.Contains(messages[0].text, "飞书授权码兑换失败，请重新发起") {
+	if len(updates) != 1 || updates[0].messageID != "om_card" || !strings.Contains(updates[0].text, "授权失败") || len(messages) != 0 {
 		t.Fatalf("updates/messages = %#v/%#v", updates, messages)
 	}
-	for _, output := range []string{updates[0].text, messages[0].text, recorder.Body.String()} {
+	for _, output := range []string{updates[0].text, recorder.Body.String()} {
 		for _, forbidden := range []string{"request_log_id", "log_pkce_failure", "联系飞书支持", "联系管理员"} {
 			if strings.Contains(output, forbidden) {
 				t.Fatalf("user-facing OAuth failure exposed %q: %q", forbidden, output)
@@ -338,14 +337,11 @@ func TestResourceAccessOAuthRejectsLegacyPKCERequestBeforeTokenExchange(t *testi
 		t.Fatalf("failed legacy request = %#v err=%v", failed, err)
 	}
 	_, updates, messages := sender.snapshot()
-	if len(updates) != 1 || !strings.Contains(updates[0].text, "旧版本") ||
-		len(messages) != 1 || !strings.Contains(messages[0].text, feishutools.ResourceAccessToolName) || !strings.Contains(messages[0].text, "最新授权卡片") {
+	if len(updates) != 1 || !strings.Contains(updates[0].text, "旧版本") || len(messages) != 0 {
 		t.Fatalf("legacy updates/messages = %#v/%#v", updates, messages)
 	}
-	for _, output := range []string{updates[0].text, messages[0].text} {
-		if strings.Contains(output, legacyVerifier) {
-			t.Fatalf("legacy verifier leaked to user-facing output: %q", output)
-		}
+	if strings.Contains(updates[0].text, legacyVerifier) {
+		t.Fatalf("legacy verifier leaked to user-facing output: %q", updates[0].text)
 	}
 }
 
@@ -516,7 +512,7 @@ func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 		t.Fatalf("saved grant = %#v active=%t err=%v", grant, active, err)
 	}
 	_, updates, messages := sender.snapshot()
-	if len(updates) != 1 || updates[0].messageID != "om_card" || !strings.Contains(updates[0].text, "权限已授予") || len(messages) != 1 || !strings.Contains(messages[0].text, result.RequestID) {
+	if len(updates) != 1 || updates[0].messageID != "om_card" || !strings.Contains(updates[0].text, "权限已授予") || len(messages) != 0 {
 		t.Fatalf("updates/messages = %#v/%#v", updates, messages)
 	}
 	logText := logs.String()
@@ -845,7 +841,7 @@ func TestResourceAccessManagerRejectsListenerWithoutCallbackURL(t *testing.T) {
 	client := lark.NewClient("cli_xxx", "secret", lark.WithOpenBaseUrl(server.URL), lark.WithOAuthBaseUrl(server.URL), lark.WithHttpClient(server.Client()))
 	_, err = newResourceAccessManager(context.Background(), st, client, store.Account{
 		ID: "feishu:cli_test", Name: "fsbot", Platform: store.PlatformFeishu,
-	}, "ou_bot", cards, sender, resourceAccessOAuthConfig{
+	}, "ou_bot", cards, resourceAccessOAuthConfig{
 		ClientID:              "cli_xxx",
 		BaseURL:               server.URL,
 		CallbackListenAddress: "127.0.0.1:18080",
@@ -926,7 +922,7 @@ func newTestResourceAccessManager(t *testing.T, server *httptest.Server, oauth r
 		ID:       "feishu:cli_test",
 		Name:     "fsbot",
 		Platform: store.PlatformFeishu,
-	}, "ou_bot", cards, sender, oauth)
+	}, "ou_bot", cards, oauth)
 	if err != nil {
 		t.Fatalf("newResourceAccessManager returned error: %v", err)
 	}
@@ -942,8 +938,8 @@ func waitForResourceAccessCompletion(t *testing.T, st *store.Store, sender *fake
 	var lastErr error
 	for time.Now().Before(deadline) {
 		last, lastErr = st.GetFeishuResourceAccessRequest(requestID, "feishu:cli_test")
-		_, updates, messages := sender.snapshot()
-		if lastErr == nil && last.State == store.FeishuResourceAccessStateSucceeded && len(updates) > 0 && len(messages) > 0 {
+		_, updates, _ := sender.snapshot()
+		if lastErr == nil && last.State == store.FeishuResourceAccessStateSucceeded && len(updates) > 0 {
 			return last
 		}
 		if lastErr == nil && (last.State == store.FeishuResourceAccessStateFailed || last.State == store.FeishuResourceAccessStateExpired || last.State == store.FeishuResourceAccessStateDenied) {

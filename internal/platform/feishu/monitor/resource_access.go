@@ -27,9 +27,9 @@ import (
 )
 
 const (
-	defaultResourceAccessTTL      = 10 * time.Minute
-	resourceAccessCallbackTimeout = 30 * time.Second
-	resourceAccessNotifyTimeout   = 10 * time.Second
+	defaultResourceAccessTTL        = 10 * time.Minute
+	resourceAccessCallbackTimeout   = 30 * time.Second
+	resourceAccessCardUpdateTimeout = 10 * time.Second
 
 	resourceAccessOAuthScope = "auth:user.id:read docs:permission.member:create"
 )
@@ -63,15 +63,10 @@ type resourceAccessOAuthConfig struct {
 	CallbackListenAddress string
 }
 
-type resourceAccessNotifier interface {
-	SendText(ctx context.Context, chatID, text string) error
-}
-
 type resourceAccessManager struct {
 	store     resourceAccessStore
 	client    *lark.Client
 	cards     CardService
-	notifier  resourceAccessNotifier
 	account   store.Account
 	botOpenID string
 	oauth     resourceAccessOAuthConfig
@@ -89,7 +84,6 @@ func newResourceAccessManager(
 	account store.Account,
 	botOpenID string,
 	cards CardService,
-	notifier resourceAccessNotifier,
 	oauth resourceAccessOAuthConfig,
 ) (*resourceAccessManager, error) {
 	if st == nil || st.PlatformID() != store.PlatformFeishu {
@@ -101,8 +95,8 @@ func newResourceAccessManager(
 	if strings.TrimSpace(account.ID) == "" || strings.TrimSpace(botOpenID) == "" {
 		return nil, fmt.Errorf("feishu resource access account and bot open_id are required")
 	}
-	if cards == nil || notifier == nil {
-		return nil, fmt.Errorf("feishu resource access cards and notifier are required")
+	if cards == nil {
+		return nil, fmt.Errorf("feishu resource access cards are required")
 	}
 	oauth.ClientID = strings.TrimSpace(oauth.ClientID)
 	oauth.BaseURL = strings.TrimRight(strings.TrimSpace(oauth.BaseURL), "/")
@@ -127,7 +121,6 @@ func newResourceAccessManager(
 		store:     st,
 		client:    client,
 		cards:     cards,
-		notifier:  notifier,
 		account:   account,
 		botOpenID: strings.TrimSpace(botOpenID),
 		oauth:     oauth,
@@ -818,10 +811,8 @@ func (m *resourceAccessManager) completeResourceAccessOAuth(ctx context.Context,
 	feishuLog.Info(ctx, "granted feishu resource access request=%s account=%s user=%s chat=%s type=%s resource_ref=%s permission=%s subject_type=%s",
 		shortRequestID(request.ID), request.AccountID, resourceAccessActorID(request), request.ChatID,
 		request.ResourceType, shortResourceRef(request.ResourceToken), request.Permission, request.SubjectType)
-	m.notifyResourceAccessResult(ctx, request,
-		statusCard{title: "权限已授予", template: "green", message: "飞书已确认所需资源权限。现在可以使用该 request_id 继续原操作。"},
-		fmt.Sprintf("✅ 飞书资源权限已授予。request_id：`%s`，可继续原操作。", request.ID),
-	)
+	m.updateResourceAccessResultCard(ctx, request,
+		statusCard{title: "权限已授予", template: "green", message: "飞书已确认所需资源权限。现在可以使用该 request_id 继续原操作。"})
 	return nil
 }
 
@@ -1176,16 +1167,13 @@ func (m *resourceAccessManager) finishOAuthFailure(ctx context.Context, request 
 	feishuLog.Warn(ctx, "feishu resource OAuth failed request=%s account=%s user=%s chat=%s type=%s resource_ref=%s: %v",
 		shortRequestID(request.ID), request.AccountID, resourceAccessActorID(request), request.ChatID,
 		request.ResourceType, shortResourceRef(request.ResourceToken), cause)
-	m.notifyResourceAccessResult(ctx, request, statusCard{title: title, template: "red", message: message}, "❌ "+message)
+	m.updateResourceAccessResultCard(ctx, request, statusCard{title: title, template: "red", message: message})
 }
 
-func (m *resourceAccessManager) notifyResourceAccessResult(ctx context.Context, request store.FeishuResourceAccessRequest, card Card, message string) {
-	notifyCtx, cancel := context.WithTimeout(ctx, resourceAccessNotifyTimeout)
+func (m *resourceAccessManager) updateResourceAccessResultCard(ctx context.Context, request store.FeishuResourceAccessRequest, card Card) {
+	updateCtx, cancel := context.WithTimeout(ctx, resourceAccessCardUpdateTimeout)
 	defer cancel()
-	m.updateResourceCardBestEffort(notifyCtx, request.CardMessageID, card)
-	if err := m.notifier.SendText(notifyCtx, request.ChatID, message); err != nil {
-		feishuLog.Warn(notifyCtx, "send feishu resource access result failed request=%s account=%s chat=%s: %v", shortRequestID(request.ID), request.AccountID, request.ChatID, err)
-	}
+	m.updateResourceCardBestEffort(updateCtx, request.CardMessageID, card)
 }
 
 func (m *resourceAccessManager) updateResourceCardBestEffort(ctx context.Context, messageID string, card Card) {
