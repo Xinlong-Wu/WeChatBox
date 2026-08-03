@@ -96,12 +96,16 @@ func TestFeishuResourceAccessOAuthLifecycleAndChatScopedGrant(t *testing.T) {
 
 	grant := FeishuResourceGrant{
 		AccountID:       request.AccountID,
+		ActorType:       FeishuResourceGrantActorTypeOpenID,
+		ActorID:         request.ActorOpenID,
 		ChatID:          request.ChatID,
 		ResourceType:    request.ResourceType,
 		ResourceToken:   request.ResourceToken,
 		Permission:      FeishuResourcePermissionWrite,
+		GrantMode:       FeishuResourceGrantModeOnce,
 		SourceRequestID: request.ID,
 		State:           FeishuResourceGrantStateActive,
+		ExpiresAt:       request.ExpiresAt,
 		CreatedAt:       now.Add(4 * time.Second),
 		UpdatedAt:       now.Add(4 * time.Second),
 	}
@@ -118,6 +122,19 @@ func TestFeishuResourceAccessOAuthLifecycleAndChatScopedGrant(t *testing.T) {
 		State:             FeishuResourceCapabilityStateActive,
 		CreatedAt:         now.Add(4 * time.Second),
 		VerifiedAt:        now.Add(4 * time.Second),
+	}
+	wrongActorGrant := grant
+	wrongActorGrant.ActorID = "ou_other"
+	if err := st.CompleteFeishuResourceAccessRequest(
+		request.ID,
+		request.AccountID,
+		FeishuResourceGrantSourceNewlyGranted,
+		FeishuResourcePermissionWrite,
+		&capability,
+		&wrongActorGrant,
+		now.Add(4*time.Second),
+	); err == nil || !strings.Contains(err.Error(), "access request actor") {
+		t.Fatalf("cross-actor completion error = %v", err)
 	}
 	if err := st.CompleteFeishuResourceAccessRequest(
 		request.ID,
@@ -138,11 +155,17 @@ func TestFeishuResourceAccessOAuthLifecycleAndChatScopedGrant(t *testing.T) {
 	if err != nil || workflow.Kind != WorkflowRequestKindFeishuResourceAccess || workflow.State != WorkflowRequestStateSucceeded {
 		t.Fatalf("resource access workflow = %#v err=%v", workflow, err)
 	}
-	gotGrant, active, err := st.ActiveFeishuResourceGrant(request.AccountID, request.ChatID, request.ResourceType, request.ResourceToken, FeishuResourcePermissionRead)
+	gotGrant, active, err := st.ActiveFeishuResourceGrant(
+		request.AccountID, FeishuResourceGrantActorTypeOpenID, request.ActorOpenID,
+		request.ChatID, request.ResourceType, request.ResourceToken, FeishuResourcePermissionRead, now.Add(5*time.Second),
+	)
 	if err != nil || !active || gotGrant.Permission != FeishuResourcePermissionWrite {
 		t.Fatalf("read through write grant = %#v active=%t err=%v", gotGrant, active, err)
 	}
-	if _, active, err := st.ActiveFeishuResourceGrant(request.AccountID, "oc_other", request.ResourceType, request.ResourceToken, FeishuResourcePermissionRead); err != nil || active {
+	if _, active, err := st.ActiveFeishuResourceGrant(
+		request.AccountID, FeishuResourceGrantActorTypeOpenID, request.ActorOpenID,
+		"oc_other", request.ResourceType, request.ResourceToken, FeishuResourcePermissionRead, now.Add(5*time.Second),
+	); err != nil || active {
 		t.Fatalf("cross-chat grant active=%t err=%v, want false", active, err)
 	}
 }
@@ -338,47 +361,103 @@ func TestFeishuResourceAccessOAuthCardClaimValidatesContextStateAndExpiry(t *tes
 	}
 }
 
-func TestFeishuResourceGrantUpgradesButDoesNotDowngrade(t *testing.T) {
+func TestFeishuResourceGrantSeparatesPermissionAndOnceAllLifetimes(t *testing.T) {
 	st := openFeishuDocsTestStore(t)
 	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
 	base := FeishuResourceGrant{
 		AccountID:       "feishu:cli_test",
+		ActorType:       FeishuResourceGrantActorTypeOpenID,
+		ActorID:         "ou_requester",
 		ChatID:          "oc_chat",
 		ResourceType:    "docx",
 		ResourceToken:   "doxcn_external",
 		Permission:      FeishuResourcePermissionWrite,
+		GrantMode:       FeishuResourceGrantModeOnce,
 		SourceRequestID: "req_write",
 		State:           FeishuResourceGrantStateActive,
+		ExpiresAt:       now.Add(20 * time.Minute),
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
 	if _, err := st.UpsertFeishuResourceGrant(base); err != nil {
 		t.Fatalf("write UpsertFeishuResourceGrant returned error: %v", err)
 	}
-	base.Permission = FeishuResourcePermissionRead
-	base.SourceRequestID = "req_read"
-	base.UpdatedAt = now.Add(time.Minute)
-	if _, err := st.UpsertFeishuResourceGrant(base); err != nil {
+	readAll := base
+	readAll.Permission = FeishuResourcePermissionRead
+	readAll.GrantMode = FeishuResourceGrantModeAll
+	readAll.ExpiresAt = time.Time{}
+	readAll.SourceRequestID = "req_read_all"
+	readAll.UpdatedAt = now.Add(time.Minute)
+	if _, err := st.UpsertFeishuResourceGrant(readAll); err != nil {
 		t.Fatalf("read UpsertFeishuResourceGrant returned error: %v", err)
 	}
-	got, active, err := st.ActiveFeishuResourceGrant(base.AccountID, base.ChatID, base.ResourceType, base.ResourceToken, FeishuResourcePermissionWrite)
-	if err != nil || !active || got.Permission != FeishuResourcePermissionWrite || got.SourceRequestID != "req_read" {
-		t.Fatalf("non-downgraded grant = %#v active=%t err=%v", got, active, err)
+	gotRead, active, err := st.ActiveFeishuResourceGrant(
+		base.AccountID, base.ActorType, base.ActorID, base.ChatID,
+		base.ResourceType, base.ResourceToken, FeishuResourcePermissionRead, now.Add(2*time.Minute),
+	)
+	if err != nil || !active || gotRead.Permission != FeishuResourcePermissionRead || gotRead.GrantMode != FeishuResourceGrantModeAll {
+		t.Fatalf("preferred permanent read grant = %#v active=%t err=%v", gotRead, active, err)
 	}
-	if err := st.RevokeFeishuResourceGrant(base.AccountID, base.ChatID, base.ResourceType, base.ResourceToken, now.Add(2*time.Minute)); err != nil {
+	gotWrite, active, err := st.ActiveFeishuResourceGrant(
+		base.AccountID, base.ActorType, base.ActorID, base.ChatID,
+		base.ResourceType, base.ResourceToken, FeishuResourcePermissionWrite, now.Add(2*time.Minute),
+	)
+	if err != nil || !active || gotWrite.Permission != FeishuResourcePermissionWrite || gotWrite.GrantMode != FeishuResourceGrantModeOnce {
+		t.Fatalf("temporary write grant = %#v active=%t err=%v", gotWrite, active, err)
+	}
+	if _, active, err := st.ActiveFeishuResourceGrant(
+		base.AccountID, base.ActorType, "ou_other", base.ChatID,
+		base.ResourceType, base.ResourceToken, FeishuResourcePermissionRead, now.Add(2*time.Minute),
+	); err != nil || active {
+		t.Fatalf("cross-actor grant active=%t err=%v, want false", active, err)
+	}
+	if count, err := st.ExpireFeishuResourceGrants(base.AccountID, now.Add(21*time.Minute)); err != nil || count != 1 {
+		t.Fatalf("ExpireFeishuResourceGrants count=%d err=%v", count, err)
+	}
+	if _, active, err := st.ActiveFeishuResourceGrant(
+		base.AccountID, base.ActorType, base.ActorID, base.ChatID,
+		base.ResourceType, base.ResourceToken, FeishuResourcePermissionWrite, now.Add(21*time.Minute),
+	); err != nil || active {
+		t.Fatalf("expired write grant active=%t err=%v, want false", active, err)
+	}
+	if _, active, err := st.ActiveFeishuResourceGrant(
+		base.AccountID, base.ActorType, base.ActorID, base.ChatID,
+		base.ResourceType, base.ResourceToken, FeishuResourcePermissionRead, now.Add(21*time.Minute),
+	); err != nil || !active {
+		t.Fatalf("permanent read grant active=%t err=%v, want true", active, err)
+	}
+	writeAll := base
+	writeAll.GrantMode = FeishuResourceGrantModeAll
+	writeAll.ExpiresAt = time.Time{}
+	writeAll.SourceRequestID = "req_write_all"
+	writeAll.CreatedAt = now.Add(22 * time.Minute)
+	writeAll.UpdatedAt = writeAll.CreatedAt
+	if _, err := st.UpsertFeishuResourceGrant(writeAll); err != nil {
+		t.Fatalf("permanent write UpsertFeishuResourceGrant returned error: %v", err)
+	}
+	writeOnceAgain := base
+	writeOnceAgain.SourceRequestID = "req_write_once_again"
+	writeOnceAgain.CreatedAt = now.Add(23 * time.Minute)
+	writeOnceAgain.UpdatedAt = writeOnceAgain.CreatedAt
+	writeOnceAgain.ExpiresAt = now.Add(40 * time.Minute)
+	if _, err := st.UpsertFeishuResourceGrant(writeOnceAgain); err != nil {
+		t.Fatalf("write once after all UpsertFeishuResourceGrant returned error: %v", err)
+	}
+	gotWrite, active, err = st.ActiveFeishuResourceGrant(
+		base.AccountID, base.ActorType, base.ActorID, base.ChatID,
+		base.ResourceType, base.ResourceToken, FeishuResourcePermissionWrite, now.Add(24*time.Minute),
+	)
+	if err != nil || !active || gotWrite.GrantMode != FeishuResourceGrantModeAll || !gotWrite.ExpiresAt.IsZero() {
+		t.Fatalf("permanent write grant after once update = %#v active=%t err=%v", gotWrite, active, err)
+	}
+	if err := st.RevokeFeishuResourceGrant(base.AccountID, base.ChatID, base.ResourceType, base.ResourceToken, now.Add(25*time.Minute)); err != nil {
 		t.Fatalf("RevokeFeishuResourceGrant returned error: %v", err)
 	}
-	if _, active, err := st.ActiveFeishuResourceGrant(base.AccountID, base.ChatID, base.ResourceType, base.ResourceToken, FeishuResourcePermissionRead); err != nil || active {
+	if _, active, err := st.ActiveFeishuResourceGrant(
+		base.AccountID, base.ActorType, base.ActorID, base.ChatID,
+		base.ResourceType, base.ResourceToken, FeishuResourcePermissionRead, now.Add(26*time.Minute),
+	); err != nil || active {
 		t.Fatalf("revoked grant active=%t err=%v, want false", active, err)
-	}
-	base.Permission = FeishuResourcePermissionRead
-	base.SourceRequestID = "req_after_revoke"
-	base.UpdatedAt = now.Add(3 * time.Minute)
-	if _, err := st.UpsertFeishuResourceGrant(base); err != nil {
-		t.Fatalf("read after revoke UpsertFeishuResourceGrant returned error: %v", err)
-	}
-	if _, active, err := st.ActiveFeishuResourceGrant(base.AccountID, base.ChatID, base.ResourceType, base.ResourceToken, FeishuResourcePermissionWrite); err != nil || active {
-		t.Fatalf("revoked write incorrectly survived read regrant active=%t err=%v", active, err)
 	}
 }
 

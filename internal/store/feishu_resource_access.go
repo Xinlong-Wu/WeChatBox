@@ -46,6 +46,13 @@ const (
 
 	FeishuResourceGrantStateActive  = "active"
 	FeishuResourceGrantStateRevoked = "revoked"
+	FeishuResourceGrantStateExpired = "expired"
+
+	FeishuResourceGrantModeOnce = "once"
+	FeishuResourceGrantModeAll  = "all"
+
+	FeishuResourceGrantActorTypeOpenID = "open_id"
+	FeishuResourceGrantActorTypeUserID = "user_id"
 )
 
 // FeishuBotResource records one folder or file created and owned by the Bot account.
@@ -104,12 +111,16 @@ type FeishuResourceAccessMatch struct {
 // chat, resource type, and resource token.
 type FeishuResourceGrant struct {
 	AccountID       string
+	ActorType       string
+	ActorID         string
 	ChatID          string
 	ResourceType    string
 	ResourceToken   string
 	Permission      string
+	GrantMode       string
 	SourceRequestID string
 	State           string
+	ExpiresAt       time.Time
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
 }
@@ -592,6 +603,27 @@ func (s *Store) CompleteFeishuResourceAccessRequest(
 		return fmt.Errorf("begin complete feishu resource access: %w", err)
 	}
 	defer tx.Rollback()
+	request, err := feishuResourceAccessByID(tx, id, accountID)
+	if err != nil {
+		return err
+	}
+	if capability != nil {
+		if normalizedCapability.ResourceType != request.ResourceType || normalizedCapability.ResourceToken != request.ResourceToken {
+			return fmt.Errorf("feishu resource capability does not match the access request resource")
+		}
+		if request.SubjectType != "" && (normalizedCapability.SubjectType != request.SubjectType || normalizedCapability.SubjectID != request.SubjectID) {
+			return fmt.Errorf("feishu resource capability does not match the access request subject")
+		}
+	}
+	if grant != nil {
+		actorType, actorID, ok := feishuResourceAccessGrantActor(request)
+		if !ok || normalizedGrant.ActorType != actorType || normalizedGrant.ActorID != actorID {
+			return fmt.Errorf("feishu resource grant does not match the access request actor")
+		}
+		if normalizedGrant.ChatID != request.ChatID || normalizedGrant.ResourceType != request.ResourceType || normalizedGrant.ResourceToken != request.ResourceToken {
+			return fmt.Errorf("feishu resource grant does not match the access request scope")
+		}
+	}
 	result, err := tx.Exec(
 		`UPDATE feishu_resource_access_requests
 		 SET state=?, grant_source=?, verified_permission=?,
@@ -770,7 +802,7 @@ func (s *Store) UpsertFeishuResourceGrant(grant FeishuResourceGrant) (FeishuReso
 }
 
 // ActiveFeishuResourceGrant returns an active exact-chat grant satisfying the requested permission.
-func (s *Store) ActiveFeishuResourceGrant(accountID, chatID, resourceType, resourceToken, permission string) (FeishuResourceGrant, bool, error) {
+func (s *Store) ActiveFeishuResourceGrant(accountID, actorType, actorID, chatID, resourceType, resourceToken, permission string, now time.Time) (FeishuResourceGrant, bool, error) {
 	if err := s.requireFeishuDocsStore(); err != nil {
 		return FeishuResourceGrant{}, false, err
 	}
@@ -778,12 +810,35 @@ func (s *Store) ActiveFeishuResourceGrant(accountID, chatID, resourceType, resou
 	if !validFeishuResourcePermission(permission) {
 		return FeishuResourceGrant{}, false, fmt.Errorf("valid feishu resource permission is required")
 	}
+	actorType = strings.TrimSpace(actorType)
+	actorID = strings.TrimSpace(actorID)
+	if !validFeishuResourceGrantActor(actorType, actorID) {
+		return FeishuResourceGrant{}, false, fmt.Errorf("valid feishu resource grant actor is required")
+	}
+	now = normalizedWorkflowTime(now)
 	grant, err := scanFeishuResourceGrant(s.db.QueryRow(
-		`SELECT account_id, chat_id, resource_type, resource_token, permission,
-		 source_request_id, state, created_at_ms, updated_at_ms
+		`SELECT account_id, actor_type, actor_id, chat_id, resource_type, resource_token,
+		 permission, grant_mode, source_request_id, state, expires_at_ms,
+		 created_at_ms, updated_at_ms
 		 FROM feishu_resource_grants
-		 WHERE account_id=? AND chat_id=? AND resource_type=? AND resource_token=? AND state=?`,
-		strings.TrimSpace(accountID), strings.TrimSpace(chatID), strings.TrimSpace(resourceType), strings.TrimSpace(resourceToken), FeishuResourceGrantStateActive,
+		 WHERE account_id=? AND actor_type=? AND actor_id=? AND chat_id=?
+		 AND resource_type=? AND resource_token=? AND state=?
+		 AND (permission=? OR (?='read' AND permission='write'))
+		 AND (grant_mode='all' OR expires_at_ms>?)
+		 ORDER BY CASE WHEN grant_mode='all' THEN 1 ELSE 0 END DESC,
+		          CASE WHEN permission=? THEN 1 ELSE 0 END DESC
+		 LIMIT 1`,
+		strings.TrimSpace(accountID),
+		actorType,
+		actorID,
+		strings.TrimSpace(chatID),
+		strings.TrimSpace(resourceType),
+		strings.TrimSpace(resourceToken),
+		FeishuResourceGrantStateActive,
+		permission,
+		permission,
+		now.UnixMilli(),
+		permission,
 	))
 	if errors.Is(err, ErrFeishuResourceGrantNotFound) {
 		return FeishuResourceGrant{}, false, nil
@@ -795,6 +850,36 @@ func (s *Store) ActiveFeishuResourceGrant(accountID, chatID, resourceType, resou
 		return FeishuResourceGrant{}, false, nil
 	}
 	return grant, true, nil
+}
+
+// ExpireFeishuResourceGrants marks elapsed once grants as expired. Permanent
+// all grants have no local expiry and are not changed.
+func (s *Store) ExpireFeishuResourceGrants(accountID string, now time.Time) (int64, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return 0, err
+	}
+	accountID = strings.TrimSpace(accountID)
+	now = normalizedWorkflowTime(now)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.Exec(
+		`UPDATE feishu_resource_grants SET state=?, updated_at_ms=?
+		 WHERE account_id=? AND state=? AND grant_mode=? AND expires_at_ms<=?`,
+		FeishuResourceGrantStateExpired,
+		now.UnixMilli(),
+		accountID,
+		FeishuResourceGrantStateActive,
+		FeishuResourceGrantModeOnce,
+		now.UnixMilli(),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("expire feishu resource grants: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("inspect expired feishu resource grants: %w", err)
+	}
+	return count, nil
 }
 
 // RevokeFeishuResourceGrant marks an exact chat-scoped grant unusable after a failed live check.
@@ -911,15 +996,19 @@ func scanFeishuResourceAccessRequest(row feishuResourceAccessScanner) (FeishuRes
 
 func scanFeishuResourceGrant(row feishuResourceAccessScanner) (FeishuResourceGrant, error) {
 	var grant FeishuResourceGrant
-	var createdAtMS, updatedAtMS int64
+	var expiresAtMS, createdAtMS, updatedAtMS int64
 	if err := row.Scan(
 		&grant.AccountID,
+		&grant.ActorType,
+		&grant.ActorID,
 		&grant.ChatID,
 		&grant.ResourceType,
 		&grant.ResourceToken,
 		&grant.Permission,
+		&grant.GrantMode,
 		&grant.SourceRequestID,
 		&grant.State,
+		&expiresAtMS,
 		&createdAtMS,
 		&updatedAtMS,
 	); err != nil {
@@ -928,6 +1017,7 @@ func scanFeishuResourceGrant(row feishuResourceAccessScanner) (FeishuResourceGra
 		}
 		return FeishuResourceGrant{}, fmt.Errorf("get feishu resource grant: %w", err)
 	}
+	grant.ExpiresAt = timeFromOptionalMillis(expiresAtMS)
 	grant.CreatedAt = time.UnixMilli(createdAtMS).UTC()
 	grant.UpdatedAt = time.UnixMilli(updatedAtMS).UTC()
 	return grant, nil
@@ -995,15 +1085,19 @@ func normalizeFeishuResourceAccessMatch(match FeishuResourceAccessMatch) FeishuR
 
 func normalizeFeishuResourceGrant(grant FeishuResourceGrant) FeishuResourceGrant {
 	grant.AccountID = strings.TrimSpace(grant.AccountID)
+	grant.ActorType = strings.TrimSpace(grant.ActorType)
+	grant.ActorID = strings.TrimSpace(grant.ActorID)
 	grant.ChatID = strings.TrimSpace(grant.ChatID)
 	grant.ResourceType = strings.TrimSpace(grant.ResourceType)
 	grant.ResourceToken = strings.TrimSpace(grant.ResourceToken)
 	grant.Permission = strings.TrimSpace(grant.Permission)
+	grant.GrantMode = strings.TrimSpace(grant.GrantMode)
 	grant.SourceRequestID = strings.TrimSpace(grant.SourceRequestID)
 	grant.State = strings.TrimSpace(grant.State)
 	if grant.State == "" {
 		grant.State = FeishuResourceGrantStateActive
 	}
+	grant.ExpiresAt = optionalUTC(grant.ExpiresAt)
 	grant.CreatedAt = normalizedWorkflowTime(grant.CreatedAt)
 	if grant.UpdatedAt.IsZero() {
 		grant.UpdatedAt = grant.CreatedAt
@@ -1014,14 +1108,31 @@ func normalizeFeishuResourceGrant(grant FeishuResourceGrant) FeishuResourceGrant
 }
 
 func validateFeishuResourceGrant(grant FeishuResourceGrant) error {
-	if grant.AccountID == "" || grant.ChatID == "" || grant.ResourceType == "" || grant.ResourceToken == "" ||
+	if grant.AccountID == "" || !validFeishuResourceGrantActor(grant.ActorType, grant.ActorID) ||
+		grant.ChatID == "" || grant.ResourceType == "" || grant.ResourceToken == "" ||
 		grant.SourceRequestID == "" || !validFeishuResourcePermission(grant.Permission) {
-		return fmt.Errorf("feishu resource grant account, chat, resource, permission, and source request are required")
+		return fmt.Errorf("feishu resource grant account, actor, chat, resource, permission, and source request are required")
 	}
-	if grant.State != FeishuResourceGrantStateActive && grant.State != FeishuResourceGrantStateRevoked {
+	if grant.State != FeishuResourceGrantStateActive && grant.State != FeishuResourceGrantStateRevoked && grant.State != FeishuResourceGrantStateExpired {
 		return fmt.Errorf("unsupported feishu resource grant state %q", grant.State)
 	}
+	if grant.GrantMode != FeishuResourceGrantModeOnce && grant.GrantMode != FeishuResourceGrantModeAll {
+		return fmt.Errorf("unsupported feishu resource grant mode %q", grant.GrantMode)
+	}
+	if grant.GrantMode == FeishuResourceGrantModeOnce && !grant.ExpiresAt.After(grant.CreatedAt) {
+		return fmt.Errorf("once feishu resource grant expires_at must be after created_at")
+	}
+	if grant.GrantMode == FeishuResourceGrantModeAll && !grant.ExpiresAt.IsZero() {
+		return fmt.Errorf("all feishu resource grant must not have expires_at")
+	}
 	return nil
+}
+
+func validFeishuResourceGrantActor(actorType, actorID string) bool {
+	if strings.TrimSpace(actorID) == "" {
+		return false
+	}
+	return actorType == FeishuResourceGrantActorTypeOpenID || actorType == FeishuResourceGrantActorTypeUserID
 }
 
 func validFeishuResourcePermission(permission string) bool {
@@ -1041,6 +1152,16 @@ func feishuResourceAccessActorMatches(request FeishuResourceAccessRequest, match
 		return request.ActorOpenID == match.ActorOpenID
 	}
 	return request.ActorUserID != "" && request.ActorUserID == match.ActorUserID
+}
+
+func feishuResourceAccessGrantActor(request FeishuResourceAccessRequest) (string, string, bool) {
+	if request.ActorOpenID != "" {
+		return FeishuResourceGrantActorTypeOpenID, request.ActorOpenID, true
+	}
+	if request.ActorUserID != "" {
+		return FeishuResourceGrantActorTypeUserID, request.ActorUserID, true
+	}
+	return "", "", false
 }
 
 type feishuResourceAccessQueryer interface {
@@ -1079,25 +1200,37 @@ type feishuResourceGrantExecer interface {
 func upsertFeishuResourceGrant(execer feishuResourceGrantExecer, grant FeishuResourceGrant) error {
 	_, err := execer.Exec(
 		`INSERT INTO feishu_resource_grants (
-			account_id, chat_id, resource_type, resource_token, permission,
-			source_request_id, state, created_at_ms, updated_at_ms
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(account_id, chat_id, resource_type, resource_token) DO UPDATE SET
-			permission=CASE
-				WHEN (feishu_resource_grants.state='active' AND feishu_resource_grants.permission='write')
-					OR excluded.permission='write' THEN 'write'
-				ELSE 'read'
+			account_id, actor_type, actor_id, chat_id, resource_type, resource_token,
+			permission, grant_mode, source_request_id, state, expires_at_ms,
+			created_at_ms, updated_at_ms
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(account_id, actor_type, actor_id, chat_id, resource_type, resource_token, permission) DO UPDATE SET
+			grant_mode=CASE
+				WHEN (feishu_resource_grants.state='active' AND feishu_resource_grants.grant_mode='all')
+					OR excluded.grant_mode='all' THEN 'all'
+				ELSE 'once'
 			END,
 			source_request_id=excluded.source_request_id,
 			state=excluded.state,
+			expires_at_ms=CASE
+				WHEN (feishu_resource_grants.state='active' AND feishu_resource_grants.grant_mode='all')
+					OR excluded.grant_mode='all' THEN 0
+				WHEN feishu_resource_grants.state='active' AND feishu_resource_grants.expires_at_ms>excluded.expires_at_ms
+					THEN feishu_resource_grants.expires_at_ms
+				ELSE excluded.expires_at_ms
+			END,
 			updated_at_ms=excluded.updated_at_ms`,
 		grant.AccountID,
+		grant.ActorType,
+		grant.ActorID,
 		grant.ChatID,
 		grant.ResourceType,
 		grant.ResourceToken,
 		grant.Permission,
+		grant.GrantMode,
 		grant.SourceRequestID,
 		grant.State,
+		optionalTimeMillis(grant.ExpiresAt),
 		grant.CreatedAt.UnixMilli(),
 		grant.UpdatedAt.UnixMilli(),
 	)

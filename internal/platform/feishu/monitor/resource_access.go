@@ -56,8 +56,9 @@ type resourceAccessStore interface {
 	FailFeishuResourceAccessRequest(id, accountID string, now time.Time) error
 	ExpireFeishuResourceAccessRequests(accountID string, now time.Time) (int64, error)
 	FailExecutingFeishuResourceAccessRequests(accountID string, now time.Time) (int64, error)
+	ExpireFeishuResourceGrants(accountID string, now time.Time) (int64, error)
 	UpsertFeishuResourceGrant(store.FeishuResourceGrant) (store.FeishuResourceGrant, error)
-	ActiveFeishuResourceGrant(accountID, chatID, resourceType, resourceToken, permission string) (store.FeishuResourceGrant, bool, error)
+	ActiveFeishuResourceGrant(accountID, actorType, actorID, chatID, resourceType, resourceToken, permission string, now time.Time) (store.FeishuResourceGrant, bool, error)
 	RevokeFeishuResourceGrant(accountID, chatID, resourceType, resourceToken string, now time.Time) error
 	UpsertFeishuResourceCapability(store.FeishuResourceCapability) (store.FeishuResourceCapability, error)
 	ActiveFeishuResourceCapability(accountID, resourceType, resourceToken, subjectType, subjectID, permission string) (store.FeishuResourceCapability, bool, error)
@@ -164,6 +165,10 @@ func newResourceAccessManager(
 
 func (m *resourceAccessManager) recoverPersistedRequests(ctx context.Context) error {
 	now := m.currentTime()
+	expiredGrants, err := m.store.ExpireFeishuResourceGrants(m.account.ID, now)
+	if err != nil {
+		return fmt.Errorf("expire persisted feishu resource grants: %w", err)
+	}
 	expired, err := m.store.ExpireFeishuResourceAccessRequests(m.account.ID, now)
 	if err != nil {
 		return fmt.Errorf("expire persisted feishu resource access requests: %w", err)
@@ -174,6 +179,9 @@ func (m *resourceAccessManager) recoverPersistedRequests(ctx context.Context) er
 	}
 	if expired > 0 {
 		feishuLog.Info(ctx, "expired persisted feishu resource access requests account=%s count=%d", m.account.ID, expired)
+	}
+	if expiredGrants > 0 {
+		feishuLog.Info(ctx, "expired persisted feishu resource grants account=%s count=%d", m.account.ID, expiredGrants)
 	}
 	if interrupted > 0 {
 		feishuLog.Warn(ctx, "closed interrupted feishu resource access requests account=%s count=%d", m.account.ID, interrupted)
@@ -242,7 +250,21 @@ func (m *resourceAccessManager) RequestAccess(ctx context.Context, input feishut
 	}
 
 	subjectType, subjectID, supportedMessage := m.resourceGrantSubject(chat, request.ResourceType)
-	grant, active, err := m.store.ActiveFeishuResourceGrant(request.AccountID, request.ChatID, resourceType, resourceToken, request.Permission)
+	actorType, actorID, err := resourceAccessGrantActor(actor.OpenID, actor.UserID)
+	if err != nil {
+		m.failResourceAccessBestEffort(ctx, request.ID)
+		return feishutools.ResourceAccessResult{}, err
+	}
+	grant, active, err := m.store.ActiveFeishuResourceGrant(
+		request.AccountID,
+		actorType,
+		actorID,
+		request.ChatID,
+		resourceType,
+		resourceToken,
+		request.Permission,
+		now,
+	)
 	if err != nil {
 		m.failResourceAccessBestEffort(ctx, request.ID)
 		return feishutools.ResourceAccessResult{}, fmt.Errorf("check feishu resource grant: %w", err)
@@ -449,14 +471,22 @@ func (m *resourceAccessManager) ValidateAccess(ctx context.Context, validation f
 	if _, err := m.store.UpsertFeishuResourceCapability(capability); err != nil {
 		return feishutools.ResourceAccessResult{}, fmt.Errorf("refresh feishu resource capability verification: %w", err)
 	}
+	grantActorType, grantActorID, actorErr := resourceAccessGrantActor(request.ActorOpenID, request.ActorUserID)
+	if actorErr != nil {
+		return feishutools.ResourceAccessResult{}, actorErr
+	}
 	if _, err := m.store.UpsertFeishuResourceGrant(store.FeishuResourceGrant{
 		AccountID:       request.AccountID,
+		ActorType:       grantActorType,
+		ActorID:         grantActorID,
 		ChatID:          request.ChatID,
 		ResourceType:    request.ResourceType,
 		ResourceToken:   request.ResourceToken,
 		Permission:      request.VerifiedPermission,
+		GrantMode:       store.FeishuResourceGrantModeOnce,
 		SourceRequestID: request.ID,
 		State:           store.FeishuResourceGrantStateActive,
+		ExpiresAt:       request.ExpiresAt,
 		CreatedAt:       request.CreatedAt,
 		UpdatedAt:       verifiedAt,
 	}); err != nil {
@@ -878,6 +908,10 @@ func (m *resourceAccessManager) completeResourceAccessOAuth(ctx context.Context,
 		return fail(verifyErr, "权限核验失败", "飞书没有确认机器人或当前群聊已获得所需权限。", http.StatusBadGateway, "resource access verification failed")
 	}
 	completedAt := m.currentTime()
+	grantActorType, grantActorID, actorErr := resourceAccessGrantActor(request.ActorOpenID, request.ActorUserID)
+	if actorErr != nil {
+		return fail(actorErr, "授权身份无效", "资源授权请求缺少可信飞书用户身份，请重新发起。", http.StatusInternalServerError, "resource access requester identity is unavailable")
+	}
 	capability := store.FeishuResourceCapability{
 		AccountID:         request.AccountID,
 		ResourceType:      request.ResourceType,
@@ -894,12 +928,16 @@ func (m *resourceAccessManager) completeResourceAccessOAuth(ctx context.Context,
 	}
 	grant := store.FeishuResourceGrant{
 		AccountID:       request.AccountID,
+		ActorType:       grantActorType,
+		ActorID:         grantActorID,
 		ChatID:          request.ChatID,
 		ResourceType:    request.ResourceType,
 		ResourceToken:   request.ResourceToken,
 		Permission:      request.Permission,
+		GrantMode:       store.FeishuResourceGrantModeOnce,
 		SourceRequestID: request.ID,
 		State:           store.FeishuResourceGrantStateActive,
+		ExpiresAt:       request.ExpiresAt,
 		CreatedAt:       completedAt,
 		UpdatedAt:       completedAt,
 	}
@@ -1510,6 +1548,16 @@ func resourceAccessActorID(request store.FeishuResourceAccessRequest) string {
 		return request.ActorOpenID
 	}
 	return request.ActorUserID
+}
+
+func resourceAccessGrantActor(openID, userID string) (string, string, error) {
+	if openID = strings.TrimSpace(openID); openID != "" {
+		return store.FeishuResourceGrantActorTypeOpenID, openID, nil
+	}
+	if userID = strings.TrimSpace(userID); userID != "" {
+		return store.FeishuResourceGrantActorTypeUserID, userID, nil
+	}
+	return "", "", fmt.Errorf("trusted feishu resource grant actor is required")
 }
 
 func resourceAccessActorMatches(request store.FeishuResourceAccessRequest, actor feishutools.Actor) bool {

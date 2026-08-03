@@ -381,12 +381,13 @@ returned `expires_at` and is atomically consumed by exactly one concrete create
 workflow immediately before the Feishu create API call. It remains consumed if
 that API reports an error, avoiding an unsafe duplicate after an uncertain
 external side effect. Bot-owned resources return `granted` immediately. For
-other resources, LingoBridge first checks an exact local
-`account_id + chat_id + resource_type + resource_token` grant, resolves the
-expected Bot or `openchat` collaborator, and loads the separate Feishu-side
-capability for that exact subject. The capability is verified against Feishu in
-real time before the local grant can be reused. If either layer is missing, it
-sends a Card V2 link to
+other resources, LingoBridge first checks a local grant scoped to the exact
+account, requesting user, current chat, resource, and permission. `write`
+satisfies `read`, while a read-only grant never satisfies a write request. It
+then resolves the expected Bot or `openchat` collaborator and loads the
+separate Feishu-side capability for that exact subject. The capability is
+verified against Feishu in real time before the local grant can be reused. If
+either layer is missing, it sends a Card V2 link to
 Feishu's official OAuth authorization page. The authorization request and any
 later create-time validation remain bound to the original Feishu user and
 chat; the model cannot provide another `chat_id`. The same card contains a
@@ -506,12 +507,15 @@ reauthorization boundary. Operations interrupted while already executing are
 marked failed rather than retried automatically, avoiding duplicate creation.
 Feishu resource capabilities store the exact collaborator subject, actual
 read/write permission, source OAuth actor, source request, live-verification
-time, and active/revoked state. Local resource grants separately store only the
-current chat/resource scope, allowed permission, source request, state, and
-timestamps. Neither layer contains a user OAuth token, and both must be active
-before reuse. Successful resource access requests also record the consuming
-create workflow ID and timestamp so concurrent or repeated create calls cannot
-reuse the same credential.
+time, and active/revoked state. Local resource grants separately store the exact
+requesting actor, current chat, resource, permission, `once`/`all` mode, local
+expiry, source request, and state. Read and write grants use separate rows so a
+permanent read authorization can coexist with a temporary write authorization.
+Expired `once` grants only stop future LingoBridge operations; they do not
+remove the Bot or group collaborator in Feishu. Neither layer contains a user
+OAuth token, and both must be active before reuse. Successful resource access
+requests also record the consuming create workflow ID and timestamp so
+concurrent or repeated create calls cannot reuse the same credential.
 
 The app needs a message permission that can both send and update bot cards;
 `im:message:send_as_bot` is the recommended narrow permission, while

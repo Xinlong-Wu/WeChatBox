@@ -170,12 +170,16 @@ func TestResourceAccessManagerReusesOnlyLiveExactChatGrant(t *testing.T) {
 	}
 	if _, err := st.UpsertFeishuResourceGrant(store.FeishuResourceGrant{
 		AccountID:       "feishu:cli_test",
+		ActorType:       store.FeishuResourceGrantActorTypeOpenID,
+		ActorID:         "ou_requester",
 		ChatID:          "oc_chat",
 		ResourceType:    "docx",
 		ResourceToken:   "doxcn_external",
 		Permission:      store.FeishuResourcePermissionWrite,
+		GrantMode:       store.FeishuResourceGrantModeOnce,
 		SourceRequestID: "req_original",
 		State:           store.FeishuResourceGrantStateActive,
+		ExpiresAt:       now.Add(10 * time.Minute),
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}); err != nil {
@@ -210,12 +214,16 @@ func TestResourceAccessManagerDoesNotReuseGrantWithoutActiveCapability(t *testin
 	now := manager.currentTime()
 	if _, err := st.UpsertFeishuResourceGrant(store.FeishuResourceGrant{
 		AccountID:       "feishu:cli_test",
+		ActorType:       store.FeishuResourceGrantActorTypeOpenID,
+		ActorID:         "ou_requester",
 		ChatID:          "oc_chat",
 		ResourceType:    "docx",
 		ResourceToken:   "doxcn_external",
 		Permission:      store.FeishuResourcePermissionWrite,
+		GrantMode:       store.FeishuResourceGrantModeOnce,
 		SourceRequestID: "req_original",
 		State:           store.FeishuResourceGrantStateActive,
+		ExpiresAt:       now.Add(10 * time.Minute),
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}); err != nil {
@@ -233,7 +241,7 @@ func TestResourceAccessManagerDoesNotReuseGrantWithoutActiveCapability(t *testin
 		t.Fatalf("missing-capability result = %#v", result)
 	}
 	if _, active, err := st.ActiveFeishuResourceGrant(
-		"feishu:cli_test", "oc_chat", "docx", "doxcn_external", store.FeishuResourcePermissionRead,
+		"feishu:cli_test", store.FeishuResourceGrantActorTypeOpenID, "ou_requester", "oc_chat", "docx", "doxcn_external", store.FeishuResourcePermissionRead, now,
 	); err != nil || active {
 		t.Fatalf("stale local grant active=%t err=%v, want false", active, err)
 	}
@@ -274,12 +282,16 @@ func TestResourceAccessManagerKeepsCapabilityOnTransientLiveCheckError(t *testin
 	}
 	if _, err := st.UpsertFeishuResourceGrant(store.FeishuResourceGrant{
 		AccountID:       "feishu:cli_test",
+		ActorType:       store.FeishuResourceGrantActorTypeOpenID,
+		ActorID:         "ou_requester",
 		ChatID:          "oc_chat",
 		ResourceType:    "docx",
 		ResourceToken:   "doxcn_external",
 		Permission:      store.FeishuResourcePermissionWrite,
+		GrantMode:       store.FeishuResourceGrantModeOnce,
 		SourceRequestID: "req_original",
 		State:           store.FeishuResourceGrantStateActive,
+		ExpiresAt:       now.Add(10 * time.Minute),
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}); err != nil {
@@ -298,7 +310,7 @@ func TestResourceAccessManagerKeepsCapabilityOnTransientLiveCheckError(t *testin
 		t.Fatalf("capability after transient error active=%t err=%v, want true", active, err)
 	}
 	if _, active, err := st.ActiveFeishuResourceGrant(
-		"feishu:cli_test", "oc_chat", "docx", "doxcn_external", store.FeishuResourcePermissionRead,
+		"feishu:cli_test", store.FeishuResourceGrantActorTypeOpenID, "ou_requester", "oc_chat", "docx", "doxcn_external", store.FeishuResourcePermissionRead, now,
 	); err != nil || !active {
 		t.Fatalf("grant after transient error active=%t err=%v, want true", active, err)
 	}
@@ -654,7 +666,9 @@ func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 		!strings.Contains(string(workflowResult.Payload), `"resource_token":"doxcn_external"`) {
 		t.Fatalf("completed workflow result = %#v err=%v", workflowResult, err)
 	}
-	grant, active, err := st.ActiveFeishuResourceGrant("feishu:cli_test", "oc_chat", "docx", "doxcn_external", store.FeishuResourcePermissionWrite)
+	grant, active, err := st.ActiveFeishuResourceGrant(
+		"feishu:cli_test", store.FeishuResourceGrantActorTypeOpenID, "ou_requester", "oc_chat", "docx", "doxcn_external", store.FeishuResourcePermissionWrite, manager.currentTime(),
+	)
 	if err != nil || !active || grant.SourceRequestID != result.RequestID {
 		t.Fatalf("saved grant = %#v active=%t err=%v", grant, active, err)
 	}

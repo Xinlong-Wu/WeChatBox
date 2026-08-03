@@ -148,4 +148,7 @@ func TestWorkflowMigrationBackfillsApprovalsAndRenamesGrantSource(t *testing.T) 
 	if hasLegacySubject, err := st.tableHasColumn("feishu_resource_grants", "subject_type"); err != nil || hasLegacySubject {
 		t.Fatalf("migrated resource grant subject column present=%t err=%v", hasLegacySubject, err)
 	}
+	if hasActorScope, err := st.tableHasColumn("feishu_resource_grants", "actor_type"); err != nil || !hasActorScope {
+		t.Fatalf("migrated resource grant actor column present=%t err=%v", hasActorScope, err)
+	}
 }

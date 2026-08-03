@@ -169,15 +169,19 @@ func (s *Store) migrate() error {
 		)`,
 		`CREATE TABLE IF NOT EXISTS feishu_resource_grants (
 			account_id TEXT NOT NULL,
+			actor_type TEXT NOT NULL,
+			actor_id TEXT NOT NULL,
 			chat_id TEXT NOT NULL,
 			resource_type TEXT NOT NULL,
 			resource_token TEXT NOT NULL,
 			permission TEXT NOT NULL,
+			grant_mode TEXT NOT NULL,
 			source_request_id TEXT NOT NULL,
 			state TEXT NOT NULL,
+			expires_at_ms INTEGER NOT NULL DEFAULT 0,
 			created_at_ms INTEGER NOT NULL,
 			updated_at_ms INTEGER NOT NULL,
-			PRIMARY KEY (account_id, chat_id, resource_type, resource_token)
+			PRIMARY KEY (account_id, actor_type, actor_id, chat_id, resource_type, resource_token, permission)
 		)`,
 		`CREATE TABLE IF NOT EXISTS feishu_resource_capabilities (
 			account_id TEXT NOT NULL,
@@ -235,6 +239,9 @@ func (s *Store) migrate() error {
 	if err := s.migrateFeishuResourceCapabilities(); err != nil {
 		return err
 	}
+	if err := s.migrateFeishuResourceGrantScopes(); err != nil {
+		return err
+	}
 	if _, err := s.db.Exec(
 		`INSERT OR IGNORE INTO workflow_requests (id, account_id, kind, state, created_at_ms, updated_at_ms)
 		 SELECT id, account_id, 'tool_approval', state, created_at_ms, updated_at_ms
@@ -278,7 +285,7 @@ func (s *Store) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_feishu_resource_access_account_state
 			 ON feishu_resource_access_requests(account_id, state, expires_at_ms)`,
 		`CREATE INDEX IF NOT EXISTS idx_feishu_resource_grants_account_chat
-			 ON feishu_resource_grants(account_id, chat_id, state, updated_at_ms)`,
+			 ON feishu_resource_grants(account_id, chat_id, state, expires_at_ms, updated_at_ms)`,
 		`CREATE INDEX IF NOT EXISTS idx_feishu_resource_capabilities_account_resource
 			 ON feishu_resource_capabilities(account_id, resource_type, resource_token, state, updated_at_ms)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_feishu_user_oauth_open_id
@@ -434,6 +441,73 @@ func (s *Store) migrateFeishuResourceCapabilities() error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit feishu resource capability migration: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) migrateFeishuResourceGrantScopes() error {
+	hasActorScope, err := s.tableHasColumn("feishu_resource_grants", "actor_type")
+	if err != nil {
+		return fmt.Errorf("inspect legacy feishu resource grant scope: %w", err)
+	}
+	if hasActorScope {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin feishu resource grant scope migration: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS feishu_resource_grants_scoped`); err != nil {
+		return fmt.Errorf("remove stale scoped feishu resource grant table: %w", err)
+	}
+	if _, err := tx.Exec(
+		`CREATE TABLE feishu_resource_grants_scoped (
+			account_id TEXT NOT NULL,
+			actor_type TEXT NOT NULL,
+			actor_id TEXT NOT NULL,
+			chat_id TEXT NOT NULL,
+			resource_type TEXT NOT NULL,
+			resource_token TEXT NOT NULL,
+			permission TEXT NOT NULL,
+			grant_mode TEXT NOT NULL,
+			source_request_id TEXT NOT NULL,
+			state TEXT NOT NULL,
+			expires_at_ms INTEGER NOT NULL DEFAULT 0,
+			created_at_ms INTEGER NOT NULL,
+			updated_at_ms INTEGER NOT NULL,
+			PRIMARY KEY (account_id, actor_type, actor_id, chat_id, resource_type, resource_token, permission)
+		)`,
+	); err != nil {
+		return fmt.Errorf("create scoped feishu resource grant table: %w", err)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO feishu_resource_grants_scoped (
+			account_id, actor_type, actor_id, chat_id, resource_type, resource_token,
+			permission, grant_mode, source_request_id, state, expires_at_ms,
+			created_at_ms, updated_at_ms
+		) SELECT grants.account_id,
+			CASE WHEN requests.actor_open_id<>'' THEN 'open_id' ELSE 'user_id' END,
+			CASE WHEN requests.actor_open_id<>'' THEN requests.actor_open_id ELSE requests.actor_user_id END,
+			grants.chat_id, grants.resource_type, grants.resource_token,
+			grants.permission, 'once', grants.source_request_id, grants.state,
+			requests.expires_at_ms, grants.created_at_ms, grants.updated_at_ms
+		  FROM feishu_resource_grants AS grants
+		  JOIN feishu_resource_access_requests AS requests
+		    ON requests.id=grants.source_request_id AND requests.account_id=grants.account_id
+		 WHERE requests.actor_open_id<>'' OR requests.actor_user_id<>''`,
+	); err != nil {
+		return fmt.Errorf("backfill scoped feishu resource grants: %w", err)
+	}
+	if _, err := tx.Exec(`DROP TABLE feishu_resource_grants`); err != nil {
+		return fmt.Errorf("drop unscoped feishu resource grant table: %w", err)
+	}
+	if _, err := tx.Exec(`ALTER TABLE feishu_resource_grants_scoped RENAME TO feishu_resource_grants`); err != nil {
+		return fmt.Errorf("activate scoped feishu resource grant table: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit feishu resource grant scope migration: %w", err)
 	}
 	return nil
 }
