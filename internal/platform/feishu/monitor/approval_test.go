@@ -262,7 +262,7 @@ func TestApprovalManagerOnlyRequesterCanApprove(t *testing.T) {
 	}
 }
 
-func TestApprovalManagerApprovesExecutesAndNotifiesOnce(t *testing.T) {
+func TestApprovalManagerApprovesExecutesUpdatesCardAndStoresResult(t *testing.T) {
 	st := openFeishuApprovalTestStore(t)
 	sender := &fakeApprovalSender{}
 	manager := newTestApprovalManager(t, st, sender)
@@ -289,7 +289,7 @@ func TestApprovalManagerApprovesExecutesAndNotifiesOnce(t *testing.T) {
 		t.Fatal("approved executor was not called")
 	}
 	waitForApprovalState(t, st, pending.RequestID, store.ToolApprovalStateSucceeded)
-	waitForApprovalNotifications(t, sender, 1, 1)
+	waitForApprovalUpdates(t, sender, 1)
 
 	calls, payload := executor.snapshot()
 	if calls != 1 || !strings.Contains(string(payload), "Quarterly plan") {
@@ -306,8 +306,12 @@ func TestApprovalManagerApprovesExecutesAndNotifiesOnce(t *testing.T) {
 	if len(updates) != 1 || updates[0].messageID != "c_callback" || !strings.Contains(updates[0].text, "执行完成") {
 		t.Fatalf("card updates = %#v, want one callback-token delayed completion update", updates)
 	}
-	if len(messages) != 1 || !strings.Contains(messages[0].text, "docs.feishu.cn/docx/doc123") {
-		t.Fatalf("messages = %#v, want created document notification", messages)
+	if len(messages) != 0 {
+		t.Fatalf("messages = %#v, want card-only immediate result", messages)
+	}
+	workflowResult, err := st.GetWorkflowResult(pending.RequestID, "feishu:cli_test")
+	if err != nil || workflowResult.State != store.WorkflowResultStateSucceeded || !strings.Contains(string(workflowResult.Payload), "docs.feishu.cn/docx/doc123") {
+		t.Fatalf("workflow result = %#v err=%v", workflowResult, err)
 	}
 
 	second, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.RequestID, approvalCardActionApproveOnce, "ou_requester", "oc_chat", "om_card", ""))
@@ -322,6 +326,84 @@ func TestApprovalManagerApprovesExecutesAndNotifiesOnce(t *testing.T) {
 	}
 	if active, err := manager.HasActiveGrant(approvalRequestContext(), "feishu_docs_create"); err != nil || active {
 		t.Fatalf("approve-once grant returned active=%v err=%v", active, err)
+	}
+}
+
+func TestApprovalManagerExecutorFailureStoresResultWithoutExtraMessage(t *testing.T) {
+	st := openFeishuApprovalTestStore(t)
+	sender := &fakeApprovalSender{}
+	manager := newTestApprovalManager(t, st, sender)
+	executor := &fakeApprovalExecutor{
+		name: "feishu_docs_create",
+		err:  errors.New("create failed"),
+		done: make(chan struct{}),
+	}
+	if err := manager.registerExecutor(executor); err != nil {
+		t.Fatalf("registerExecutor returned error: %v", err)
+	}
+	pending := requestTestApproval(t, manager)
+
+	response, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.RequestID, approvalCardActionApproveOnce, "ou_requester", "oc_chat", "om_card", ""))
+	if err != nil || response == nil || response.Toast == nil || response.Toast.Type != "success" {
+		t.Fatalf("HandleCardAction response = %#v err=%v", response, err)
+	}
+	select {
+	case <-executor.done:
+	case <-time.After(time.Second):
+		t.Fatal("approved executor was not called")
+	}
+	waitForApprovalState(t, st, pending.RequestID, store.ToolApprovalStateFailed)
+	waitForApprovalUpdates(t, sender, 1)
+	workflowResult, err := st.GetWorkflowResult(pending.RequestID, "feishu:cli_test")
+	if err != nil || workflowResult.State != store.WorkflowResultStateFailed || !strings.Contains(string(workflowResult.Payload), `"status":"failed"`) {
+		t.Fatalf("failed workflow result = %#v err=%v", workflowResult, err)
+	}
+	_, updates, messages := sender.snapshot()
+	if len(updates) != 1 || !strings.Contains(updates[0].text, "执行失败") || len(messages) != 0 {
+		t.Fatalf("updates/messages = %#v/%#v", updates, messages)
+	}
+}
+
+func TestApprovalManagerExpiredDecisionStoresWorkflowResult(t *testing.T) {
+	st := openFeishuApprovalTestStore(t)
+	sender := &fakeApprovalSender{}
+	manager := newTestApprovalManager(t, st, sender)
+	if err := manager.registerExecutor(&fakeApprovalExecutor{name: "feishu_docs_create"}); err != nil {
+		t.Fatalf("registerExecutor returned error: %v", err)
+	}
+	pending := requestTestApproval(t, manager)
+	manager.now = func() time.Time { return pending.ExpiresAt }
+
+	response, err := manager.HandleCardAction(t.Context(), approvalCardEvent(pending.RequestID, approvalCardActionApproveOnce, "ou_requester", "oc_chat", "om_card", ""))
+	if err != nil || response == nil || response.Toast == nil || !strings.Contains(response.Toast.Content, "过期") {
+		t.Fatalf("HandleCardAction response = %#v err=%v", response, err)
+	}
+	workflowResult, err := st.GetWorkflowResult(pending.RequestID, "feishu:cli_test")
+	if err != nil || workflowResult.State != store.WorkflowResultStateExpired || !strings.Contains(string(workflowResult.Payload), `"status":"expired"`) {
+		t.Fatalf("expired workflow result = %#v err=%v", workflowResult, err)
+	}
+}
+
+func TestApprovalManagerRecoveryReconcilesExpiredWorkflowResult(t *testing.T) {
+	st := openFeishuApprovalTestStore(t)
+	sender := &fakeApprovalSender{}
+	manager := newTestApprovalManager(t, st, sender)
+	if err := manager.registerExecutor(&fakeApprovalExecutor{name: "feishu_docs_create"}); err != nil {
+		t.Fatalf("registerExecutor returned error: %v", err)
+	}
+	pending := requestTestApproval(t, manager)
+	manager.now = func() time.Time { return pending.ExpiresAt }
+
+	if err := manager.recoverPersistedApprovals(t.Context()); err != nil {
+		t.Fatalf("recoverPersistedApprovals returned error: %v", err)
+	}
+	workflowResult, err := st.GetWorkflowResult(pending.RequestID, "feishu:cli_test")
+	if err != nil || workflowResult.State != store.WorkflowResultStateExpired || !strings.Contains(string(workflowResult.Payload), `"status":"expired"`) {
+		t.Fatalf("reconciled workflow result = %#v err=%v", workflowResult, err)
+	}
+	continuation, err := st.GetWorkflowContinuation(pending.RequestID, "feishu:cli_test")
+	if err != nil || continuation.State != store.WorkflowContinuationStateWaiting {
+		t.Fatalf("reconciled continuation = %#v err=%v", continuation, err)
 	}
 }
 
@@ -454,6 +536,10 @@ func TestApprovalManagerDenyDoesNotExecute(t *testing.T) {
 	if record.Payload != "" {
 		t.Fatalf("denied approval retained payload: %#v", record)
 	}
+	workflowResult, err := st.GetWorkflowResult(pending.RequestID, "feishu:cli_test")
+	if err != nil || workflowResult.State != store.WorkflowResultStateDenied || !strings.Contains(string(workflowResult.Payload), `"status":"denied"`) {
+		t.Fatalf("denied workflow result = %#v err=%v", workflowResult, err)
+	}
 }
 
 func TestApprovalManagerFailsRequestWhenCardCannotBeSent(t *testing.T) {
@@ -523,7 +609,7 @@ func newTestApprovalManager(t *testing.T, st *store.Store, sender *fakeApprovalS
 		ID:       "feishu:cli_test",
 		Name:     "fsbot",
 		Platform: store.PlatformFeishu,
-	}, cards, sender)
+	}, cards)
 	if err != nil {
 		t.Fatalf("newApprovalManager returned error: %v", err)
 	}
@@ -698,19 +784,19 @@ func waitForApprovalState(t *testing.T, st *store.Store, requestID, want string)
 	}
 }
 
-func waitForApprovalNotifications(t *testing.T, sender *fakeApprovalSender, updateCount, messageCount int) {
+func waitForApprovalUpdates(t *testing.T, sender *fakeApprovalSender, updateCount int) {
 	t.Helper()
 	deadline := time.After(time.Second)
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		_, updates, messages := sender.snapshot()
-		if len(updates) >= updateCount && len(messages) >= messageCount {
+		_, updates, _ := sender.snapshot()
+		if len(updates) >= updateCount {
 			return
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("approval notifications updates/messages = %d/%d, want at least %d/%d", len(updates), len(messages), updateCount, messageCount)
+			t.Fatalf("approval card updates = %d, want at least %d", len(updates), updateCount)
 		case <-ticker.C:
 		}
 	}

@@ -42,6 +42,8 @@ type resourceAccessStore interface {
 	CreateFeishuResourceAccessRequest(store.FeishuResourceAccessRequest) (store.FeishuResourceAccessRequest, error)
 	CreateWorkflowContinuation(store.WorkflowContinuation) (store.WorkflowContinuation, error)
 	CancelWorkflowContinuation(requestID, accountID, reason string, now time.Time) error
+	StoreWorkflowResult(store.WorkflowResult) (store.WorkflowResult, store.WorkflowContinuation, bool, error)
+	ListTerminalWorkflowResultGaps(accountID, kind string, updatedBefore time.Time, limit int) ([]store.WorkflowRequest, error)
 	PrepareFeishuResourceAccessOAuth(id, accountID, stateHash, verifier, subjectType, subjectID string, now time.Time) error
 	SetFeishuResourceAccessCardMessageID(id, accountID, messageID string, now time.Time) error
 	GetFeishuResourceAccessRequest(id, accountID string) (store.FeishuResourceAccessRequest, error)
@@ -151,6 +153,13 @@ func (m *resourceAccessManager) recoverPersistedRequests(ctx context.Context) er
 	}
 	if interrupted > 0 {
 		feishuLog.Warn(ctx, "closed interrupted feishu resource access requests account=%s count=%d", m.account.ID, interrupted)
+	}
+	reconciled, err := m.reconcileTerminalResourceAccessResults(ctx, now)
+	if err != nil {
+		return fmt.Errorf("reconcile persisted feishu resource access results: %w", err)
+	}
+	if reconciled > 0 {
+		feishuLog.Info(ctx, "reconciled persisted feishu resource access results account=%s count=%d", m.account.ID, reconciled)
 	}
 	return nil
 }
@@ -444,6 +453,7 @@ func (m *resourceAccessManager) HandleCardAction(ctx context.Context, event *cal
 		feishuLog.Info(ctx, "denied feishu resource access request=%s account=%s user=%s chat=%s type=%s resource_ref=%s",
 			shortRequestID(request.ID), request.AccountID, resourceAccessActorID(request), request.ChatID,
 			request.ResourceType, shortResourceRef(request.ResourceToken))
+		m.persistResourceWorkflowResult(ctx, request, store.WorkflowResultStateDenied, "denied", "", "用户拒绝了本次资源授权。", m.currentTime())
 		return approvalCallbackResponse(
 			"success",
 			"已拒绝，本次不会授予资源权限。",
@@ -715,6 +725,9 @@ func (m *resourceAccessManager) HandleOAuthCallback(w http.ResponseWriter, r *ht
 		shortResourceRef(query.Response.Error), len(query.Response.Error))
 	request, err := m.store.ClaimFeishuResourceAccessOAuth(hashResourceAccessState(query.State), m.account.ID, m.currentTime())
 	if err != nil {
+		if errors.Is(err, store.ErrFeishuResourceAccessExpired) {
+			m.persistResourceWorkflowResult(r.Context(), request, store.WorkflowResultStateExpired, "expired", "", "资源授权请求已过期。", m.currentTime())
+		}
 		status := http.StatusBadRequest
 		if errors.Is(err, store.ErrFeishuResourceAccessExpired) {
 			status = http.StatusGone
@@ -821,6 +834,7 @@ func (m *resourceAccessManager) completeResourceAccessOAuth(ctx context.Context,
 	); err != nil {
 		return fail(err, "授权记录失败", "飞书已授予权限，但 LingoBridge 未能保存核验结果；请重新调用授权工具核验。", http.StatusInternalServerError, "saving resource access failed")
 	}
+	m.persistResourceWorkflowResult(ctx, request, store.WorkflowResultStateSucceeded, "granted", store.FeishuResourceGrantSourceNewlyGranted, "飞书已确认所需资源权限。", completedAt)
 	feishuLog.Info(ctx, "granted feishu resource access request=%s account=%s user=%s chat=%s type=%s resource_ref=%s permission=%s subject_type=%s",
 		shortRequestID(request.ID), request.AccountID, resourceAccessActorID(request), request.ChatID,
 		request.ResourceType, shortResourceRef(request.ResourceToken), request.Permission, request.SubjectType)
@@ -1162,6 +1176,7 @@ func (m *resourceAccessManager) resourceAccessDecisionError(ctx context.Context,
 	case errors.Is(err, store.ErrFeishuResourceAccessOAuthStateMismatch):
 		return cardToast("error", "授权链接的 state 与原请求不匹配，请重新复制或重新发起授权。")
 	case errors.Is(err, store.ErrFeishuResourceAccessExpired):
+		m.persistResourceWorkflowResult(ctx, request, store.WorkflowResultStateExpired, "expired", "", "资源授权请求已过期。", m.currentTime())
 		return approvalCallbackResponse("error", "授权请求已过期。", statusCard{title: "授权已过期", template: "grey", message: "请重新调用资源授权工具。"})
 	case errors.Is(err, store.ErrFeishuResourceAccessResolved):
 		return cardToast("info", "该授权请求已经处理。")
@@ -1174,13 +1189,94 @@ func (m *resourceAccessManager) resourceAccessDecisionError(ctx context.Context,
 }
 
 func (m *resourceAccessManager) finishOAuthFailure(ctx context.Context, request store.FeishuResourceAccessRequest, cause error, title, message string) {
-	if err := m.store.FailFeishuResourceAccessRequest(request.ID, request.AccountID, m.currentTime()); err != nil && !errors.Is(err, store.ErrFeishuResourceAccessResolved) {
+	failedAt := m.currentTime()
+	if err := m.store.FailFeishuResourceAccessRequest(request.ID, request.AccountID, failedAt); err != nil && !errors.Is(err, store.ErrFeishuResourceAccessResolved) {
 		feishuLog.Error(ctx, "mark feishu resource OAuth failed request=%s account=%s: %v", shortRequestID(request.ID), request.AccountID, err)
+	} else if err == nil {
+		m.persistResourceWorkflowResult(ctx, request, store.WorkflowResultStateFailed, "failed", "", message, failedAt)
 	}
 	feishuLog.Warn(ctx, "feishu resource OAuth failed request=%s account=%s user=%s chat=%s type=%s resource_ref=%s: %v",
 		shortRequestID(request.ID), request.AccountID, resourceAccessActorID(request), request.ChatID,
 		request.ResourceType, shortResourceRef(request.ResourceToken), cause)
 	m.updateResourceAccessResultCard(ctx, request, statusCard{title: title, template: "red", message: message})
+}
+
+func (m *resourceAccessManager) persistResourceWorkflowResult(ctx context.Context, request store.FeishuResourceAccessRequest, state, status, source, message string, now time.Time) {
+	if strings.TrimSpace(request.ID) == "" {
+		return
+	}
+	persistWorkflowResultBestEffort(ctx, m.store, request.ID, request.AccountID, state, resourceWorkflowResultPayload(request, status, source, message), now)
+}
+
+func resourceWorkflowResultPayload(request store.FeishuResourceAccessRequest, status, source, message string) map[string]any {
+	return map[string]any{
+		"status":         status,
+		"permission":     request.Permission,
+		"source":         source,
+		"resource_type":  request.ResourceType,
+		"resource_token": request.ResourceToken,
+		"resource_url":   request.ResourceURL,
+		"message":        strings.TrimSpace(message),
+	}
+}
+
+func (m *resourceAccessManager) reconcileTerminalResourceAccessResults(ctx context.Context, updatedBefore time.Time) (int, error) {
+	const batchSize = 100
+	total := 0
+	for {
+		gaps, err := m.store.ListTerminalWorkflowResultGaps(
+			m.account.ID,
+			store.WorkflowRequestKindFeishuResourceAccess,
+			updatedBefore,
+			batchSize,
+		)
+		if err != nil {
+			return total, err
+		}
+		for _, gap := range gaps {
+			request, err := m.store.GetFeishuResourceAccessRequest(gap.ID, gap.AccountID)
+			if err != nil {
+				return total, fmt.Errorf("load terminal resource access request %s: %w", shortRequestID(gap.ID), err)
+			}
+			resultState, status, source, message, err := recoveredResourceAccessResult(request, gap.State)
+			if err != nil {
+				return total, err
+			}
+			_, ready, err := persistWorkflowResult(
+				m.store,
+				request.ID,
+				request.AccountID,
+				resultState,
+				resourceWorkflowResultPayload(request, status, source, message),
+				gap.UpdatedAt,
+			)
+			if err != nil {
+				return total, fmt.Errorf("store recovered resource access result %s: %w", shortRequestID(gap.ID), err)
+			}
+			total++
+			feishuLog.Debug(ctx, "reconciled feishu resource access result request=%s account=%s workflow_state=%s result_state=%s ready=%t",
+				shortRequestID(gap.ID), gap.AccountID, gap.State, resultState, ready)
+		}
+		if len(gaps) < batchSize {
+			return total, nil
+		}
+	}
+}
+
+func recoveredResourceAccessResult(request store.FeishuResourceAccessRequest, workflowState string) (resultState, status, source, message string, err error) {
+	switch workflowState {
+	case store.WorkflowRequestStateDenied:
+		return store.WorkflowResultStateDenied, "denied", "", "用户拒绝了本次资源授权。", nil
+	case store.WorkflowRequestStateExpired:
+		return store.WorkflowResultStateExpired, "expired", "", "资源授权请求已过期。", nil
+	case store.WorkflowRequestStateFailed:
+		return store.WorkflowResultStateFailed, "failed", "", "资源授权未能完成。", nil
+	case store.WorkflowRequestStateSucceeded:
+		source := strings.TrimSpace(request.GrantSource)
+		return store.WorkflowResultStateSucceeded, "granted", source, "飞书已确认所需资源权限。", nil
+	default:
+		return "", "", "", "", fmt.Errorf("unsupported terminal resource access state %q", workflowState)
+	}
 }
 
 func (m *resourceAccessManager) updateResourceAccessResultCard(ctx context.Context, request store.FeishuResourceAccessRequest, card Card) {

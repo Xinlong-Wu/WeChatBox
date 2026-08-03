@@ -503,6 +503,65 @@ func (s *Store) ListResumableWorkflowContinuations(accountID string, now time.Ti
 	return continuations, nil
 }
 
+// ListTerminalWorkflowResultGaps returns terminal workflow roots whose waiting
+// continuation does not yet have a durable result. Callers use this to repair
+// the small crash window between a workflow-specific terminal update and
+// StoreWorkflowResult. updatedBefore lets live reconcilers avoid racing a
+// terminal callback that is still writing its richer result payload.
+func (s *Store) ListTerminalWorkflowResultGaps(accountID, kind string, updatedBefore time.Time, limit int) ([]WorkflowRequest, error) {
+	accountID = strings.TrimSpace(accountID)
+	kind = strings.TrimSpace(kind)
+	updatedBefore = normalizedWorkflowTime(updatedBefore)
+	if accountID == "" || kind == "" {
+		return nil, fmt.Errorf("workflow result gap account and kind are required")
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	rows, err := s.db.Query(
+		`SELECT request.id, request.account_id, request.kind, request.state,
+			request.created_at_ms, request.updated_at_ms
+		 FROM workflow_requests AS request
+		 JOIN workflow_continuations AS continuation
+		   ON continuation.request_id=request.id AND continuation.account_id=request.account_id
+		 LEFT JOIN workflow_results AS result
+		   ON result.request_id=request.id AND result.account_id=request.account_id
+		 WHERE request.account_id=? AND request.kind=?
+		   AND request.state IN (?, ?, ?, ?, ?)
+		   AND request.updated_at_ms<=?
+		   AND continuation.state=?
+		   AND result.request_id IS NULL
+		 ORDER BY request.updated_at_ms, request.created_at_ms
+		 LIMIT ?`,
+		accountID,
+		kind,
+		WorkflowRequestStateDenied,
+		WorkflowRequestStateSucceeded,
+		WorkflowRequestStatePartial,
+		WorkflowRequestStateFailed,
+		WorkflowRequestStateExpired,
+		updatedBefore.UnixMilli(),
+		WorkflowContinuationStateWaiting,
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list terminal workflow result gaps: %w", err)
+	}
+	defer rows.Close()
+	requests := []WorkflowRequest{}
+	for rows.Next() {
+		request, scanErr := scanWorkflowRequest(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		requests = append(requests, request)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list terminal workflow result gaps: %w", err)
+	}
+	return requests, nil
+}
+
 func (s *Store) GetWorkflowContinuation(requestID, accountID string) (WorkflowContinuation, error) {
 	return workflowContinuationByID(s.db, strings.TrimSpace(requestID), strings.TrimSpace(accountID))
 }

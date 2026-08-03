@@ -253,6 +253,10 @@ func TestResourceAccessOAuthTokenErrorDoesNotExposeSupportInstructions(t *testin
 	if err != nil || failed.State != store.FeishuResourceAccessStateFailed || failed.PKCEVerifier != "" || failed.OAuthStateHash != "" {
 		t.Fatalf("failed request = %#v err=%v", failed, err)
 	}
+	workflowResult, err := st.GetWorkflowResult(result.RequestID, "feishu:cli_test")
+	if err != nil || workflowResult.State != store.WorkflowResultStateFailed || !strings.Contains(string(workflowResult.Payload), `"status":"failed"`) {
+		t.Fatalf("failed workflow result = %#v err=%v", workflowResult, err)
+	}
 	_, updates, messages := sender.snapshot()
 	if len(updates) != 1 || updates[0].messageID != "om_card" || !strings.Contains(updates[0].text, "授权失败") || len(messages) != 0 {
 		t.Fatalf("updates/messages = %#v/%#v", updates, messages)
@@ -523,6 +527,12 @@ func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 	if completed.State != store.FeishuResourceAccessStateSucceeded || completed.GrantSource != store.FeishuResourceGrantSourceNewlyGranted || completed.PKCEVerifier != "" || completed.OAuthStateHash != "" {
 		t.Fatalf("completed request = %#v", completed)
 	}
+	workflowResult, err := st.GetWorkflowResult(result.RequestID, "feishu:cli_test")
+	if err != nil || workflowResult.State != store.WorkflowResultStateSucceeded ||
+		!strings.Contains(string(workflowResult.Payload), `"status":"granted"`) ||
+		!strings.Contains(string(workflowResult.Payload), `"resource_token":"doxcn_external"`) {
+		t.Fatalf("completed workflow result = %#v err=%v", workflowResult, err)
+	}
 	grant, active, err := st.ActiveFeishuResourceGrant("feishu:cli_test", "oc_chat", "docx", "doxcn_external", store.FeishuResourcePermissionWrite)
 	if err != nil || !active || grant.SubjectID != "ou_bot" {
 		t.Fatalf("saved grant = %#v active=%t err=%v", grant, active, err)
@@ -663,6 +673,43 @@ func TestResourceAccessCardRejectIsBoundToRequester(t *testing.T) {
 	denied, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
 	if err != nil || denied.State != store.FeishuResourceAccessStateDenied || denied.PKCEVerifier != "" {
 		t.Fatalf("denied request = %#v err=%v", denied, err)
+	}
+	workflowResult, err := st.GetWorkflowResult(result.RequestID, "feishu:cli_test")
+	if err != nil || workflowResult.State != store.WorkflowResultStateDenied || !strings.Contains(string(workflowResult.Payload), `"status":"denied"`) {
+		t.Fatalf("denied workflow result = %#v err=%v", workflowResult, err)
+	}
+}
+
+func TestResourceAccessRecoveryReconcilesExpiredWorkflowResult(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://oauth.wulongxin.com/feishu/oauth/callback",
+	})
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType:  "docx",
+		ResourceToken: "doxcn_external",
+		ResourceURL:   "https://example.feishu.cn/docx/doxcn_external",
+		Permission:    feishutools.ResourcePermissionWrite,
+		Reason:        "append a summary",
+	})
+	if err != nil {
+		t.Fatalf("RequestAccess returned error: %v", err)
+	}
+	manager.now = func() time.Time { return result.ExpiresAt }
+
+	if err := manager.recoverPersistedRequests(t.Context()); err != nil {
+		t.Fatalf("recoverPersistedRequests returned error: %v", err)
+	}
+	workflowResult, err := st.GetWorkflowResult(result.RequestID, "feishu:cli_test")
+	if err != nil || workflowResult.State != store.WorkflowResultStateExpired || !strings.Contains(string(workflowResult.Payload), `"status":"expired"`) {
+		t.Fatalf("reconciled workflow result = %#v err=%v", workflowResult, err)
+	}
+	continuation, err := st.GetWorkflowContinuation(result.RequestID, "feishu:cli_test")
+	if err != nil || continuation.State != store.WorkflowContinuationStateWaiting {
+		t.Fatalf("reconciled continuation = %#v err=%v", continuation, err)
 	}
 }
 

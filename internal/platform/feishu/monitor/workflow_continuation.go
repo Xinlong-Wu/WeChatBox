@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -17,6 +18,10 @@ type workflowContinuationCreator interface {
 
 type workflowContinuationCanceler interface {
 	CancelWorkflowContinuation(requestID, accountID, reason string, now time.Time) error
+}
+
+type workflowResultWriter interface {
+	StoreWorkflowResult(store.WorkflowResult) (store.WorkflowResult, store.WorkflowContinuation, bool, error)
 }
 
 func trustedWorkflowExecutionContext(ctx context.Context, accountID, toolName string) (tooltypes.ExecutionContext, error) {
@@ -72,4 +77,39 @@ func cancelWorkflowContinuationBestEffort(ctx context.Context, canceler workflow
 	if err := canceler.CancelWorkflowContinuation(requestID, accountID, reason, now); err != nil && !errors.Is(err, store.ErrWorkflowContinuationResolved) {
 		feishuLog.Warn(ctx, "cancel feishu workflow continuation failed request=%s account=%s: %v", shortRequestID(requestID), accountID, err)
 	}
+}
+
+func persistWorkflowResultBestEffort(ctx context.Context, writer workflowResultWriter, requestID, accountID, state string, payload any, now time.Time) {
+	continuation, ready, err := persistWorkflowResult(writer, requestID, accountID, state, payload, now)
+	if err == nil {
+		feishuLog.Debug(ctx, "persisted feishu workflow result request=%s account=%s state=%s session=%s continuation_state=%s ready=%t",
+			shortRequestID(requestID), accountID, state, continuation.SessionID, continuation.State, ready)
+		return
+	}
+	if errors.Is(err, store.ErrWorkflowContinuationNotFound) {
+		feishuLog.Debug(ctx, "skip workflow result without continuation request=%s account=%s state=%s", shortRequestID(requestID), accountID, state)
+		return
+	}
+	feishuLog.Error(ctx, "persist feishu workflow result failed request=%s account=%s state=%s: %v", shortRequestID(requestID), accountID, state, err)
+}
+
+func persistWorkflowResult(writer workflowResultWriter, requestID, accountID, state string, payload any, now time.Time) (store.WorkflowContinuation, bool, error) {
+	if writer == nil {
+		return store.WorkflowContinuation{}, false, fmt.Errorf("workflow result store is unavailable")
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return store.WorkflowContinuation{}, false, fmt.Errorf("marshal workflow result: %w", err)
+	}
+	_, continuation, ready, err := writer.StoreWorkflowResult(store.WorkflowResult{
+		RequestID: requestID,
+		AccountID: accountID,
+		State:     state,
+		Payload:   raw,
+		CreatedAt: now,
+	})
+	if err != nil {
+		return continuation, false, err
+	}
+	return continuation, ready, nil
 }

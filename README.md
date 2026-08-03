@@ -465,20 +465,21 @@ operation card, but it does not bypass the mandatory resource-access call and
 `access_request_id`. A different user, bot, chat, or tool, or an expired grant,
 requires a new operation card.
 
-Card-approved document creation runs asynchronously and posts the result link
-back to Feishu. Immediately before execution, LingoBridge reconstructs the
-original trusted actor/chat context and revalidates the target folder. If
-permission was revoked, no document-create API call is made. The approval
-callback responds within three seconds; terminal denial/expiry states can
-replace the card in that response, while an approved asynchronous operation
-uses the callback token and Feishu's delayed card-update API for its final
-state. After Feishu creates the document, LingoBridge records Bot ownership and
-the current-chat binding before appending optional initial content. If any
-post-create step fails, the result reports partial success and tells the model
-not to create a duplicate; an initial append failure can be recovered through
-`feishu_docs_append`. `feishu_docs_append` remains an immediate write tool restricted to a
-document bound to the current trusted chat or an external Docx accompanied by
-a live `docx/write` access request.
+Card-approved document creation runs asynchronously and updates the original
+card with the result; it does not send a second standalone success/failure text
+message. Immediately before execution, LingoBridge reconstructs the original
+trusted actor/chat context and revalidates the target folder. If permission was
+revoked, no document-create API call is made. The approval callback responds
+within three seconds; terminal denial/expiry states can replace the card in
+that response, while an approved asynchronous operation uses the callback
+token and Feishu's delayed card-update API for its final state. After Feishu
+creates the document, LingoBridge records Bot ownership and the current-chat
+binding before appending optional initial content. If any post-create step
+fails, the card and durable workflow result report partial success and tell the
+model not to create a duplicate; an initial append failure can be recovered
+through `feishu_docs_append`. `feishu_docs_append` remains an immediate write
+tool restricted to a document bound to the current trusted chat or an external
+Docx accompanied by a live `docx/write` access request.
 
 Pending operation and resource-access requests survive process restarts in the
 Feishu platform SQLite database. The document payload is retained only while
@@ -778,6 +779,14 @@ expired lease can be reclaimed after restart. Continuations do not store model
 names, OAuth codes, callback URLs, access tokens, refresh tokens, or card callback
 tokens. Deleting a Feishu account's Docs or approval data also deletes the
 matching workflow results and continuations.
+
+Operation approvals and resource OAuth callbacks persist a model-safe terminal
+payload for success, warning, denial, expiry, and failure. The original card is
+the immediate user-visible status surface; no duplicate result text is sent.
+At startup, LingoBridge also reconciles terminal approval/resource records that
+are missing a result because the process stopped between the workflow-specific
+state update and result insertion. Recovered operation results deliberately do
+not guess or replay a possibly completed remote write.
 
 An asynchronous tool returns its request ID to core as runtime-only result
 metadata; that ID is not part of the model-visible tool JSON. The Feishu manager

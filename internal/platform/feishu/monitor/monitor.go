@@ -99,7 +99,7 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 		}
 	}
 	if docsCreateApprovalRequired(p.config.Tools) {
-		approvals, err = newApprovalManager(ctx, p.store, acc, cards, sender)
+		approvals, err = newApprovalManager(ctx, p.store, acc, cards)
 		if err != nil {
 			return fmt.Errorf("initialize feishu tool approvals for account %s: %w", acc.Name, err)
 		}

@@ -293,6 +293,82 @@ func TestWorkflowContinuationExpiredLeaseIsResumable(t *testing.T) {
 	}
 }
 
+func TestListTerminalWorkflowResultGapsHonorsKindCutoffAndExistingResult(t *testing.T) {
+	st := openTestStore(t)
+	now := time.Date(2026, time.August, 3, 13, 15, 0, 0, time.UTC)
+	continuation := createWorkflowContinuationForTest(t, st, now, 30)
+	terminalAt := now.Add(2 * time.Second)
+	if err := st.UpdateWorkflowRequestState(
+		continuation.RequestID,
+		continuation.AccountID,
+		WorkflowRequestStateFailed,
+		terminalAt,
+	); err != nil {
+		t.Fatalf("UpdateWorkflowRequestState returned error: %v", err)
+	}
+
+	gaps, err := st.ListTerminalWorkflowResultGaps(
+		continuation.AccountID,
+		WorkflowRequestKindFeishuResourceAccess,
+		terminalAt.Add(-time.Millisecond),
+		10,
+	)
+	if err != nil {
+		t.Fatalf("ListTerminalWorkflowResultGaps before cutoff returned error: %v", err)
+	}
+	if len(gaps) != 0 {
+		t.Fatalf("gaps before cutoff = %#v, want none", gaps)
+	}
+
+	gaps, err = st.ListTerminalWorkflowResultGaps(
+		continuation.AccountID,
+		WorkflowRequestKindToolApproval,
+		terminalAt,
+		10,
+	)
+	if err != nil {
+		t.Fatalf("ListTerminalWorkflowResultGaps wrong kind returned error: %v", err)
+	}
+	if len(gaps) != 0 {
+		t.Fatalf("gaps for wrong kind = %#v, want none", gaps)
+	}
+
+	gaps, err = st.ListTerminalWorkflowResultGaps(
+		continuation.AccountID,
+		WorkflowRequestKindFeishuResourceAccess,
+		terminalAt,
+		10,
+	)
+	if err != nil {
+		t.Fatalf("ListTerminalWorkflowResultGaps returned error: %v", err)
+	}
+	if len(gaps) != 1 || gaps[0].ID != continuation.RequestID || gaps[0].State != WorkflowRequestStateFailed {
+		t.Fatalf("terminal workflow gaps = %#v", gaps)
+	}
+
+	if _, _, _, err := st.StoreWorkflowResult(WorkflowResult{
+		RequestID: continuation.RequestID,
+		AccountID: continuation.AccountID,
+		State:     WorkflowResultStateFailed,
+		Payload:   json.RawMessage(`{"status":"failed"}`),
+		CreatedAt: terminalAt,
+	}); err != nil {
+		t.Fatalf("StoreWorkflowResult returned error: %v", err)
+	}
+	gaps, err = st.ListTerminalWorkflowResultGaps(
+		continuation.AccountID,
+		WorkflowRequestKindFeishuResourceAccess,
+		terminalAt,
+		10,
+	)
+	if err != nil {
+		t.Fatalf("ListTerminalWorkflowResultGaps after result returned error: %v", err)
+	}
+	if len(gaps) != 0 {
+		t.Fatalf("gaps after result = %#v, want none", gaps)
+	}
+}
+
 func createWorkflowContinuationForTest(t *testing.T, st *Store, now time.Time, originRevision int64) WorkflowContinuation {
 	t.Helper()
 	request, err := st.CreateWorkflowRequest(WorkflowRequest{
