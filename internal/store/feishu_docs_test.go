@@ -200,6 +200,23 @@ func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
 		); err != nil {
 			t.Fatalf("CompleteFeishuResourceAccessRequest returned error: %v", err)
 		}
+		if _, err := st.SaveFeishuUserOAuthCredential(FeishuUserOAuthCredential{
+			AccountID:              accountID,
+			ActorOpenID:            "ou_requester",
+			ActorUserID:            "u_requester",
+			AccessTokenCiphertext:  "v1.access-" + accountID,
+			AccessTokenExpiresAt:   now.Add(2 * time.Hour),
+			RefreshTokenCiphertext: "v1.refresh-" + accountID,
+			RefreshTokenExpiresAt:  now.Add(30 * 24 * time.Hour),
+			Scopes:                 "auth:user.id:read docs:permission.member:create offline_access",
+			AuthorizedAt:           now,
+			ReauthorizeAt:          now.Add(365 * 24 * time.Hour),
+			Status:                 FeishuUserOAuthCredentialStatusActive,
+			CreatedAt:              now,
+			UpdatedAt:              now,
+		}); err != nil {
+			t.Fatalf("SaveFeishuUserOAuthCredential returned error: %v", err)
+		}
 		continuation := attachWorkflowContinuationForTest(t, st, access.ID, accountID, now, 0)
 		if _, _, err := st.CommitWorkflowContinuation(continuation.RequestID, continuation.AccountID, 1, now.Add(time.Second)); err != nil {
 			t.Fatalf("CommitWorkflowContinuation returned error: %v", err)
@@ -228,6 +245,12 @@ func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
 	}
 	if _, err := st.GetFeishuBotResource("feishu:second", "folder", "fld_feishu:second"); err != nil {
 		t.Fatalf("other account bot resource error = %v", err)
+	}
+	if _, err := st.GetFeishuUserOAuthCredential("feishu:first", "ou_requester", "u_requester"); !errors.Is(err, ErrFeishuUserOAuthCredentialNotFound) {
+		t.Fatalf("deleted account OAuth credential error = %v, want ErrFeishuUserOAuthCredentialNotFound", err)
+	}
+	if _, err := st.GetFeishuUserOAuthCredential("feishu:second", "ou_requester", "u_requester"); err != nil {
+		t.Fatalf("other account OAuth credential was deleted: %v", err)
 	}
 	var deletedAccessID string
 	if err := st.db.QueryRow(

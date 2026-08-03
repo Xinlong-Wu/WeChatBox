@@ -182,6 +182,24 @@ func (s *Store) migrate() error {
 			updated_at_ms INTEGER NOT NULL,
 			PRIMARY KEY (account_id, chat_id, resource_type, resource_token)
 		)`,
+		`CREATE TABLE IF NOT EXISTS feishu_user_oauth_credentials (
+			id TEXT PRIMARY KEY,
+			account_id TEXT NOT NULL,
+			actor_open_id TEXT NOT NULL DEFAULT '',
+			actor_user_id TEXT NOT NULL DEFAULT '',
+			access_token_ciphertext TEXT NOT NULL DEFAULT '',
+			access_token_expires_at_ms INTEGER NOT NULL DEFAULT 0,
+			refresh_token_ciphertext TEXT NOT NULL DEFAULT '',
+			refresh_token_expires_at_ms INTEGER NOT NULL DEFAULT 0,
+			scopes TEXT NOT NULL DEFAULT '',
+			authorized_at_ms INTEGER NOT NULL DEFAULT 0,
+			last_refreshed_at_ms INTEGER NOT NULL DEFAULT 0,
+			reauthorize_at_ms INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL,
+			version INTEGER NOT NULL DEFAULT 1,
+			created_at_ms INTEGER NOT NULL,
+			updated_at_ms INTEGER NOT NULL
+		)`,
 	}
 
 	for _, q := range queries {
@@ -245,6 +263,12 @@ func (s *Store) migrate() error {
 			 ON feishu_resource_access_requests(account_id, state, expires_at_ms)`,
 		`CREATE INDEX IF NOT EXISTS idx_feishu_resource_grants_account_chat
 			 ON feishu_resource_grants(account_id, chat_id, state, updated_at_ms)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_feishu_user_oauth_open_id
+			 ON feishu_user_oauth_credentials(account_id, actor_open_id) WHERE actor_open_id<>''`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_feishu_user_oauth_user_id
+			 ON feishu_user_oauth_credentials(account_id, actor_user_id) WHERE actor_user_id<>''`,
+		`CREATE INDEX IF NOT EXISTS idx_feishu_user_oauth_account_status_expiry
+			 ON feishu_user_oauth_credentials(account_id, status, access_token_expires_at_ms, refresh_token_expires_at_ms)`,
 	}
 	for _, q := range indexes {
 		if _, err := s.db.Exec(q); err != nil {

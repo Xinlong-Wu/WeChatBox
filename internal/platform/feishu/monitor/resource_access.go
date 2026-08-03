@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
@@ -31,7 +32,7 @@ const (
 	resourceAccessCallbackTimeout   = 30 * time.Second
 	resourceAccessCardUpdateTimeout = 10 * time.Second
 
-	resourceAccessOAuthScope = "auth:user.id:read docs:permission.member:create"
+	resourceAccessOAuthScope = "auth:user.id:read docs:permission.member:create offline_access"
 )
 
 type resourceAccessStore interface {
@@ -58,6 +59,10 @@ type resourceAccessStore interface {
 	UpsertFeishuResourceGrant(store.FeishuResourceGrant) (store.FeishuResourceGrant, error)
 	ActiveFeishuResourceGrant(accountID, chatID, resourceType, resourceToken, permission string) (store.FeishuResourceGrant, bool, error)
 	RevokeFeishuResourceGrant(accountID, chatID, resourceType, resourceToken string, now time.Time) error
+	SaveFeishuUserOAuthCredential(store.FeishuUserOAuthCredential) (store.FeishuUserOAuthCredential, error)
+	GetFeishuUserOAuthCredential(accountID, actorOpenID, actorUserID string) (store.FeishuUserOAuthCredential, error)
+	RotateFeishuUserOAuthCredential(store.FeishuUserOAuthCredential, int64) (store.FeishuUserOAuthCredential, error)
+	MarkFeishuUserOAuthCredentialReauthRequired(id, accountID string, expectedVersion int64, now time.Time) (store.FeishuUserOAuthCredential, error)
 }
 
 type resourceAccessOAuthConfig struct {
@@ -65,6 +70,7 @@ type resourceAccessOAuthConfig struct {
 	BaseURL               string
 	CallbackURL           string
 	CallbackListenAddress string
+	CredentialSecret      string
 }
 
 type resourceAccessManager struct {
@@ -77,6 +83,9 @@ type resourceAccessManager struct {
 	runCtx    context.Context
 	ttl       time.Duration
 	now       func() time.Time
+
+	credentialCipher *feishuOAuthCredentialCipher
+	credentialMu     sync.Mutex
 }
 
 var _ feishutools.ResourceAccessController = (*resourceAccessManager)(nil)
@@ -117,20 +126,32 @@ func newResourceAccessManager(
 		if oauth.ClientID == "" || oauth.BaseURL == "" {
 			return nil, fmt.Errorf("feishu OAuth client_id and oauth_base_url are required when the callback is enabled")
 		}
+		if strings.TrimSpace(oauth.CredentialSecret) == "" {
+			return nil, fmt.Errorf("feishu app secret is required to encrypt persisted OAuth credentials")
+		}
 	}
 	if runCtx == nil {
 		runCtx = context.Background()
 	}
+	var credentialCipher *feishuOAuthCredentialCipher
+	if oauth.CallbackURL != "" {
+		cipherValue, err := newFeishuOAuthCredentialCipher(oauth.CredentialSecret, account.ID)
+		if err != nil {
+			return nil, fmt.Errorf("initialize feishu OAuth credential encryption: %w", err)
+		}
+		credentialCipher = cipherValue
+	}
 	manager := &resourceAccessManager{
-		store:     st,
-		client:    client,
-		cards:     cards,
-		account:   account,
-		botOpenID: strings.TrimSpace(botOpenID),
-		oauth:     oauth,
-		runCtx:    runCtx,
-		ttl:       defaultResourceAccessTTL,
-		now:       time.Now,
+		store:            st,
+		client:           client,
+		cards:            cards,
+		account:          account,
+		botOpenID:        strings.TrimSpace(botOpenID),
+		oauth:            oauth,
+		runCtx:           runCtx,
+		ttl:              defaultResourceAccessTTL,
+		now:              time.Now,
+		credentialCipher: credentialCipher,
 	}
 	if err := cards.RegisterAction(resourceAccessCardActionKind, manager.HandleCardAction); err != nil {
 		return nil, fmt.Errorf("register feishu resource access card action: %w", err)
@@ -791,15 +812,19 @@ func (m *resourceAccessManager) completeResourceAccessOAuth(ctx context.Context,
 			"legacy PKCE authorization request is no longer supported; start a new request",
 		)
 	}
-	accessToken, err := m.exchangeAuthorizationCode(ctx, request.ID, code)
+	tokens, err := m.exchangeAuthorizationCode(ctx, request.ID, code)
 	if err != nil {
 		m.logResourceAccessTokenExchangeError(ctx, request.ID, code, err)
 		return fail(err, "授权失败", "飞书授权码兑换失败，请重新发起。", http.StatusBadGateway, "authorization code exchange failed")
 	}
-	if err := m.verifyOAuthUser(ctx, accessToken, request); err != nil {
+	identity, err := m.verifyOAuthUser(ctx, tokens.AccessToken, request)
+	if err != nil {
 		return fail(err, "授权用户不匹配", "只有发起资源请求的飞书用户可以完成授权。", http.StatusForbidden, "authorized user does not match the requester")
 	}
-	createCode, err := m.grantResourceAccess(ctx, accessToken, request)
+	if _, err := m.persistFeishuOAuthCredential(ctx, identity, tokens); err != nil {
+		return fail(err, "授权凭证保存失败", "LingoBridge 未能安全保存飞书授权凭证，请重新发起。", http.StatusInternalServerError, "saving encrypted OAuth credential failed")
+	}
+	createCode, err := m.grantResourceAccess(ctx, tokens.AccessToken, request)
 	if err != nil && createCode != 1063003 {
 		return fail(err, "授予权限失败", "飞书未能把所需权限授予机器人或当前群聊，请重新检查资源权限。", http.StatusBadGateway, "granting resource access failed")
 	}
@@ -870,7 +895,7 @@ func (m *resourceAccessManager) logResourceAccessTokenExchangeError(
 		shortResourceRef(code), len(code))
 }
 
-func (m *resourceAccessManager) exchangeAuthorizationCode(ctx context.Context, requestID, code string) (string, error) {
+func (m *resourceAccessManager) exchangeAuthorizationCode(ctx context.Context, requestID, code string) (feishuOAuthTokenBundle, error) {
 	tokenRequest := authorizationcode.NewTokenRequestBuilder().
 		Code(code).
 		RedirectUri(m.oauth.CallbackURL).
@@ -893,14 +918,11 @@ func (m *resourceAccessManager) exchangeAuthorizationCode(ctx context.Context, r
 		shortResourceRef(sdkRedirect), len(sdkRedirect), sdkRedirect == m.oauth.CallbackURL)
 	resp, err := m.client.AccessToken.RetrieveByAuthorizationCode(ctx, tokenRequest)
 	if err != nil {
-		return "", fmt.Errorf("exchange feishu OAuth authorization code: %w", err)
+		return feishuOAuthTokenBundle{}, fmt.Errorf("exchange feishu OAuth authorization code: %w", err)
 	}
-	if resp == nil || !resp.Success() || resp.Data == nil {
-		return "", fmt.Errorf("exchange feishu OAuth authorization code: empty or unsuccessful response")
-	}
-	token := strings.TrimSpace(deref(resp.Data.AccessToken))
-	if token == "" {
-		return "", fmt.Errorf("exchange feishu OAuth authorization code returned no access_token")
+	bundle, err := feishuOAuthTokenBundleFromResponse(resp, resourceAccessOAuthScope)
+	if err != nil {
+		return feishuOAuthTokenBundle{}, fmt.Errorf("exchange feishu OAuth authorization code: %w", err)
 	}
 	statusCode := 0
 	requestLogID := ""
@@ -911,6 +933,7 @@ func (m *resourceAccessManager) exchangeAuthorizationCode(ctx context.Context, r
 	scopeCount := 0
 	expiresIn := 0
 	refreshTokenPresent := false
+	refreshExpiresIn := 0
 	if resp.Data.Scope != nil {
 		scopeCount = len(strings.Fields(deref(resp.Data.Scope)))
 	}
@@ -918,34 +941,39 @@ func (m *resourceAccessManager) exchangeAuthorizationCode(ctx context.Context, r
 		expiresIn = *resp.Data.ExpiresIn
 	}
 	refreshTokenPresent = strings.TrimSpace(deref(resp.Data.RefreshToken)) != ""
-	feishuLog.Debug(ctx, "received feishu resource OAuth token response request=%s account=%s http_status=%d request_log_id=%q access_token_present=true refresh_token_present=%t expires_in=%d scope_count=%d",
-		shortRequestID(requestID), m.account.ID, statusCode, requestLogID, refreshTokenPresent, expiresIn, scopeCount)
-	return token, nil
+	if resp.Data.RefreshTokenExpiresIn != nil {
+		refreshExpiresIn = *resp.Data.RefreshTokenExpiresIn
+	}
+	feishuLog.Debug(ctx, "received feishu resource OAuth token response request=%s account=%s http_status=%d request_log_id=%q access_token_present=true refresh_token_present=%t expires_in=%d refresh_expires_in=%d scope_count=%d",
+		shortRequestID(requestID), m.account.ID, statusCode, requestLogID, refreshTokenPresent, expiresIn, refreshExpiresIn, scopeCount)
+	return bundle, nil
 }
 
-func (m *resourceAccessManager) verifyOAuthUser(ctx context.Context, accessToken string, request store.FeishuResourceAccessRequest) error {
+func (m *resourceAccessManager) verifyOAuthUser(ctx context.Context, accessToken string, request store.FeishuResourceAccessRequest) (feishuOAuthIdentity, error) {
 	resp, err := m.client.Authen.UserInfo.Get(ctx, larkcore.WithUserAccessToken(accessToken))
 	if err != nil {
-		return fmt.Errorf("get authorized feishu user: %w", err)
+		return feishuOAuthIdentity{}, fmt.Errorf("get authorized feishu user: %w", err)
 	}
 	if resp == nil || !resp.Success() || resp.Data == nil {
 		if resp == nil {
-			return fmt.Errorf("get authorized feishu user: empty response")
+			return feishuOAuthIdentity{}, fmt.Errorf("get authorized feishu user: empty response")
 		}
-		return fmt.Errorf("get authorized feishu user code=%d msg=%s", resp.Code, resp.Msg)
+		return feishuOAuthIdentity{}, fmt.Errorf("get authorized feishu user code=%d msg=%s", resp.Code, resp.Msg)
 	}
-	openID := strings.TrimSpace(deref(resp.Data.OpenId))
-	userID := strings.TrimSpace(deref(resp.Data.UserId))
+	identity := feishuOAuthIdentity{
+		OpenID: strings.TrimSpace(deref(resp.Data.OpenId)),
+		UserID: strings.TrimSpace(deref(resp.Data.UserId)),
+	}
 	if request.ActorOpenID != "" {
-		if request.ActorOpenID != openID {
-			return fmt.Errorf("authorized open_id does not match requester")
+		if request.ActorOpenID != identity.OpenID {
+			return feishuOAuthIdentity{}, fmt.Errorf("authorized open_id does not match requester")
 		}
-		return nil
+		return identity, nil
 	}
-	if request.ActorUserID == "" || request.ActorUserID != userID {
-		return fmt.Errorf("authorized user_id does not match requester")
+	if request.ActorUserID == "" || request.ActorUserID != identity.UserID {
+		return feishuOAuthIdentity{}, fmt.Errorf("authorized user_id does not match requester")
 	}
-	return nil
+	return identity, nil
 }
 
 func (m *resourceAccessManager) grantResourceAccess(ctx context.Context, accessToken string, request store.FeishuResourceAccessRequest) (int, error) {

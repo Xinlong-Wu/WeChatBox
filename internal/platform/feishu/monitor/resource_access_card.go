@@ -41,7 +41,7 @@ func (c pendingResourceAccessCard) JSON() (string, error) {
 	lines = append(lines,
 		"",
 		"点击下方“前往飞书官方授权页面”按钮完成授权。",
-		"LingoBridge 仅使用本次返回的 user_access_token 完成授权，不保存 user_access_token 或 refresh_token。",
+		"LingoBridge 会在本机使用应用密钥加密保存 user_access_token 与 refresh_token，仅用于你批准的飞书资源操作；凭证不会发送给大模型或写入日志。",
 		"如果授权后浏览器无法返回 LingoBridge，请复制地址栏中的完整回调 URL，返回本卡片粘贴并提交；也可以只粘贴授权码。",
 		fmt.Sprintf("本请求将于 %s 过期。", c.request.ExpiresAt.UTC().Format("2006-01-02 15:04 UTC")),
 	)

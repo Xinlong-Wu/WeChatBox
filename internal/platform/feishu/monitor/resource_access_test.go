@@ -372,10 +372,12 @@ func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 			tokenBody = body
 			mu.Unlock()
 			writeResourceAccessJSON(t, w, map[string]any{
-				"access_token": "user-access-token",
-				"token_type":   "Bearer",
-				"expires_in":   7200,
-				"scope":        resourceAccessOAuthScope,
+				"access_token":             "user-access-token",
+				"token_type":               "Bearer",
+				"expires_in":               7200,
+				"refresh_token":            "user-refresh-token",
+				"refresh_token_expires_in": 2592000,
+				"scope":                    resourceAccessOAuthScope,
 			})
 		case "/open-apis/authen/v1/user_info":
 			mu.Lock()
@@ -537,6 +539,16 @@ func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 	if err != nil || !active || grant.SubjectID != "ou_bot" {
 		t.Fatalf("saved grant = %#v active=%t err=%v", grant, active, err)
 	}
+	credential, err := st.GetFeishuUserOAuthCredential("feishu:cli_test", "ou_requester", "u_requester")
+	if err != nil || credential.Status != store.FeishuUserOAuthCredentialStatusActive || credential.Version != 1 ||
+		credential.AccessTokenCiphertext == "" || credential.RefreshTokenCiphertext == "" ||
+		strings.Contains(credential.AccessTokenCiphertext, "user-access-token") || strings.Contains(credential.RefreshTokenCiphertext, "user-refresh-token") {
+		t.Fatalf("encrypted OAuth credential = %#v err=%v", credential, err)
+	}
+	storedAccessToken, err := manager.feishuUserAccessToken(context.Background(), "ou_requester", "u_requester")
+	if err != nil || storedAccessToken != "user-access-token" {
+		t.Fatalf("stored OAuth access token = %q err=%v", storedAccessToken, err)
+	}
 	_, updates, messages := sender.snapshot()
 	if len(updates) != 1 || updates[0].messageID != "om_card" || !strings.Contains(updates[0].text, "权限已授予") || len(messages) != 0 {
 		t.Fatalf("updates/messages = %#v/%#v", updates, messages)
@@ -566,8 +578,9 @@ func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 		"sdk_code_matches=true",
 		"sdk_code_verifier_present=false",
 		"sdk_redirect_matches=true",
-		"scope_count=2",
+		"scope_count=3",
 		"access_token_present=true",
+		"refresh_token_present=true",
 	}
 	for _, fragment := range requiredLogFragments {
 		if !strings.Contains(logText, fragment) {
@@ -580,6 +593,7 @@ func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 		authURL,
 		oauth.CallbackURL,
 		"user-access-token",
+		"user-refresh-token",
 		"doxcn_external",
 	} {
 		if strings.Contains(logText, secret) {
@@ -765,7 +779,9 @@ func TestPendingResourceAccessCardContainsOAuthHandoffForm(t *testing.T) {
 	markdownContent, _ := markdown["content"].(string)
 	if markdown["tag"] != "markdown" || markdown["element_id"] != "KNJPSduXTksKaRe28qq6" || markdown["text_size"] != "normal_v2" ||
 		!strings.Contains(markdownContent, "为了更好地为您提供服务") || !strings.Contains(markdownContent, "创建项目计划文档") ||
-		!strings.Contains(markdownContent, "点击下方“前往飞书官方授权页面”按钮") || strings.Contains(markdownContent, authURL) {
+		!strings.Contains(markdownContent, "点击下方“前往飞书官方授权页面”按钮") ||
+		!strings.Contains(markdownContent, "使用应用密钥加密保存 user_access_token 与 refresh_token") ||
+		!strings.Contains(markdownContent, "不会发送给大模型或写入日志") || strings.Contains(markdownContent, authURL) {
 		t.Fatalf("resource card description = %#v", markdown)
 	}
 	openButton, _ := elements[2].(map[string]any)
@@ -970,6 +986,9 @@ func TestResourceAccessOAuthServerSkipsListenerFreeMode(t *testing.T) {
 
 func newTestResourceAccessManager(t *testing.T, server *httptest.Server, oauth resourceAccessOAuthConfig) (*resourceAccessManager, *store.Store, *fakeApprovalSender) {
 	t.Helper()
+	if oauth.CallbackURL != "" && oauth.CredentialSecret == "" {
+		oauth.CredentialSecret = "secret"
+	}
 	st := openFeishuApprovalTestStore(t)
 	sender := &fakeApprovalSender{}
 	cards, err := newCardService(sender)
