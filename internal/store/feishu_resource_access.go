@@ -62,8 +62,9 @@ type FeishuBotResource struct {
 }
 
 // FeishuResourceAccessRequest is one globally identified access verification workflow.
-// OAuth state is stored only as a hash, and the PKCE verifier is cleared as soon as
-// the callback atomically claims the request.
+// OAuth state is stored only as a hash and cleared as soon as the callback atomically
+// claims the request. PKCEVerifier is retained only to identify requests created by
+// older versions and is cleared by the same claim.
 type FeishuResourceAccessRequest struct {
 	ID                  string
 	AccountID           string
@@ -240,7 +241,8 @@ func (s *Store) CreateFeishuResourceAccessRequest(request FeishuResourceAccessRe
 	return request, nil
 }
 
-// PrepareFeishuResourceAccessOAuth binds the one-time OAuth state and PKCE verifier.
+// PrepareFeishuResourceAccessOAuth binds the one-time OAuth state. verifier is kept
+// for compatibility with requests created by older PKCE-enabled versions.
 func (s *Store) PrepareFeishuResourceAccessOAuth(id, accountID, stateHash, verifier, subjectType, subjectID string, now time.Time) error {
 	id = strings.TrimSpace(id)
 	accountID = strings.TrimSpace(accountID)
@@ -248,8 +250,8 @@ func (s *Store) PrepareFeishuResourceAccessOAuth(id, accountID, stateHash, verif
 	verifier = strings.TrimSpace(verifier)
 	subjectType = strings.TrimSpace(subjectType)
 	subjectID = strings.TrimSpace(subjectID)
-	if id == "" || accountID == "" || stateHash == "" || verifier == "" || subjectType == "" || subjectID == "" {
-		return fmt.Errorf("feishu resource access id, account, oauth state, verifier, and subject are required")
+	if id == "" || accountID == "" || stateHash == "" || subjectType == "" || subjectID == "" {
+		return fmt.Errorf("feishu resource access id, account, oauth state, and subject are required")
 	}
 	now = normalizedWorkflowTime(now)
 	s.mu.Lock()
@@ -356,8 +358,9 @@ func (s *Store) ConsumeFeishuResourceAccessRequest(id, accountID, consumedByRequ
 	return fmt.Errorf("consume feishu resource access request: no row updated")
 }
 
-// ClaimFeishuResourceAccessOAuth atomically consumes a valid OAuth state and
-// returns the PKCE verifier to the caller. Both stored one-time values are cleared.
+// ClaimFeishuResourceAccessOAuth atomically consumes a valid OAuth state. A legacy
+// PKCE verifier is returned to the caller for compatibility detection, while both
+// stored one-time values are cleared.
 func (s *Store) ClaimFeishuResourceAccessOAuth(stateHash, accountID string, now time.Time) (FeishuResourceAccessRequest, error) {
 	if err := s.requireFeishuDocsStore(); err != nil {
 		return FeishuResourceAccessRequest{}, err
@@ -377,7 +380,7 @@ func (s *Store) ClaimFeishuResourceAccessOAuth(stateHash, accountID string, now 
 
 // ClaimFeishuResourceAccessOAuthFromCard atomically consumes a pending OAuth
 // request from the exact requester, chat, and card. stateHash is optional only
-// for a raw authorization-code submission; PKCE still binds that code to this request.
+// for a raw authorization-code submission from that bound card.
 func (s *Store) ClaimFeishuResourceAccessOAuthFromCard(id, accountID, stateHash string, match FeishuResourceAccessMatch, now time.Time) (FeishuResourceAccessRequest, error) {
 	if err := s.requireFeishuDocsStore(); err != nil {
 		return FeishuResourceAccessRequest{}, err
@@ -438,7 +441,7 @@ func (s *Store) claimFeishuResourceAccessOAuthRequest(
 		request.UpdatedAt = now
 		return request, ErrFeishuResourceAccessExpired
 	}
-	if request.OAuthStateHash == "" || request.PKCEVerifier == "" {
+	if request.OAuthStateHash == "" {
 		return request, ErrFeishuResourceAccessResolved
 	}
 	if validate != nil {
@@ -449,7 +452,7 @@ func (s *Store) claimFeishuResourceAccessOAuthRequest(
 	result, err := tx.Exec(
 		`UPDATE feishu_resource_access_requests
 		 SET state=?, oauth_state_hash='', pkce_verifier='', updated_at_ms=?
-		 WHERE id=? AND account_id=? AND state=? AND oauth_state_hash<>'' AND pkce_verifier<>''`,
+		 WHERE id=? AND account_id=? AND state=? AND oauth_state_hash<>''`,
 		FeishuResourceAccessStateExecuting, now.UnixMilli(), request.ID, request.AccountID, FeishuResourceAccessStatePending,
 	)
 	if err != nil {

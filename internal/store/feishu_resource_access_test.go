@@ -70,7 +70,7 @@ func TestFeishuResourceAccessOAuthLifecycleAndChatScopedGrant(t *testing.T) {
 	if !strings.HasPrefix(request.ID, "req_") || request.State != FeishuResourceAccessStatePending {
 		t.Fatalf("created request = %#v", request)
 	}
-	if err := st.PrepareFeishuResourceAccessOAuth(request.ID, request.AccountID, "state_hash", "pkce_verifier", "openid", "ou_bot", now.Add(time.Second)); err != nil {
+	if err := st.PrepareFeishuResourceAccessOAuth(request.ID, request.AccountID, "state_hash", "", "openid", "ou_bot", now.Add(time.Second)); err != nil {
 		t.Fatalf("PrepareFeishuResourceAccessOAuth returned error: %v", err)
 	}
 	if err := st.SetFeishuResourceAccessCardMessageID(request.ID, request.AccountID, "om_card", now.Add(2*time.Second)); err != nil {
@@ -80,7 +80,7 @@ func TestFeishuResourceAccessOAuthLifecycleAndChatScopedGrant(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClaimFeishuResourceAccessOAuth returned error: %v", err)
 	}
-	if claimed.State != FeishuResourceAccessStateExecuting || claimed.PKCEVerifier != "pkce_verifier" || claimed.SubjectID != "ou_bot" {
+	if claimed.State != FeishuResourceAccessStateExecuting || claimed.PKCEVerifier != "" || claimed.SubjectID != "ou_bot" {
 		t.Fatalf("claimed request = %#v", claimed)
 	}
 	stored, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
@@ -131,6 +131,41 @@ func TestFeishuResourceAccessOAuthLifecycleAndChatScopedGrant(t *testing.T) {
 	}
 	if _, active, err := st.ActiveFeishuResourceGrant(request.AccountID, "oc_other", request.ResourceType, request.ResourceToken, FeishuResourcePermissionRead); err != nil || active {
 		t.Fatalf("cross-chat grant active=%t err=%v, want false", active, err)
+	}
+}
+
+func TestFeishuResourceAccessOAuthClaimReturnsAndClearsLegacyPKCEVerifier(t *testing.T) {
+	st := openFeishuDocsTestStore(t)
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	request, err := st.CreateFeishuResourceAccessRequest(FeishuResourceAccessRequest{
+		AccountID:     "feishu:cli_test",
+		ActorOpenID:   "ou_requester",
+		ChatID:        "oc_chat",
+		ResourceType:  "docx",
+		ResourceToken: "doxcn_external",
+		Permission:    FeishuResourcePermissionWrite,
+		CreatedAt:     now,
+		ExpiresAt:     now.Add(10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("CreateFeishuResourceAccessRequest returned error: %v", err)
+	}
+	if err := st.PrepareFeishuResourceAccessOAuth(request.ID, request.AccountID, "legacy_state_hash", "legacy_pkce_verifier", "openid", "ou_bot", now); err != nil {
+		t.Fatalf("PrepareFeishuResourceAccessOAuth returned error: %v", err)
+	}
+	claimed, err := st.ClaimFeishuResourceAccessOAuth("legacy_state_hash", request.AccountID, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("ClaimFeishuResourceAccessOAuth returned error: %v", err)
+	}
+	if claimed.PKCEVerifier != "legacy_pkce_verifier" {
+		t.Fatalf("claimed legacy verifier = %q", claimed.PKCEVerifier)
+	}
+	stored, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil {
+		t.Fatalf("GetFeishuResourceAccessRequest returned error: %v", err)
+	}
+	if stored.PKCEVerifier != "" || stored.OAuthStateHash != "" || stored.State != FeishuResourceAccessStateExecuting {
+		t.Fatalf("claimed legacy request retained one-time values: %#v", stored)
 	}
 }
 
@@ -242,7 +277,7 @@ func TestFeishuResourceAccessOAuthCardClaimValidatesContextStateAndExpiry(t *tes
 		t.Fatalf("wrong state claim error = %v, want ErrFeishuResourceAccessOAuthStateMismatch", err)
 	}
 	pending, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
-	if err != nil || pending.State != FeishuResourceAccessStatePending || pending.OAuthStateHash == "" || pending.PKCEVerifier == "" {
+	if err != nil || pending.State != FeishuResourceAccessStatePending || pending.OAuthStateHash == "" || pending.PKCEVerifier != "" {
 		t.Fatalf("rejected card claims changed pending request = %#v err=%v", pending, err)
 	}
 
@@ -250,7 +285,7 @@ func TestFeishuResourceAccessOAuthCardClaimValidatesContextStateAndExpiry(t *tes
 	if err != nil {
 		t.Fatalf("ClaimFeishuResourceAccessOAuthFromCard returned error: %v", err)
 	}
-	if claimed.State != FeishuResourceAccessStateExecuting || claimed.PKCEVerifier != request.PKCEVerifier || claimed.OAuthStateHash != "" {
+	if claimed.State != FeishuResourceAccessStateExecuting || claimed.PKCEVerifier != "" || claimed.OAuthStateHash != "" {
 		t.Fatalf("claimed card request = %#v", claimed)
 	}
 	stored, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
@@ -378,14 +413,13 @@ func createPendingFeishuResourceAccess(t *testing.T, st *Store, now time.Time) F
 		t.Fatalf("CreateFeishuResourceAccessRequest returned error: %v", err)
 	}
 	stateHash := "hash_" + request.ID
-	if err := st.PrepareFeishuResourceAccessOAuth(request.ID, request.AccountID, stateHash, "verifier_"+request.ID, "openid", "ou_bot", now); err != nil {
+	if err := st.PrepareFeishuResourceAccessOAuth(request.ID, request.AccountID, stateHash, "", "openid", "ou_bot", now); err != nil {
 		t.Fatalf("PrepareFeishuResourceAccessOAuth returned error: %v", err)
 	}
 	if err := st.SetFeishuResourceAccessCardMessageID(request.ID, request.AccountID, "card_"+request.ID, now); err != nil {
 		t.Fatalf("SetFeishuResourceAccessCardMessageID returned error: %v", err)
 	}
 	request.OAuthStateHash = stateHash
-	request.PKCEVerifier = "verifier_" + request.ID
 	request.SubjectType = "openid"
 	request.SubjectID = "ou_bot"
 	request.CardMessageID = "card_" + request.ID
