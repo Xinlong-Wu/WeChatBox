@@ -23,7 +23,7 @@ func TestWorkflowContinuationResultBeforeOriginCommit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StoreWorkflowResult returned error: %v", err)
 	}
-	if ready || pending.State != WorkflowContinuationStateWaiting || pending.CommittedRevision != -1 {
+	if ready || pending.State != WorkflowContinuationStateWaiting || pending.CommittedRevision != -1 || !pending.ChatIsGroup {
 		t.Fatalf("continuation after early result = %#v ready=%v, want uncommitted waiting", pending, ready)
 	}
 	if stored.State != WorkflowResultStateSucceeded || string(stored.Payload) != `{"status":"granted"}` {
@@ -392,6 +392,7 @@ func attachWorkflowContinuationForTest(t *testing.T, st *Store, requestID, accou
 		UserKey:         "feishu:ou_requester",
 		SessionID:       "session-work",
 		ChatID:          "oc_chat",
+		ChatIsGroup:     true,
 		SourceMessageID: "om_source",
 		ActorOpenID:     "ou_requester",
 		ActorUserID:     "u_requester",

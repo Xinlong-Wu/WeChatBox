@@ -233,6 +233,66 @@ func TestOpenMigratesUserModelPreferenceToExistingSessions(t *testing.T) {
 	}
 }
 
+func TestOpenAddsWorkflowContinuationChatTypeColumn(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dataDir, err := config.EnsurePlatformDataDir(PlatformFeishu)
+	if err != nil {
+		t.Fatalf("EnsurePlatformDataDir returned error: %v", err)
+	}
+	dbPath := filepath.Join(dataDir, "lingobridge.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open returned error: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE workflow_continuations (
+		request_id TEXT PRIMARY KEY,
+		account_id TEXT NOT NULL,
+		platform TEXT NOT NULL,
+		user_key TEXT NOT NULL,
+		session_id TEXT NOT NULL,
+		chat_id TEXT NOT NULL DEFAULT '',
+		source_message_id TEXT NOT NULL DEFAULT '',
+		actor_open_id TEXT NOT NULL DEFAULT '',
+		actor_user_id TEXT NOT NULL DEFAULT '',
+		origin_revision INTEGER NOT NULL,
+		committed_revision INTEGER NOT NULL DEFAULT -1,
+		origin_turn_id TEXT NOT NULL,
+		tool_call_id TEXT NOT NULL,
+		tool_name TEXT NOT NULL,
+		state TEXT NOT NULL,
+		attempts INTEGER NOT NULL DEFAULT 0,
+		available_at_ms INTEGER NOT NULL,
+		lease_token TEXT NOT NULL DEFAULT '',
+		lease_expires_at_ms INTEGER NOT NULL DEFAULT 0,
+		last_error TEXT NOT NULL DEFAULT '',
+		created_at_ms INTEGER NOT NULL,
+		updated_at_ms INTEGER NOT NULL
+	)`); err != nil {
+		db.Close()
+		t.Fatalf("create legacy workflow continuations returned error: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close returned error: %v", err)
+	}
+
+	st, err := Open(PlatformFeishu)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+	})
+	hasColumn, err := st.tableHasColumn("workflow_continuations", "chat_is_group")
+	if err != nil {
+		t.Fatalf("tableHasColumn returned error: %v", err)
+	}
+	if !hasColumn {
+		t.Fatal("workflow_continuations.chat_is_group was not added")
+	}
+}
+
 func TestSaveAccountRequiresMatchingPlatform(t *testing.T) {
 	st := openTestStore(t)
 

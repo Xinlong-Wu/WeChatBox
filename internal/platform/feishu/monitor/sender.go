@@ -52,6 +52,10 @@ func (s *sdkSender) CreateText(ctx context.Context, chatID, text string) (string
 	return s.createText(ctx, chatID, text, true)
 }
 
+func (s *sdkSender) CreateTextWithUUID(ctx context.Context, chatID, text, uuid string) (string, error) {
+	return s.createTextWithUUID(ctx, chatID, text, strings.TrimSpace(uuid), true)
+}
+
 func (s *sdkSender) CreateReplyText(ctx context.Context, replyToMessageID, text string) (string, error) {
 	body, err := marshalRichTextContent(text)
 	if err != nil {
@@ -108,17 +112,24 @@ func (s *sdkSender) CreateCard(ctx context.Context, chatID, cardJSON string) (st
 }
 
 func (s *sdkSender) createText(ctx context.Context, chatID, text string, requireMessageID bool) (string, error) {
+	return s.createTextWithUUID(ctx, chatID, text, "", requireMessageID)
+}
+
+func (s *sdkSender) createTextWithUUID(ctx context.Context, chatID, text, uuid string, requireMessageID bool) (string, error) {
 	body, err := marshalRichTextContent(text)
 	if err != nil {
 		return "", fmt.Errorf("marshal feishu rich text content: %w", err)
 	}
+	bodyBuilder := larkim.NewCreateMessageReqBodyBuilder().
+		ReceiveId(chatID).
+		MsgType(larkim.MsgTypePost).
+		Content(body)
+	if uuid != "" {
+		bodyBuilder = bodyBuilder.Uuid(uuid)
+	}
 	req := larkim.NewCreateMessageReqBuilder().
 		ReceiveIdType("chat_id").
-		Body(larkim.NewCreateMessageReqBodyBuilder().
-			ReceiveId(chatID).
-			MsgType(larkim.MsgTypePost).
-			Content(body).
-			Build()).
+		Body(bodyBuilder.Build()).
 		Build()
 	resp, err := s.client.Im.Message.Create(ctx, req)
 	if err != nil {

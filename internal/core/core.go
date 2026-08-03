@@ -309,6 +309,9 @@ func (b *Bot) replyInSession(ctx context.Context, msg InboundMessage, sender Sen
 		conv = &store.Conversation{}
 	}
 	expectedRevision := conv.Revision
+	if userMsg.Internal != nil {
+		userMsg.Internal.CommittedRevision = expectedRevision + 1
+	}
 	if len(msg.Tools) > 0 {
 		var execution tooltypes.ExecutionContext
 		ctx, execution, err = bindToolExecutionContext(ctx, msg, sess.ID, expectedRevision)
@@ -576,6 +579,7 @@ func (b *Bot) chatWithTools(ctx context.Context, client llm.ToolCallingClient, p
 			totalCalls++
 			result, trace, toolErr := runTool(ctx, lookup[call.Name], call, options.Timeout, options.ResultLimit)
 			if requestID := strings.TrimSpace(result.PendingWorkflowID); requestID != "" {
+				trace.PendingWorkflowID = requestID
 				if _, exists := pendingWorkflowSet[requestID]; !exists {
 					pendingWorkflowSet[requestID] = struct{}{}
 					pendingWorkflowIDs = append(pendingWorkflowIDs, requestID)

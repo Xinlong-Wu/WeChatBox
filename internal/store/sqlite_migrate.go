@@ -54,6 +54,7 @@ func (s *Store) migrate() error {
 			user_key TEXT NOT NULL,
 			session_id TEXT NOT NULL,
 			chat_id TEXT NOT NULL DEFAULT '',
+			chat_is_group INTEGER NOT NULL DEFAULT 0,
 			source_message_id TEXT NOT NULL DEFAULT '',
 			actor_open_id TEXT NOT NULL DEFAULT '',
 			actor_user_id TEXT NOT NULL DEFAULT '',
@@ -195,6 +196,9 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if err := s.ensureFeishuResourceAccessConsumptionColumns(); err != nil {
+		return err
+	}
+	if err := s.ensureWorkflowContinuationContextColumns(); err != nil {
 		return err
 	}
 	if _, err := s.db.Exec(
@@ -358,6 +362,20 @@ func (s *Store) ensureFeishuResourceAccessConsumptionColumns() error {
 		if _, err := s.db.Exec(`ALTER TABLE feishu_resource_access_requests ADD COLUMN consumed_at_ms INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return fmt.Errorf("add feishu resource access consumed timestamp column: %w", err)
 		}
+	}
+	return nil
+}
+
+func (s *Store) ensureWorkflowContinuationContextColumns() error {
+	hasChatIsGroup, err := s.tableHasColumn("workflow_continuations", "chat_is_group")
+	if err != nil {
+		return fmt.Errorf("inspect workflow continuation context schema: %w", err)
+	}
+	if hasChatIsGroup {
+		return nil
+	}
+	if _, err := s.db.Exec(`ALTER TABLE workflow_continuations ADD COLUMN chat_is_group INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return fmt.Errorf("add workflow continuation chat type column: %w", err)
 	}
 	return nil
 }

@@ -771,7 +771,8 @@ revision zero and receive revision one on their next successful save.
 
 Asynchronous approval and authorization workflows persist one sanitized
 terminal result per global request ID plus a continuation bound to the trusted
-account, user, session, chat, actor, source message, origin turn, and tool call.
+account, user, session, chat type, actor, source message, origin turn, and tool
+call.
 The origin conversation revision is committed only after its CAS save. A
 terminal result can arrive before or after that commit; the continuation becomes
 resumable only when both exist. Ready work is leased while processing, and an
@@ -787,6 +788,30 @@ At startup, LingoBridge also reconciles terminal approval/resource records that
 are missing a result because the process stopped between the workflow-specific
 state update and result insertion. Recovered operation results deliberately do
 not guess or replay a possibly completed remote write.
+
+Each Feishu account runs a continuation worker while Docs tools are enabled.
+The worker scans ready work and expired processing leases, claims one durable
+lease, and enters the exact original session lane without waiting for another
+user message. It loads that session's current model selection and latest
+conversation revision at execution time, so
+changing models while a card is pending affects the resumed turn without moving
+the workflow to another session. An archived/deleted target session cancels the
+continuation; transient model, tool, storage, or delivery failures use bounded
+backoff retries and eventually become failed.
+
+The resumed turn receives a runtime-generated workflow-result event with a
+per-turn attestation in the system prompt. The event payload is treated as data,
+not instructions, and ordinary user text cannot set its internal JSONL marker.
+The normal tool loop remains available, so a successful resource grant can
+continue the original operation; a completed side-effecting operation is not
+executed again. The resumed user/assistant pair is saved through the normal
+conversation CAS before any reply is sent. Its internal event ID, exact
+committed revision, and any newly pending workflow IDs are retained in JSONL,
+allowing a retry to reconcile a chained workflow against the revision that
+created it and replay the already committed assistant response without calling
+the model again. Automatic resume suppresses compaction progress notices so the
+persisted assistant chunks keep the same deterministic Feishu message UUID
+positions across partial delivery retries.
 
 An asynchronous tool returns its request ID to core as runtime-only result
 metadata; that ID is not part of the model-visible tool JSON. The Feishu manager

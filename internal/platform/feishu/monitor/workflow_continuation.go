@@ -55,6 +55,7 @@ func persistWorkflowContinuation(creator workflowContinuationCreator, execution 
 		UserKey:         execution.UserKey,
 		SessionID:       execution.SessionID,
 		ChatID:          execution.ChatID,
+		ChatIsGroup:     execution.ChatIsGroup,
 		SourceMessageID: execution.SourceMessageID,
 		ActorOpenID:     execution.ActorOpenID,
 		ActorUserID:     execution.ActorUserID,

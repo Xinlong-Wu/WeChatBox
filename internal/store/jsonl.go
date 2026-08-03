@@ -26,21 +26,32 @@ type Attachment struct {
 
 // Message represents a single chat message stored in conversation history.
 type Message struct {
-	Role        string       `json:"role"`
-	Content     string       `json:"content"`
-	Attachments []Attachment `json:"attachments,omitempty"`
-	ToolTraces  []ToolTrace  `json:"tool_traces,omitempty"`
+	Role        string         `json:"role"`
+	Content     string         `json:"content"`
+	Attachments []Attachment   `json:"attachments,omitempty"`
+	ToolTraces  []ToolTrace    `json:"tool_traces,omitempty"`
+	Internal    *InternalEvent `json:"internal_event,omitempty"`
+}
+
+// InternalEvent marks a runtime-originated conversation event. User input does
+// not populate this field; it is used to make asynchronous workflow resumption
+// idempotent even when the process stops after saving the resumed turn.
+type InternalEvent struct {
+	Kind              string `json:"kind"`
+	ID                string `json:"id"`
+	CommittedRevision int64  `json:"committed_revision,omitempty"`
 }
 
 // ToolTrace is a compact audit record for tool use during one assistant turn.
 type ToolTrace struct {
-	CallID         string `json:"call_id,omitempty"`
-	Name           string `json:"name"`
-	Status         string `json:"status"`
-	Arguments      string `json:"arguments,omitempty"`
-	Result         string `json:"result,omitempty"`
-	Error          string `json:"error,omitempty"`
-	DurationMillis int64  `json:"duration_ms,omitempty"`
+	CallID            string `json:"call_id,omitempty"`
+	Name              string `json:"name"`
+	Status            string `json:"status"`
+	Arguments         string `json:"arguments,omitempty"`
+	Result            string `json:"result,omitempty"`
+	Error             string `json:"error,omitempty"`
+	PendingWorkflowID string `json:"pending_workflow_id,omitempty"`
+	DurationMillis    int64  `json:"duration_ms,omitempty"`
 }
 
 // ProviderContext stores opaque provider-native context items for one model profile.

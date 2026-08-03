@@ -161,6 +161,53 @@ func TestSDKSenderCreatesTextAndReturnsMessageID(t *testing.T) {
 	}
 }
 
+func TestSDKSenderCreatesTextWithIdempotencyUUID(t *testing.T) {
+	var messageRequest struct {
+		ReceiveID string `json:"receive_id"`
+		MsgType   string `json:"msg_type"`
+		Content   string `json:"content"`
+		UUID      string `json:"uuid"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/v3/token", "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "ok",
+				"tenant_access_token": "tenant-token",
+				"expire":              7200,
+			})
+		case "/open-apis/im/v1/messages":
+			if err := json.NewDecoder(r.Body).Decode(&messageRequest); err != nil {
+				t.Fatalf("decode message request: %v", err)
+			}
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{"message_id": "om_resume"},
+			})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	sender := &sdkSender{client: client}
+	uuid := "75540b86-28aa-4a80-a257-9ce76a69fef4"
+	messageID, err := sender.CreateTextWithUUID(t.Context(), "oc_chat", "resumed", uuid)
+	if err != nil {
+		t.Fatalf("CreateTextWithUUID returned error: %v", err)
+	}
+	if messageID != "om_resume" || messageRequest.ReceiveID != "oc_chat" || messageRequest.UUID != uuid {
+		t.Fatalf("messageID/request = %q/%#v", messageID, messageRequest)
+	}
+}
+
 func TestSDKSenderCreatesInteractiveCardAndReturnsMessageID(t *testing.T) {
 	var messageRequest struct {
 		ReceiveID string `json:"receive_id"`

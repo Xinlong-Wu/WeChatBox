@@ -114,6 +114,19 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 			return fmt.Errorf("register feishu tool approval executors for account %s: %w", acc.Name, err)
 		}
 	}
+	if docsToolsEnabled(p.config.Tools) {
+		if resumer, ok := handler.(core.WorkflowResumer); ok {
+			worker, workerErr := newWorkflowContinuationWorker(p.store, resumer, sender, acc, tools)
+			if workerErr != nil {
+				return fmt.Errorf("initialize feishu workflow continuation worker for account %s: %w", acc.Name, workerErr)
+			}
+			workerCtx, stopWorker := context.WithCancel(ctx)
+			defer stopWorker()
+			go worker.Run(workerCtx)
+		} else {
+			feishuLog.Warn(ctx, "feishu workflow continuation worker disabled because handler does not support resumption account=%s", acc.ID)
+		}
+	}
 	if names := toolNames(tools); len(names) > 0 {
 		feishuLog.Info(ctx, "registered tools for account %s (%s): %s", acc.Name, acc.ID, strings.Join(names, ", "))
 	} else {

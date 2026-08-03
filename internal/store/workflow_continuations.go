@@ -55,6 +55,7 @@ type WorkflowContinuation struct {
 	UserKey           string
 	SessionID         string
 	ChatID            string
+	ChatIsGroup       bool
 	SourceMessageID   string
 	ActorOpenID       string
 	ActorUserID       string
@@ -74,7 +75,7 @@ type WorkflowContinuation struct {
 }
 
 const workflowContinuationSelect = `SELECT request_id, account_id, platform, user_key, session_id,
-	chat_id, source_message_id, actor_open_id, actor_user_id,
+	chat_id, chat_is_group, source_message_id, actor_open_id, actor_user_id,
 	origin_revision, committed_revision, origin_turn_id, tool_call_id, tool_name,
 	state, attempts, available_at_ms, lease_token, lease_expires_at_ms, last_error,
 	created_at_ms, updated_at_ms
@@ -107,17 +108,18 @@ func (s *Store) CreateWorkflowContinuation(continuation WorkflowContinuation) (W
 	_, err = tx.Exec(
 		`INSERT INTO workflow_continuations (
 			request_id, account_id, platform, user_key, session_id,
-			chat_id, source_message_id, actor_open_id, actor_user_id,
+			chat_id, chat_is_group, source_message_id, actor_open_id, actor_user_id,
 			origin_revision, committed_revision, origin_turn_id, tool_call_id, tool_name,
 			state, attempts, available_at_ms, lease_token, lease_expires_at_ms, last_error,
 			created_at_ms, updated_at_ms
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, -1, ?, ?, ?, ?, 0, ?, '', 0, '', ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, -1, ?, ?, ?, ?, 0, ?, '', 0, '', ?, ?)`,
 		continuation.RequestID,
 		continuation.AccountID,
 		continuation.Platform,
 		continuation.UserKey,
 		continuation.SessionID,
 		continuation.ChatID,
+		continuation.ChatIsGroup,
 		continuation.SourceMessageID,
 		continuation.ActorOpenID,
 		continuation.ActorUserID,
@@ -343,9 +345,10 @@ func (s *Store) RetryWorkflowContinuation(requestID, accountID, leaseToken strin
 	)
 }
 
-// CompleteWorkflowContinuation marks a leased continuation delivered or failed.
+// CompleteWorkflowContinuation marks a leased continuation delivered, canceled,
+// or failed.
 func (s *Store) CompleteWorkflowContinuation(requestID, accountID, leaseToken, state, lastError string, now time.Time) error {
-	if state != WorkflowContinuationStateDelivered && state != WorkflowContinuationStateFailed {
+	if state != WorkflowContinuationStateDelivered && state != WorkflowContinuationStateCanceled && state != WorkflowContinuationStateFailed {
 		return fmt.Errorf("unsupported workflow continuation completion state %q", state)
 	}
 	return s.updateLeasedWorkflowContinuation(
@@ -597,9 +600,10 @@ func prepareWorkflowContinuation(continuation WorkflowContinuation) (WorkflowCon
 	continuation.LeaseExpiresAt = time.Time{}
 	continuation.LastError = ""
 	if continuation.RequestID == "" || continuation.AccountID == "" || continuation.Platform == "" ||
-		continuation.UserKey == "" || continuation.SessionID == "" || continuation.OriginTurnID == "" ||
+		continuation.UserKey == "" || continuation.SessionID == "" || continuation.ChatID == "" || continuation.SourceMessageID == "" ||
+		(continuation.ActorOpenID == "" && continuation.ActorUserID == "") || continuation.OriginTurnID == "" ||
 		continuation.ToolCallID == "" || continuation.ToolName == "" || continuation.OriginRevision < 0 {
-		return WorkflowContinuation{}, fmt.Errorf("workflow continuation request, account, platform, user, session, origin revision/turn, tool call, and tool name are required")
+		return WorkflowContinuation{}, fmt.Errorf("workflow continuation request, account, platform, user, session, chat/message, actor, origin revision/turn, tool call, and tool name are required")
 	}
 	return continuation, nil
 }
@@ -689,6 +693,7 @@ func scanWorkflowContinuation(row workflowContinuationScanner) (WorkflowContinua
 		&continuation.UserKey,
 		&continuation.SessionID,
 		&continuation.ChatID,
+		&continuation.ChatIsGroup,
 		&continuation.SourceMessageID,
 		&continuation.ActorOpenID,
 		&continuation.ActorUserID,
