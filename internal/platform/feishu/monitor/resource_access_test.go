@@ -485,7 +485,7 @@ func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 		"sdk_pkce_matches=true",
 		"sdk_redirect_matches=true",
 		"challenge_length=43",
-		"verifier_length=64",
+		"verifier_length=43",
 		"scope_count=2",
 		"access_token_present=true",
 	}
@@ -733,6 +733,26 @@ func TestResourceAccessPKCEChallengeRFC7636Vector(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("resourceAccessPKCEChallenge = %q, want %q", got, want)
+	}
+}
+
+func TestNewResourceAccessOAuthValuesUsesRecommendedVerifierLength(t *testing.T) {
+	state, stateHash, verifier, challenge, err := newResourceAccessOAuthValues()
+	if err != nil {
+		t.Fatalf("newResourceAccessOAuthValues returned error: %v", err)
+	}
+	if len(state) != 43 || stateHash != hashResourceAccessState(state) {
+		t.Fatalf("OAuth state length/hash = %d/%q", len(state), stateHash)
+	}
+	if len(verifier) != 43 {
+		t.Fatalf("PKCE verifier length = %d, want 43", len(verifier))
+	}
+	wantChallenge, err := resourceAccessPKCEChallenge(verifier)
+	if err != nil {
+		t.Fatalf("derive PKCE challenge: %v", err)
+	}
+	if challenge != wantChallenge || len(challenge) != 43 {
+		t.Fatalf("PKCE challenge = %q (length %d), want %q", challenge, len(challenge), wantChallenge)
 	}
 }
 

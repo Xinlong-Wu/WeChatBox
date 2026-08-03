@@ -1286,7 +1286,7 @@ func newResourceAccessOAuthValues() (state, stateHash, verifier, challenge strin
 	if err != nil {
 		return "", "", "", "", err
 	}
-	verifier, err = randomBase64URL(48)
+	verifier, err = randomBase64URL(32)
 	if err != nil {
 		return "", "", "", "", err
 	}
