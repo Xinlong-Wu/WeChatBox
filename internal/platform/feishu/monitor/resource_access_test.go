@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -195,6 +196,56 @@ func TestResourceAccessOAuthCardCodeHandoffGrantsWithoutListener(t *testing.T) {
 	testResourceAccessOAuthCompletion(t, "card_code")
 }
 
+func TestResourceAccessOAuthPKCEFailureRequiresNewRequest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/oauth/v3/token" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		writeResourceAccessJSON(t, w, map[string]any{
+			"code":              20049,
+			"error":             "invalid_grant",
+			"error_description": "PKCE code challenge failed.",
+		})
+	}))
+	defer server.Close()
+
+	oauth := resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	}
+	manager, st, sender := newTestResourceAccessManager(t, server, oauth)
+	result, err := manager.RequestAccess(approvalRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType:  "docx",
+		ResourceToken: "doxcn_external",
+		Permission:    feishutools.ResourcePermissionWrite,
+	})
+	if err != nil {
+		t.Fatalf("RequestAccess returned error: %v", err)
+	}
+	cards, _, _ := sender.snapshot()
+	if len(cards) != 1 {
+		t.Fatalf("sent cards = %#v", cards)
+	}
+	state := resourceAccessCardState(t, cards[0].text)
+	recorder := httptest.NewRecorder()
+	callbackRequest := httptest.NewRequest(http.MethodGet, "/feishu/oauth/callback?code=auth-code&state="+url.QueryEscape(state), nil)
+	manager.HandleOAuthCallback(recorder, callbackRequest)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "PKCE verification failed") {
+		t.Fatalf("callback response = %d %q", recorder.Code, recorder.Body.String())
+	}
+	failed, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
+	if err != nil || failed.State != store.FeishuResourceAccessStateFailed || failed.PKCEVerifier != "" || failed.OAuthStateHash != "" {
+		t.Fatalf("failed request = %#v err=%v", failed, err)
+	}
+	_, updates, messages := sender.snapshot()
+	if len(updates) != 1 || updates[0].messageID != "om_card" || !strings.Contains(updates[0].text, "PKCE 校验失败") ||
+		len(messages) != 1 || !strings.Contains(messages[0].text, feishutools.ResourceAccessToolName) || !strings.Contains(messages[0].text, "最新授权卡片") {
+		t.Fatalf("updates/messages = %#v/%#v", updates, messages)
+	}
+}
+
 func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 	t.Helper()
 	var mu sync.Mutex
@@ -305,17 +356,31 @@ func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 	if err != nil || storedPending.OAuthStateHash == "" || storedPending.OAuthStateHash == state || storedPending.PKCEVerifier == "" {
 		t.Fatalf("stored pending request = %#v err=%v", storedPending, err)
 	}
+	expectedChallenge, err := resourceAccessPKCEChallenge(storedPending.PKCEVerifier)
+	if err != nil {
+		t.Fatalf("derive stored PKCE challenge: %v", err)
+	}
+	if got := parsedAuthURL.Query().Get("code_challenge"); got != expectedChallenge {
+		t.Fatalf("authorization PKCE challenge = %q, want %q", got, expectedChallenge)
+	}
+
+	expectedCode := "auth-code"
+	encodedCallbackCode := "auth-code"
+	if mode == "http" || mode == "card_url" {
+		expectedCode = "auth+code/%value"
+		encodedCallbackCode = "auth+code%2F%25value"
+	}
 
 	switch mode {
 	case "http":
 		recorder := httptest.NewRecorder()
-		callbackRequest := httptest.NewRequest(http.MethodGet, "/feishu/oauth/callback?code=auth-code&state="+url.QueryEscape(state), nil)
+		callbackRequest := httptest.NewRequest(http.MethodGet, "/feishu/oauth/callback?code="+encodedCallbackCode+"&state="+url.QueryEscape(state), nil)
 		manager.HandleOAuthCallback(recorder, callbackRequest)
 		if recorder.Code != http.StatusSeeOther || recorder.Header().Get("Location") != result.ResourceURL {
 			t.Fatalf("callback response status/location = %d/%q", recorder.Code, recorder.Header().Get("Location"))
 		}
 	case "card_url":
-		callbackURL := oauth.CallbackURL + "?code=auth-code&state=" + url.QueryEscape(state)
+		callbackURL := oauth.CallbackURL + "?code=" + encodedCallbackCode + "&state=" + url.QueryEscape(state)
 		response, err := manager.HandleCardAction(context.Background(), resourceAccessCardSubmitEvent(result.RequestID, "ou_requester", "oc_chat", "om_card", callbackURL))
 		if err != nil || response == nil || response.Toast == nil || response.Toast.Type != "success" {
 			t.Fatalf("card URL handoff response = %#v err=%v", response, err)
@@ -335,7 +400,7 @@ func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 	calls := []int{userInfoCalls, permissionCalls, verifyCalls}
 	mu.Unlock()
 	if gotTokenBody["grant_type"] != "authorization_code" || gotTokenBody["client_id"] != "cli_xxx" || gotTokenBody["client_secret"] != "secret" ||
-		gotTokenBody["code"] != "auth-code" || gotTokenBody["redirect_uri"] != oauth.CallbackURL || strings.TrimSpace(stringValue(gotTokenBody["code_verifier"])) == "" {
+		gotTokenBody["code"] != expectedCode || gotTokenBody["redirect_uri"] != oauth.CallbackURL || strings.TrimSpace(stringValue(gotTokenBody["code_verifier"])) == "" {
 		t.Fatalf("OAuth token body = %#v", gotTokenBody)
 	}
 	if gotPermissionBody["member_type"] != "openid" || gotPermissionBody["member_id"] != "ou_bot" || gotPermissionBody["perm"] != "edit" || gotPermissionBody["type"] != "user" {
@@ -567,6 +632,36 @@ func TestParseResourceAccessOAuthSubmissionValidatesURLAndRawCode(t *testing.T) 
 		t.Run(test.name, func(t *testing.T) {
 			if _, err := manager.parseResourceAccessOAuthSubmission(test.value); err == nil {
 				t.Fatalf("parseResourceAccessOAuthSubmission(%q) returned no error", test.name)
+			}
+		})
+	}
+}
+
+func TestResourceAccessPKCEChallengeRFC7636Vector(t *testing.T) {
+	const verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	const want = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+	got, err := resourceAccessPKCEChallenge(verifier)
+	if err != nil {
+		t.Fatalf("resourceAccessPKCEChallenge returned error: %v", err)
+	}
+	if got != want {
+		t.Fatalf("resourceAccessPKCEChallenge = %q, want %q", got, want)
+	}
+}
+
+func TestResourceAccessPKCEChallengeRejectsInvalidVerifier(t *testing.T) {
+	tests := []struct {
+		name     string
+		verifier string
+	}{
+		{name: "too short", verifier: strings.Repeat("a", 42)},
+		{name: "too long", verifier: strings.Repeat("a", 129)},
+		{name: "invalid character", verifier: strings.Repeat("a", 42) + "+"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := resourceAccessPKCEChallenge(test.verifier); !errors.Is(err, errInvalidResourceAccessPKCEVerifier) {
+				t.Fatalf("resourceAccessPKCEChallenge error = %v, want invalid verifier", err)
 			}
 		})
 	}

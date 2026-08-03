@@ -16,6 +16,7 @@ import (
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
+	"github.com/larksuite/oapi-sdk-go/v3/core/accesstoken"
 	"github.com/larksuite/oapi-sdk-go/v3/core/accesstoken/authorizationcode"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkdrive "github.com/larksuite/oapi-sdk-go/v3/service/drive/v1"
@@ -31,6 +32,8 @@ const (
 
 	resourceAccessOAuthScope = "auth:user.id:read docs:permission.member:create"
 )
+
+var errInvalidResourceAccessPKCEVerifier = errors.New("invalid feishu resource access PKCE verifier")
 
 type resourceAccessStore interface {
 	PlatformID() string
@@ -292,9 +295,10 @@ func (m *resourceAccessManager) RequestAccess(ctx context.Context, input feishut
 		return feishutools.ResourceAccessResult{}, fmt.Errorf("bind feishu resource access card: %w", err)
 	}
 	request.CardMessageID = messageID
-	feishuLog.Info(ctx, "requested feishu resource access request=%s account=%s user=%s chat=%s type=%s resource_ref=%s permission=%s expires_at=%s",
+	feishuLog.Info(ctx, "requested feishu resource access request=%s account=%s user=%s chat=%s type=%s resource_ref=%s permission=%s pkce_ref=%s pkce_verifier_length=%d expires_at=%s",
 		shortRequestID(request.ID), request.AccountID, resourceAccessActorID(request), request.ChatID,
-		request.ResourceType, shortResourceRef(request.ResourceToken), request.Permission, request.ExpiresAt.Format(time.RFC3339))
+		request.ResourceType, shortResourceRef(request.ResourceToken), request.Permission,
+		shortResourceRef(challenge), len(verifier), request.ExpiresAt.Format(time.RFC3339))
 	result.ExpiresAt = request.ExpiresAt
 	result.Message = "已向当前飞书用户发送资源授权卡片。请在卡片中打开飞书官方授权页；如果浏览器无法直接回调 LingoBridge，请复制地址栏中的完整回调 URL（或授权码）粘贴到原卡片并提交。完成核验后机器人会更新卡片并通知当前对话。"
 	return result, nil
@@ -468,6 +472,11 @@ type resourceAccessOAuthSubmission struct {
 	Response  resourceAccessOAuthResponse
 }
 
+type resourceAccessOAuthQuery struct {
+	State    string
+	Response resourceAccessOAuthResponse
+}
+
 type resourceAccessOAuthCompletionError struct {
 	cause        error
 	httpStatus   int
@@ -510,25 +519,14 @@ func (m *resourceAccessManager) parseResourceAccessOAuthSubmission(raw string) (
 			normalizedOAuthCallbackPath(submitted) != normalizedOAuthCallbackPath(configured) {
 			return resourceAccessOAuthSubmission{}, fmt.Errorf("授权回调 URL 与当前机器人配置不匹配。")
 		}
-		query := submitted.Query()
-		if len(query["state"]) != 1 || strings.TrimSpace(query.Get("state")) == "" {
-			return resourceAccessOAuthSubmission{}, fmt.Errorf("授权回调 URL 缺少有效的 state，请重新发起授权。")
-		}
-		if len(query["code"]) > 1 || len(query["error"]) > 1 {
-			return resourceAccessOAuthSubmission{}, fmt.Errorf("授权回调 URL 包含重复的授权结果参数，请重新发起授权。")
-		}
-		code := strings.TrimSpace(query.Get("code"))
-		oauthError := strings.TrimSpace(query.Get("error"))
-		if (code == "") == (oauthError == "") {
-			return resourceAccessOAuthSubmission{}, fmt.Errorf("授权回调 URL 必须且只能包含授权码或 OAuth 错误。")
+		query, err := parseResourceAccessOAuthQuery(submitted.RawQuery)
+		if err != nil {
+			return resourceAccessOAuthSubmission{}, err
 		}
 		return resourceAccessOAuthSubmission{
 			InputKind: "url",
-			StateHash: hashResourceAccessState(strings.TrimSpace(query.Get("state"))),
-			Response: resourceAccessOAuthResponse{
-				Code:  code,
-				Error: oauthError,
-			},
+			StateHash: hashResourceAccessState(query.State),
+			Response:  query.Response,
 		}, nil
 	}
 	if strings.ContainsAny(raw, " \t\r\n") {
@@ -538,6 +536,57 @@ func (m *resourceAccessManager) parseResourceAccessOAuthSubmission(raw string) (
 		InputKind: "code",
 		Response:  resourceAccessOAuthResponse{Code: raw},
 	}, nil
+}
+
+func parseResourceAccessOAuthQuery(rawQuery string) (resourceAccessOAuthQuery, error) {
+	values := map[string][]string{
+		"state": nil,
+		"code":  nil,
+		"error": nil,
+	}
+	for _, field := range strings.Split(rawQuery, "&") {
+		if field == "" {
+			continue
+		}
+		rawKey, rawValue, _ := strings.Cut(field, "=")
+		key, err := url.PathUnescape(rawKey)
+		if err != nil {
+			return resourceAccessOAuthQuery{}, fmt.Errorf("授权回调 URL 包含无效的查询参数编码。")
+		}
+		if _, tracked := values[key]; !tracked {
+			continue
+		}
+		value, err := url.PathUnescape(rawValue)
+		if err != nil {
+			return resourceAccessOAuthQuery{}, fmt.Errorf("授权回调 URL 包含无效的查询参数编码。")
+		}
+		values[key] = append(values[key], value)
+	}
+	if len(values["state"]) != 1 || strings.TrimSpace(values["state"][0]) == "" {
+		return resourceAccessOAuthQuery{}, fmt.Errorf("授权回调 URL 缺少有效的 state，请重新发起授权。")
+	}
+	if len(values["code"]) > 1 || len(values["error"]) > 1 {
+		return resourceAccessOAuthQuery{}, fmt.Errorf("授权回调 URL 包含重复的授权结果参数，请重新发起授权。")
+	}
+	code := firstResourceAccessOAuthQueryValue(values["code"])
+	oauthError := firstResourceAccessOAuthQueryValue(values["error"])
+	if (strings.TrimSpace(code) == "") == (strings.TrimSpace(oauthError) == "") {
+		return resourceAccessOAuthQuery{}, fmt.Errorf("授权回调 URL 必须且只能包含授权码或 OAuth 错误。")
+	}
+	return resourceAccessOAuthQuery{
+		State: strings.TrimSpace(values["state"][0]),
+		Response: resourceAccessOAuthResponse{
+			Code:  code,
+			Error: oauthError,
+		},
+	}, nil
+}
+
+func firstResourceAccessOAuthQueryValue(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
 }
 
 func normalizedOAuthCallbackPath(value *url.URL) string {
@@ -565,27 +614,25 @@ func (m *resourceAccessManager) HandleOAuthCallback(w http.ResponseWriter, r *ht
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	state := strings.TrimSpace(r.URL.Query().Get("state"))
-	if state == "" {
-		http.Error(w, "missing OAuth state", http.StatusBadRequest)
+	query, err := parseResourceAccessOAuthQuery(r.URL.RawQuery)
+	if err != nil {
+		feishuLog.Warn(r.Context(), "reject malformed feishu resource OAuth callback account=%s: %v", m.account.ID, err)
+		http.Error(w, "invalid OAuth callback query", http.StatusBadRequest)
 		return
 	}
-	request, err := m.store.ClaimFeishuResourceAccessOAuth(hashResourceAccessState(state), m.account.ID, m.currentTime())
+	request, err := m.store.ClaimFeishuResourceAccessOAuth(hashResourceAccessState(query.State), m.account.ID, m.currentTime())
 	if err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, store.ErrFeishuResourceAccessExpired) {
 			status = http.StatusGone
 		}
-		feishuLog.Warn(r.Context(), "reject feishu resource OAuth callback account=%s state_ref=%s: %v", m.account.ID, shortResourceRef(hashResourceAccessState(state)), err)
+		feishuLog.Warn(r.Context(), "reject feishu resource OAuth callback account=%s state_ref=%s: %v", m.account.ID, shortResourceRef(hashResourceAccessState(query.State)), err)
 		http.Error(w, "OAuth request is invalid, expired, or already used", status)
 		return
 	}
 	callbackCtx, cancel := context.WithTimeout(m.baseContext(), resourceAccessCallbackTimeout)
 	defer cancel()
-	err = m.completeResourceAccessOAuth(callbackCtx, request, resourceAccessOAuthResponse{
-		Code:  r.URL.Query().Get("code"),
-		Error: r.URL.Query().Get("error"),
-	})
+	err = m.completeResourceAccessOAuth(callbackCtx, request, query.Response)
 	if err != nil {
 		var completionErr *resourceAccessOAuthCompletionError
 		if errors.As(err, &completionErr) {
@@ -627,8 +674,24 @@ func (m *resourceAccessManager) completeResourceAccessOAuth(ctx context.Context,
 			"missing authorization code",
 		)
 	}
+	pkceChallenge, err := resourceAccessPKCEChallenge(request.PKCEVerifier)
+	if err != nil {
+		return fail(
+			err,
+			"PKCE 参数无效",
+			"本次授权请求的 PKCE 参数无效，请重新调用资源授权工具。",
+			http.StatusInternalServerError,
+			"invalid PKCE verifier; start a new resource access request",
+		)
+	}
+	feishuLog.Debug(ctx, "exchange feishu resource OAuth code request=%s account=%s pkce_ref=%s pkce_verifier_length=%d",
+		shortRequestID(request.ID), request.AccountID, shortResourceRef(pkceChallenge), len(request.PKCEVerifier))
 	accessToken, err := m.exchangeAuthorizationCode(ctx, code, request.PKCEVerifier)
 	if err != nil {
+		if isResourceAccessPKCEFailure(err) {
+			message := fmt.Sprintf("飞书未通过本次 PKCE 校验，此授权请求已失效且不能继续使用。请重新调用 `%s`，并只使用最新授权卡片。", feishutools.ResourceAccessToolName)
+			return fail(err, "PKCE 校验失败", message, http.StatusBadRequest, "PKCE verification failed; start a new resource access request and use only the latest authorization card")
+		}
 		return fail(err, "授权失败", "飞书授权码兑换失败，请重新发起。", http.StatusBadGateway, "authorization code exchange failed")
 	}
 	if err := m.verifyOAuthUser(ctx, accessToken, request); err != nil {
@@ -677,6 +740,11 @@ func (m *resourceAccessManager) completeResourceAccessOAuth(ctx context.Context,
 		fmt.Sprintf("✅ 飞书资源权限已授予。request_id：`%s`，可继续原操作。", request.ID),
 	)
 	return nil
+}
+
+func isResourceAccessPKCEFailure(err error) bool {
+	var accessTokenErr *accesstoken.AccessTokenError
+	return errors.As(err, &accessTokenErr) && accessTokenErr.Code == 20049
 }
 
 func (m *resourceAccessManager) exchangeAuthorizationCode(ctx context.Context, code, verifier string) (string, error) {
@@ -1066,9 +1134,29 @@ func newResourceAccessOAuthValues() (state, stateHash, verifier, challenge strin
 		return "", "", "", "", err
 	}
 	stateHash = hashResourceAccessState(state)
-	challengeSum := sha256.Sum256([]byte(verifier))
-	challenge = base64.RawURLEncoding.EncodeToString(challengeSum[:])
+	challenge, err = resourceAccessPKCEChallenge(verifier)
+	if err != nil {
+		return "", "", "", "", err
+	}
 	return state, stateHash, verifier, challenge, nil
+}
+
+func resourceAccessPKCEChallenge(verifier string) (string, error) {
+	if len(verifier) < 43 || len(verifier) > 128 {
+		return "", fmt.Errorf("%w: length must be between 43 and 128 bytes", errInvalidResourceAccessPKCEVerifier)
+	}
+	for i := 0; i < len(verifier); i++ {
+		char := verifier[i]
+		if (char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '-' || char == '.' || char == '_' || char == '~' {
+			continue
+		}
+		return "", fmt.Errorf("%w: contains a character outside the RFC 7636 unreserved set", errInvalidResourceAccessPKCEVerifier)
+	}
+	challengeSum := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(challengeSum[:]), nil
 }
 
 func randomBase64URL(size int) (string, error) {
