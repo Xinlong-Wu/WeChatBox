@@ -94,7 +94,7 @@ func TestDocsFolderCreateUsesApplicationRootAndSharesGroup(t *testing.T) {
 	result := tool.Execute(groupDocsContext(), tooltypes.Call{
 		ID:        "call_folder",
 		Name:      folderCreateToolName,
-		Arguments: json.RawMessage(`{"name":" Team Docs ","access_request_id":"req_access"}`),
+		Arguments: json.RawMessage(`{"name":" Team Docs "}`),
 	})
 	if result.IsError {
 		t.Fatalf("Execute result = %#v, want created folder", result)
@@ -156,7 +156,7 @@ func TestDocsFolderCreatePartialRetryOnlyRepeatsSharing(t *testing.T) {
 
 	tools := NewDocsFolderTools(newDocsFolderTestClient(server), st, "feishu:cli_test", Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}, grantedResourceAccessController("req_access"))
 	tool := findDocsTool(t, tools, folderCreateToolName)
-	first := tool.Execute(groupDocsContext(), tooltypes.Call{ID: "call_1", Name: folderCreateToolName, Arguments: json.RawMessage(`{"name":"Retry Docs","access_request_id":"req_access"}`)})
+	first := tool.Execute(groupDocsContext(), tooltypes.Call{ID: "call_1", Name: folderCreateToolName, Arguments: json.RawMessage(`{"name":"Retry Docs"}`)})
 	if first.IsError {
 		t.Fatalf("first Execute result = %#v, want partial success", first)
 	}
@@ -240,7 +240,7 @@ func TestDocsFolderCreatePrivateUsesBoundParentAndOpenID(t *testing.T) {
 	tool := findDocsTool(t, NewDocsFolderTools(newDocsFolderTestClient(server), st, parent.AccountID, Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}, access), folderCreateToolName)
 	ctx := WithActor(context.Background(), Actor{OpenID: "ou_private", UserID: "u_private"})
 	ctx = WithChatContext(ctx, ChatContext{ChatID: "oc_private", IsGroup: false})
-	result := tool.Execute(ctx, tooltypes.Call{ID: "call", Name: folderCreateToolName, Arguments: json.RawMessage(`{"name":"Child","parent_folder_token":"fld_parent","set_default":true,"access_request_id":"req_access"}`)})
+	result := tool.Execute(ctx, tooltypes.Call{ID: "call", Name: folderCreateToolName, Arguments: json.RawMessage(`{"name":"Child","parent_folder_token":"fld_parent","set_default":true}`)})
 	if result.IsError {
 		t.Fatalf("Execute result = %#v", result)
 	}
@@ -288,21 +288,38 @@ func TestDocsFolderListReturnsOnlyCurrentChat(t *testing.T) {
 	}
 }
 
-func TestDocsFolderCreateRequiresGrantedParentAccessBeforeFeishuAPI(t *testing.T) {
+func TestDocsFolderCreateReturnsStructuredMissingParentAccessBeforeFeishuAPI(t *testing.T) {
 	st := openDocsFolderTestStore(t)
 	access := grantedResourceAccessController("req_access")
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	if _, err := st.SaveFeishuChatFolder(store.FeishuChatFolder{
+		AccountID:       "feishu:cli_test",
+		ChatID:          "oc_chat",
+		FolderToken:     "fld_parent",
+		Name:            "Parent",
+		ShareMemberType: "openchat",
+		ShareMemberID:   "oc_chat",
+		ShareState:      store.FeishuFolderShareStateSucceeded,
+		CreateRequestID: "req_parent",
+		CreatedAt:       now,
+	}); err != nil {
+		t.Fatalf("SaveFeishuChatFolder returned error: %v", err)
+	}
+	access.err = NewResourceAuthorizationRequiredError(ResourceAccessRequirement{
+		ResourceType: "folder", ResourceToken: "fld_parent", Permission: ResourcePermissionWrite,
+	}, "")
 	tool := findDocsTool(t, NewDocsFolderTools(&lark.Client{}, st, "feishu:cli_test", Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}, access), folderCreateToolName)
 
 	missing := tool.Execute(groupDocsContext(), tooltypes.Call{
 		ID:        "missing",
 		Name:      folderCreateToolName,
-		Arguments: json.RawMessage(`{"name":"No access"}`),
+		Arguments: json.RawMessage(`{"name":"No access","parent_folder_token":"fld_parent"}`),
 	})
-	if !missing.IsError || !strings.Contains(missing.Content, "access_request_id is required") {
+	if !missing.IsError || !strings.Contains(missing.Content, `"status":"resource_authorization_required"`) {
 		t.Fatalf("missing access result = %#v", missing)
 	}
-	if len(access.requirements) != 0 {
-		t.Fatalf("unexpected access requirements = %#v", access.requirements)
+	if len(access.requirements) != 1 || access.requirement.ResourceToken != "fld_parent" {
+		t.Fatalf("access requirements = %#v", access.requirements)
 	}
 }
 

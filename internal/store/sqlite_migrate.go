@@ -164,8 +164,6 @@ func (s *Store) migrate() error {
 			oauth_state_hash TEXT NOT NULL DEFAULT '',
 			pkce_verifier TEXT NOT NULL DEFAULT '',
 			state TEXT NOT NULL,
-			consumed_by_request_id TEXT NOT NULL DEFAULT '',
-			consumed_at_ms INTEGER NOT NULL DEFAULT 0,
 			created_at_ms INTEGER NOT NULL,
 			expires_at_ms INTEGER NOT NULL,
 			updated_at_ms INTEGER NOT NULL
@@ -233,7 +231,7 @@ func (s *Store) migrate() error {
 	if err := s.renameToolApprovalGrantRequestIDColumn(); err != nil {
 		return err
 	}
-	if err := s.ensureFeishuResourceAccessConsumptionColumns(); err != nil {
+	if err := s.removeFeishuResourceAccessConsumptionColumns(); err != nil {
 		return err
 	}
 	if err := s.ensureFeishuResourceAccessDecisionColumns(); err != nil {
@@ -518,43 +516,17 @@ func (s *Store) migrateFeishuResourceGrantScopes() error {
 	return nil
 }
 
-func (s *Store) ensureFeishuResourceAccessConsumptionColumns() error {
-	rows, err := s.db.Query(`PRAGMA table_info(feishu_resource_access_requests)`)
-	if err != nil {
-		return fmt.Errorf("inspect feishu resource access schema: %w", err)
-	}
-	hasConsumedByRequestID := false
-	hasConsumedAtMS := false
-	for rows.Next() {
-		var cid, notNull, primaryKey int
-		var name, columnType string
-		var defaultValue interface{}
-		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan feishu resource access schema: %w", err)
+func (s *Store) removeFeishuResourceAccessConsumptionColumns() error {
+	for _, column := range []string{"consumed_at_ms", "consumed_by_request_id"} {
+		hasColumn, err := s.tableHasColumn("feishu_resource_access_requests", column)
+		if err != nil {
+			return fmt.Errorf("inspect legacy feishu resource access %s column: %w", column, err)
 		}
-		switch name {
-		case "consumed_by_request_id":
-			hasConsumedByRequestID = true
-		case "consumed_at_ms":
-			hasConsumedAtMS = true
+		if !hasColumn {
+			continue
 		}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return fmt.Errorf("inspect feishu resource access schema: %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("close feishu resource access schema inspection: %w", err)
-	}
-	if !hasConsumedByRequestID {
-		if _, err := s.db.Exec(`ALTER TABLE feishu_resource_access_requests ADD COLUMN consumed_by_request_id TEXT NOT NULL DEFAULT ''`); err != nil {
-			return fmt.Errorf("add feishu resource access consumer column: %w", err)
-		}
-	}
-	if !hasConsumedAtMS {
-		if _, err := s.db.Exec(`ALTER TABLE feishu_resource_access_requests ADD COLUMN consumed_at_ms INTEGER NOT NULL DEFAULT 0`); err != nil {
-			return fmt.Errorf("add feishu resource access consumed timestamp column: %w", err)
+		if _, err := s.db.Exec(`ALTER TABLE feishu_resource_access_requests DROP COLUMN ` + column); err != nil {
+			return fmt.Errorf("remove legacy feishu resource access %s column: %w", column, err)
 		}
 	}
 	return nil

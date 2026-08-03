@@ -106,17 +106,15 @@ type searchArgs struct {
 }
 
 type readArgs struct {
-	Token           string `json:"token,omitempty"`
-	URL             string `json:"url,omitempty"`
-	Type            string `json:"type,omitempty"`
-	AccessRequestID string `json:"access_request_id,omitempty"`
+	Token string `json:"token,omitempty"`
+	URL   string `json:"url,omitempty"`
+	Type  string `json:"type,omitempty"`
 }
 
 type createArgs struct {
-	Title           string `json:"title"`
-	Content         string `json:"content,omitempty"`
-	FolderToken     string `json:"folder_token,omitempty"`
-	AccessRequestID string `json:"access_request_id"`
+	Title       string `json:"title"`
+	Content     string `json:"content,omitempty"`
+	FolderToken string `json:"folder_token,omitempty"`
 }
 
 type approvedCreatePayload struct {
@@ -127,11 +125,10 @@ type approvedCreatePayload struct {
 }
 
 type appendArgs struct {
-	Token           string `json:"token,omitempty"`
-	URL             string `json:"url,omitempty"`
-	Content         string `json:"content"`
-	FolderToken     string `json:"folder_token,omitempty"`
-	AccessRequestID string `json:"access_request_id,omitempty"`
+	Token       string `json:"token,omitempty"`
+	URL         string `json:"url,omitempty"`
+	Content     string `json:"content"`
+	FolderToken string `json:"folder_token,omitempty"`
 }
 
 type searchOutput struct {
@@ -325,7 +322,7 @@ func (t docsTool) read(ctx context.Context, raw json.RawMessage) (string, error)
 	if err != nil {
 		return "", err
 	}
-	if _, _, err := t.authorizeDocumentAccess(ctx, chat, ref.Token, ResourcePermissionRead, args.AccessRequestID); err != nil {
+	if _, _, err := t.authorizeDocumentAccess(ctx, chat, ref.Token, ResourcePermissionRead); err != nil {
 		return "", err
 	}
 	req := larkdocx.NewRawContentDocumentReqBuilder().
@@ -455,15 +452,11 @@ func (t docsTool) parseCreateArgs(raw json.RawMessage) (createArgs, error) {
 	}
 	args.Title = strings.TrimSpace(args.Title)
 	args.FolderToken = strings.TrimSpace(args.FolderToken)
-	args.AccessRequestID = strings.TrimSpace(args.AccessRequestID)
 	if args.Title == "" {
 		return createArgs{}, fmt.Errorf("title is required")
 	}
 	if utf8.RuneCountInString(args.Title) > maxDocxTitle {
 		return createArgs{}, fmt.Errorf("title must not exceed %d characters", maxDocxTitle)
-	}
-	if args.AccessRequestID == "" {
-		return createArgs{}, fmt.Errorf("access_request_id is required; call %s with folder/write before creating a document", ResourceAccessToolName)
 	}
 	return args, nil
 }
@@ -624,10 +617,9 @@ func (t docsTool) createDocument(ctx context.Context, requestID string, payload 
 	return out, nil
 }
 
-func (t docsTool) authorizeDocumentAccess(ctx context.Context, chat ChatContext, documentToken, permission, accessRequestID string) (store.FeishuChatDocument, bool, error) {
+func (t docsTool) authorizeDocumentAccess(ctx context.Context, chat ChatContext, documentToken, permission string) (store.FeishuChatDocument, bool, error) {
 	documentToken = strings.TrimSpace(documentToken)
 	permission = strings.ToLower(strings.TrimSpace(permission))
-	accessRequestID = strings.TrimSpace(accessRequestID)
 	if err := requireResourceAccess(ctx, t.resourceAccess, ResourceAccessRequirement{
 		ResourceType:  "docx",
 		ResourceToken: documentToken,
@@ -705,7 +697,7 @@ func (t docsTool) append(ctx context.Context, raw json.RawMessage) (string, erro
 	if err != nil {
 		return "", err
 	}
-	document, bound, err := t.authorizeDocumentAccess(ctx, chat, ref.Token, ResourcePermissionWrite, args.AccessRequestID)
+	document, bound, err := t.authorizeDocumentAccess(ctx, chat, ref.Token, ResourcePermissionWrite)
 	if err != nil {
 		return "", err
 	}
@@ -856,15 +848,15 @@ func docsReadSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        readToolName,
 		Description: "Read plain text from a Feishu docx document. The tool checks Bot ownership or the current trusted user's scoped docx/read grant and live Feishu capability without sending cards itself. If authorization is missing it returns resource_authorization_required; call feishu_docs_request_access with the returned resource and permission, then retry. External access does not create a permanent chat binding. The result may be truncated by configuration.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"token":{"type":"string","description":"Feishu docx document token."},"url":{"type":"string","description":"Feishu document URL."},"type":{"type":"string","enum":["docx","wiki","file"],"description":"Document type hint."},"access_request_id":{"type":"string","description":"Granted request_id for docx/read; required only when the document is not bound to the current chat."}},"additionalProperties":false}`),
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"token":{"type":"string","description":"Feishu docx document token."},"url":{"type":"string","description":"Feishu document URL."},"type":{"type":"string","enum":["docx","wiki","file"],"description":"Document type hint."}},"additionalProperties":false}`),
 	}
 }
 
 func docsCreateSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        createToolName,
-		Description: "Create a Feishu docx document only in a Bot-owned folder bound to the current trusted chat. Before every creation, call feishu_docs_request_access for folder/write on the target folder and pass its granted request_id as access_request_id. Omit folder_token to use the chat's default Bot folder. To place a document in a non-Bot-owned directory, use the create-in-Bot-folder, copy-to-target, then delete-temporary-resource flow. A matching 24-hour operation grant executes immediately; otherwise creation starts after the requester approves the operation card.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"title":{"type":"string","minLength":1,"maxLength":800},"content":{"type":"string"},"folder_token":{"type":"string","description":"Optional Bot-owned folder token already bound to this exact Feishu chat."},"access_request_id":{"type":"string","description":"Granted request_id returned by feishu_docs_request_access for write access to the resolved target folder."}},"required":["title","access_request_id"],"additionalProperties":false}`),
+		Description: "Create a Feishu docx document only in a Bot-owned folder bound to the current trusted chat. The tool checks folder/write access from trusted context before approval and again immediately before creation; missing authorization returns resource_authorization_required without sending a resource card. Omit folder_token to use the chat's default Bot folder. To place a document in a non-Bot-owned directory, use the create-in-Bot-folder, copy-to-target, then delete-temporary-resource flow. A matching operation grant executes immediately; otherwise creation starts after the requester approves the operation card.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"title":{"type":"string","minLength":1,"maxLength":800},"content":{"type":"string"},"folder_token":{"type":"string","description":"Optional Bot-owned folder token already bound to this exact Feishu chat."}},"required":["title"],"additionalProperties":false}`),
 	}
 }
 
@@ -884,7 +876,7 @@ func docsAppendSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        appendToolName,
 		Description: "Append plain text paragraphs to a Feishu docx document. The tool checks Bot ownership or the current trusted user's scoped docx/write grant and live Feishu capability without sending cards itself. If authorization is missing it returns resource_authorization_required; call feishu_docs_request_access with the returned resource and permission, then retry. External access does not create a permanent chat binding.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"token":{"type":"string"},"url":{"type":"string"},"content":{"type":"string"},"folder_token":{"type":"string","description":"Optional consistency check available only for a current-chat document binding."},"access_request_id":{"type":"string","description":"Granted request_id for docx/write; required only when the document is not bound to the current chat."}},"required":["content"],"additionalProperties":false}`),
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"token":{"type":"string"},"url":{"type":"string"},"content":{"type":"string"},"folder_token":{"type":"string","description":"Optional consistency check available only for a current-chat document binding."}},"required":["content"],"additionalProperties":false}`),
 	}
 }
 

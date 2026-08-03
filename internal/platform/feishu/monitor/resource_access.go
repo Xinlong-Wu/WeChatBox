@@ -50,7 +50,6 @@ type resourceAccessStore interface {
 	ApproveFeishuResourceAccessRequest(id, accountID, grantMode string, match store.FeishuResourceAccessMatch, now time.Time) (store.FeishuResourceAccessRequest, error)
 	ListApprovedPendingFeishuResourceAccessRequests(accountID string, now time.Time, limit int) ([]store.FeishuResourceAccessRequest, error)
 	GetFeishuResourceAccessRequest(id, accountID string) (store.FeishuResourceAccessRequest, error)
-	ConsumeFeishuResourceAccessRequest(id, accountID, consumedByRequestID string, now time.Time) error
 	ClaimFeishuResourceAccessOAuth(stateHash, accountID string, now time.Time) (store.FeishuResourceAccessRequest, error)
 	ClaimFeishuResourceAccessOAuthFromCard(id, accountID, stateHash string, match store.FeishuResourceAccessMatch, now time.Time) (store.FeishuResourceAccessRequest, error)
 	DenyFeishuResourceAccessRequest(id, accountID string, match store.FeishuResourceAccessMatch, now time.Time) (store.FeishuResourceAccessRequest, error)

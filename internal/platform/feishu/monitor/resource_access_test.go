@@ -118,8 +118,8 @@ func TestResourceAccessManagerRequiresBotOwnedAccessWithoutRequestBinding(t *tes
 		t.Fatalf("RequireResourceAccess returned error: %v", err)
 	}
 	stored, err := st.GetFeishuResourceAccessRequest(first.RequestID, "feishu:cli_test")
-	if err != nil || stored.ConsumedByRequestID != "" || !stored.ConsumedAt.IsZero() {
-		t.Fatalf("resource request unexpectedly consumed = %#v err=%v", stored, err)
+	if err != nil || stored.State != store.FeishuResourceAccessStateSucceeded {
+		t.Fatalf("resource request = %#v err=%v", stored, err)
 	}
 
 	baseNow := manager.currentTime()

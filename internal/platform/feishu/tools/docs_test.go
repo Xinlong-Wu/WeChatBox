@@ -176,7 +176,7 @@ func TestDocsReadRejectsBotOwnedDocumentFromAnotherChat(t *testing.T) {
 	result := findDocsTool(t, tools, readToolName).Execute(groupDocsContext(), tooltypes.Call{
 		ID:        "read_cross_chat",
 		Name:      readToolName,
-		Arguments: json.RawMessage(`{"token":"doxcnotherchat123","access_request_id":"req_access"}`),
+		Arguments: json.RawMessage(`{"token":"doxcnotherchat123"}`),
 	})
 	if !result.IsError || !strings.Contains(result.Content, "not available to the current Feishu chat") {
 		t.Fatalf("cross-chat read result = %#v", result)
@@ -249,7 +249,7 @@ func TestDocsCreateToolReturnsPendingApprovalWithoutCallingFeishuDocs(t *testing
 	result := tool.Execute(groupDocsContext(), tooltypes.Call{
 		ID:        "call_1",
 		Name:      createToolName,
-		Arguments: json.RawMessage(`{"title":" Quarterly plan ","content":"private body","folder_token":" fld_token ","access_request_id":"req_access"}`),
+		Arguments: json.RawMessage(`{"title":" Quarterly plan ","content":"private body","folder_token":" fld_token "}`),
 	})
 	if result.IsError {
 		t.Fatalf("Execute result = %#v, want pending approval success", result)
@@ -274,7 +274,7 @@ func TestDocsCreateToolReturnsPendingApprovalWithoutCallingFeishuDocs(t *testing
 	if err := json.Unmarshal(approver.request.Payload, &approvedArgs); err != nil {
 		t.Fatalf("unmarshal approval payload: %v", err)
 	}
-	if approvedArgs.Title != "Quarterly plan" || approvedArgs.FolderToken != "fld_token" || approvedArgs.Content != "private body" || approvedArgs.AccessRequestID != "req_access" || approvedArgs.ChatID != "oc_chat" {
+	if approvedArgs.Title != "Quarterly plan" || approvedArgs.FolderToken != "fld_token" || approvedArgs.Content != "private body" || approvedArgs.ChatID != "oc_chat" {
 		t.Fatalf("approved args = %#v, want normalized exact payload", approvedArgs)
 	}
 	for _, field := range approver.request.Fields {
@@ -320,7 +320,7 @@ func TestDocsCreateToolUsesActiveGrantWithoutSendingCard(t *testing.T) {
 	result := tool.Execute(groupDocsContext(), tooltypes.Call{
 		ID:        "call_1",
 		Name:      createToolName,
-		Arguments: json.RawMessage(`{"title":"Quarterly plan","folder_token":"fld_token","access_request_id":"req_access"}`),
+		Arguments: json.RawMessage(`{"title":"Quarterly plan","folder_token":"fld_token"}`),
 	})
 	if result.IsError {
 		t.Fatalf("Execute result = %#v, want direct create", result)
@@ -382,7 +382,7 @@ func TestDocsCreateToolActiveGrantReportsPartialSuccessWithoutRetrySignal(t *tes
 	result := tool.Execute(groupDocsContext(), tooltypes.Call{
 		ID:        "call_1",
 		Name:      createToolName,
-		Arguments: json.RawMessage(`{"title":"Quarterly plan","content":"body","folder_token":"fld_token","access_request_id":"req_access"}`),
+		Arguments: json.RawMessage(`{"title":"Quarterly plan","content":"body","folder_token":"fld_token"}`),
 	})
 	if result.IsError {
 		t.Fatalf("Execute result = %#v, want partial success", result)
@@ -405,9 +405,8 @@ func TestDocsCreateToolRejectsTitleLongerThanFeishuLimit(t *testing.T) {
 	_, tools, _ := newDocsToolsForTest(t, &lark.Client{}, cfg, approver)
 	tool := findDocsTool(t, tools, createToolName)
 	args, err := json.Marshal(createArgs{
-		Title:           strings.Repeat("文", maxDocxTitle+1),
-		FolderToken:     "fld_token",
-		AccessRequestID: "req_access",
+		Title:       strings.Repeat("文", maxDocxTitle+1),
+		FolderToken: "fld_token",
 	})
 	if err != nil {
 		t.Fatalf("marshal create args: %v", err)
@@ -468,7 +467,7 @@ func TestDocsCreateApprovedExecutionCreatesDocument(t *testing.T) {
 	if !ok {
 		t.Fatalf("create tool %T does not implement ApprovalExecutor", tool)
 	}
-	result, err := executor.ExecuteApproved(context.Background(), "req_approved", json.RawMessage(`{"title":"Quarterly plan","folder_token":"fld_token","access_request_id":"req_access","chat_id":"oc_chat","actor_open_id":"ou_requester"}`))
+	result, err := executor.ExecuteApproved(context.Background(), "req_approved", json.RawMessage(`{"title":"Quarterly plan","folder_token":"fld_token","chat_id":"oc_chat","actor_open_id":"ou_requester"}`))
 	if err != nil {
 		t.Fatalf("ExecuteApproved returned error: %v", err)
 	}
@@ -516,7 +515,7 @@ func TestDocsCreateApprovedExecutionReportsPartialSuccessWithoutRetryingCreate(t
 	_, tools, _ := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
 	tool := findDocsTool(t, tools, createToolName)
 	executor := tool.(ApprovalExecutor)
-	result, err := executor.ExecuteApproved(context.Background(), "req_approved", json.RawMessage(`{"title":"Quarterly plan","content":"body","folder_token":"fld_token","access_request_id":"req_access","chat_id":"oc_chat","actor_open_id":"ou_requester"}`))
+	result, err := executor.ExecuteApproved(context.Background(), "req_approved", json.RawMessage(`{"title":"Quarterly plan","content":"body","folder_token":"fld_token","chat_id":"oc_chat","actor_open_id":"ou_requester"}`))
 	if err != nil {
 		t.Fatalf("ExecuteApproved returned error after document creation: %v", err)
 	}
@@ -531,7 +530,7 @@ func TestDocsCreateApprovedExecutionStopsWhenAccessWasRevoked(t *testing.T) {
 	access.err = errors.New("permission revoked")
 	executor := findDocsTool(t, tools, createToolName).(ApprovalExecutor)
 
-	_, err := executor.ExecuteApproved(context.Background(), "req_approved", json.RawMessage(`{"title":"Quarterly plan","folder_token":"fld_token","access_request_id":"req_access","chat_id":"oc_chat","actor_open_id":"ou_requester"}`))
+	_, err := executor.ExecuteApproved(context.Background(), "req_approved", json.RawMessage(`{"title":"Quarterly plan","folder_token":"fld_token","chat_id":"oc_chat","actor_open_id":"ou_requester"}`))
 	if err == nil || !strings.Contains(err.Error(), "revalidate approved document target access") || !strings.Contains(err.Error(), "permission revoked") {
 		t.Fatalf("ExecuteApproved error = %v", err)
 	}
@@ -596,12 +595,20 @@ func TestDocsCreateRequiresAndRevalidatesFolderAccess(t *testing.T) {
 	tools := NewDocsTools(&lark.Client{}, st, "feishu:cli_test", cfg, approver, access)
 	tool := findDocsTool(t, tools, createToolName)
 
+	access.err = NewResourceAuthorizationRequiredError(ResourceAccessRequirement{
+		ResourceType: "folder", ResourceToken: "fld_token", Permission: ResourcePermissionWrite,
+	}, "")
 	missing := tool.Execute(groupDocsContext(), tooltypes.Call{ID: "missing", Name: createToolName, Arguments: json.RawMessage(`{"title":"No access","folder_token":"fld_token"}`)})
-	if !missing.IsError || !strings.Contains(missing.Content, "access_request_id is required") || approver.checks != 0 {
+	if !missing.IsError || !strings.Contains(missing.Content, `"status":"resource_authorization_required"`) || approver.checks != 0 {
 		t.Fatalf("missing access result=%#v approval_checks=%d", missing, approver.checks)
 	}
+	if len(access.requirements) != 1 || access.requirement.ResourceToken != "fld_token" || access.requirement.Permission != ResourcePermissionWrite {
+		t.Fatalf("missing access requirements=%#v", access.requirements)
+	}
+	access.err = nil
+	access.requirements = nil
 
-	result := tool.Execute(groupDocsContext(), tooltypes.Call{ID: "pending", Name: createToolName, Arguments: json.RawMessage(`{"title":"With access","folder_token":"fld_token","access_request_id":"req_access"}`)})
+	result := tool.Execute(groupDocsContext(), tooltypes.Call{ID: "pending", Name: createToolName, Arguments: json.RawMessage(`{"title":"With access","folder_token":"fld_token"}`)})
 	if result.IsError {
 		t.Fatalf("granted access result = %#v", result)
 	}

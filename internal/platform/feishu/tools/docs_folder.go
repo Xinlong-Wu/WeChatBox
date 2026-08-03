@@ -79,7 +79,6 @@ type folderCreateArgs struct {
 	Name              string `json:"name,omitempty"`
 	ParentFolderToken string `json:"parent_folder_token,omitempty"`
 	SetDefault        bool   `json:"set_default,omitempty"`
-	AccessRequestID   string `json:"access_request_id,omitempty"`
 	RequestID         string `json:"request_id,omitempty"`
 }
 
@@ -123,15 +122,14 @@ func (t docsFolderTool) createFolder(ctx context.Context, raw json.RawMessage) (
 	}
 	args.Name = strings.TrimSpace(args.Name)
 	args.ParentFolderToken = strings.TrimSpace(args.ParentFolderToken)
-	args.AccessRequestID = strings.TrimSpace(args.AccessRequestID)
 	args.RequestID = strings.TrimSpace(args.RequestID)
 	actor, chat, err := trustedDocsScope(ctx)
 	if err != nil {
 		return "", err
 	}
 	if args.RequestID != "" {
-		if args.Name != "" || args.ParentFolderToken != "" || args.SetDefault || args.AccessRequestID != "" {
-			return "", fmt.Errorf("request_id retry must not include name, parent_folder_token, set_default, or access_request_id")
+		if args.Name != "" || args.ParentFolderToken != "" || args.SetDefault {
+			return "", fmt.Errorf("request_id retry must not include name, parent_folder_token, or set_default")
 		}
 		return t.retryFolderShare(ctx, actor, chat, args.RequestID)
 	}
@@ -143,9 +141,6 @@ func (t docsFolderTool) createFolder(ctx context.Context, raw json.RawMessage) (
 	}
 	if utf8.RuneCountInString(args.Name) == 0 {
 		return "", fmt.Errorf("name is required")
-	}
-	if args.AccessRequestID == "" {
-		return "", fmt.Errorf("access_request_id is required; call %s with folder/write before creating a folder", ResourceAccessToolName)
 	}
 	parentToken := args.ParentFolderToken
 	createParentToken := parentToken
@@ -545,8 +540,8 @@ func folderOutput(folder store.FeishuChatFolder, status string, shared bool, war
 func docsFolderCreateSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        folderCreateToolName,
-		Description: "Create a Bot-owned Feishu folder under the Bot root or another Bot-owned folder bound to the current trusted chat, then grant the chat or private-chat user full access. Before creating, call feishu_docs_request_access for folder/write on the actual parent and pass its granted request_id as access_request_id. This operation has no separate operation-approval card. If sharing fails after creation, retry with only request_id so the folder is not created twice.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"name":{"type":"string","description":"Folder name for a new folder; maximum 256 UTF-8 bytes."},"parent_folder_token":{"type":"string","description":"Optional Bot-owned parent folder already bound to this exact Feishu chat. Omit to use the Bot root."},"set_default":{"type":"boolean","description":"Make the new folder the default for this chat. The first folder is always default."},"access_request_id":{"type":"string","description":"Granted request_id returned by feishu_docs_request_access for write access to the actual parent folder."},"request_id":{"type":"string","description":"Retry a prior partial result by sharing the already-created folder; when set, omit all other fields."}},"oneOf":[{"required":["name","access_request_id"]},{"required":["request_id"]}],"additionalProperties":false}`),
+		Description: "Create a Bot-owned Feishu folder under the Bot root or another Bot-owned folder bound to the current trusted chat, then grant the chat or private-chat user full access. The tool checks folder/write access from trusted context before creation and returns resource_authorization_required if it is missing; it does not send a resource card itself. This operation has no separate operation-approval card. If sharing fails after creation, retry with only request_id so the folder is not created twice.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"name":{"type":"string","description":"Folder name for a new folder; maximum 256 UTF-8 bytes."},"parent_folder_token":{"type":"string","description":"Optional Bot-owned parent folder already bound to this exact Feishu chat. Omit to use the Bot root."},"set_default":{"type":"boolean","description":"Make the new folder the default for this chat. The first folder is always default."},"request_id":{"type":"string","description":"Retry a prior partial result by sharing the already-created folder; when set, omit all other fields."}},"oneOf":[{"required":["name"]},{"required":["request_id"]}],"additionalProperties":false}`),
 	}
 }
 
