@@ -171,6 +171,7 @@ func (w *workflowContinuationWorker) processOne(ctx context.Context, candidate s
 	err = w.resumer.ResumeWorkflow(resumeCtx, core.WorkflowResumeRequest{
 		Continuation: continuation,
 		Result:       result,
+		AccountName:  strings.TrimSpace(w.account.Name),
 		Tools:        w.tools,
 		ToolOptions:  w.toolOptions,
 	}, responder)

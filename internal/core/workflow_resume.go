@@ -24,6 +24,7 @@ var ErrWorkflowResumeInvalid = errors.New("invalid workflow resume request")
 type WorkflowResumeRequest struct {
 	Continuation store.WorkflowContinuation
 	Result       store.WorkflowResult
+	AccountName  string
 	Tools        []tooltypes.Tool
 	ToolOptions  tooltypes.Options
 }
@@ -62,6 +63,7 @@ func (b *Bot) ResumeWorkflow(ctx context.Context, request WorkflowResumeRequest,
 	msg := InboundMessage{
 		Platform:           continuation.Platform,
 		AccountID:          continuation.AccountID,
+		AccountName:        strings.TrimSpace(request.AccountName),
 		UserKey:            continuation.UserKey,
 		LLMText:            eventContent,
 		Tools:              request.Tools,

@@ -76,6 +76,41 @@ func TestResumeWorkflowInjectsAuthenticatedEventAndSavesTargetSession(t *testing
 	}
 }
 
+func TestResumeWorkflowPreservesAccountNameForProviderToolScope(t *testing.T) {
+	sessions := &fakeSessions{conv: &store.Conversation{Revision: 4}}
+	client := &fakeToolLLM{
+		callTurns: [][]tooltypes.Call{{{
+			ID:        "call_account_tool",
+			Name:      "mcp_account_tool",
+			Arguments: json.RawMessage(`{}`),
+		}}},
+		finalText: "account-scoped workflow resumed",
+	}
+	tool := &fakeTool{spec: tooltypes.Spec{Name: "mcp_account_tool"}, result: `{"status":"ok"}`}
+	provider := &fakeToolProvider{tools: []tooltypes.Tool{tool}}
+	bot := &Bot{
+		Sessions:       sessions,
+		LLMConfig:      testLLMConfig(),
+		LLMClients:     map[string]llm.Client{},
+		NewLLM:         func(config.ResolvedModel) llm.Client { return client },
+		TextChunkLimit: testTextChunkLimit,
+		ToolProvider:   provider,
+	}
+	request := testWorkflowResumeRequest()
+	request.AccountName = "fsbot"
+
+	if err := bot.ResumeWorkflow(t.Context(), request, &fakeSender{}); err != nil {
+		t.Fatalf("ResumeWorkflow returned error: %v", err)
+	}
+	if len(provider.scopes) != 1 || provider.scopes[0].Platform != store.PlatformFeishu ||
+		provider.scopes[0].AccountID != request.Continuation.AccountID || provider.scopes[0].AccountName != "fsbot" {
+		t.Fatalf("workflow provider scopes = %#v", provider.scopes)
+	}
+	if len(tool.executions) != 1 {
+		t.Fatalf("account-scoped workflow tool executions = %#v", tool.executions)
+	}
+}
+
 func TestResumeWorkflowReplaysCommittedResponseWithoutCallingModelAgain(t *testing.T) {
 	sessions := &fakeSessions{conv: &store.Conversation{Revision: 2}}
 	client := &fakeLLM{resp: llm.Response{Text: "resume once"}}
@@ -209,6 +244,7 @@ func testWorkflowResumeRequest() WorkflowResumeRequest {
 	}
 	return WorkflowResumeRequest{
 		Continuation: continuation,
+		AccountName:  "fsbot",
 		Result: store.WorkflowResult{
 			RequestID: continuation.RequestID,
 			AccountID: continuation.AccountID,

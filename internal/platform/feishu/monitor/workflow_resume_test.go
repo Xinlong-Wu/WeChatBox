@@ -86,7 +86,7 @@ func TestWorkflowContinuationWorkerDeliversReadyResult(t *testing.T) {
 	continuation := createReadyWorkflowForWorker(t, st, now)
 	resumer := &fakeWorkflowResumer{text: "authorization complete"}
 	sender := &fakeWorkflowResumeTextSender{}
-	worker, err := newWorkflowContinuationWorker(st, resumer, sender, &fakeWorkflowResumeCardUpdater{}, store.Account{ID: continuation.AccountID}, nil)
+	worker, err := newWorkflowContinuationWorker(st, resumer, sender, &fakeWorkflowResumeCardUpdater{}, store.Account{ID: continuation.AccountID, Name: "fsbot"}, nil)
 	if err != nil {
 		t.Fatalf("newWorkflowContinuationWorker returned error: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestWorkflowContinuationWorkerDeliversReadyResult(t *testing.T) {
 	if err != nil || stored.State != store.WorkflowContinuationStateDelivered || stored.Attempts != 1 {
 		t.Fatalf("delivered continuation = %#v err=%v", stored, err)
 	}
-	if len(resumer.requests) != 1 || !resumer.requests[0].Continuation.ChatIsGroup {
+	if len(resumer.requests) != 1 || !resumer.requests[0].Continuation.ChatIsGroup || resumer.requests[0].AccountName != "fsbot" {
 		t.Fatalf("resume requests = %#v", resumer.requests)
 	}
 	if len(sender.calls) != 1 || sender.calls[0].chatID != "oc_chat" || sender.calls[0].text != "authorization complete" {
