@@ -168,6 +168,19 @@ func (s *Store) GetFeishuUserOAuthCredential(accountID, actorOpenID, actorUserID
 	return credential, nil
 }
 
+// GetFeishuUserOAuthCredentialByID loads one exact credential for durable
+// refresh recovery without resolving mutable actor aliases.
+func (s *Store) GetFeishuUserOAuthCredentialByID(id, accountID string) (FeishuUserOAuthCredential, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return FeishuUserOAuthCredential{}, err
+	}
+	return scanFeishuUserOAuthCredential(s.db.QueryRow(
+		feishuUserOAuthCredentialSelect+` WHERE id=? AND account_id=?`,
+		strings.TrimSpace(id),
+		strings.TrimSpace(accountID),
+	))
+}
+
 // RotateFeishuUserOAuthCredential atomically replaces both one-time token
 // values only when the caller still owns the loaded version.
 func (s *Store) RotateFeishuUserOAuthCredential(credential FeishuUserOAuthCredential, expectedVersion int64) (FeishuUserOAuthCredential, error) {

@@ -134,6 +134,7 @@ func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
 	st := openFeishuDocsTestStore(t)
 	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
 	accessIDs := map[string]string{}
+	refreshAttemptIDs := map[string]string{}
 	for _, accountID := range []string{"feishu:first", "feishu:second"} {
 		request, err := st.CreateWorkflowRequest(WorkflowRequest{
 			AccountID: accountID,
@@ -217,7 +218,7 @@ func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("UpsertFeishuResourceCapability returned error: %v", err)
 		}
-		if _, err := st.SaveFeishuUserOAuthCredential(FeishuUserOAuthCredential{
+		credential, err := st.SaveFeishuUserOAuthCredential(FeishuUserOAuthCredential{
 			AccountID:              accountID,
 			ActorOpenID:            "ou_requester",
 			ActorUserID:            "u_requester",
@@ -231,9 +232,22 @@ func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
 			Status:                 FeishuUserOAuthCredentialStatusActive,
 			CreatedAt:              now,
 			UpdatedAt:              now,
-		}); err != nil {
+		})
+		if err != nil {
 			t.Fatalf("SaveFeishuUserOAuthCredential returned error: %v", err)
 		}
+		refreshAttempt, _, err := st.PrepareFeishuOAuthRefreshAttempt(
+			credential.ID,
+			credential.AccountID,
+			credential.Version,
+			"lease-"+accountID,
+			now,
+			time.Minute,
+		)
+		if err != nil {
+			t.Fatalf("PrepareFeishuOAuthRefreshAttempt returned error: %v", err)
+		}
+		refreshAttemptIDs[accountID] = refreshAttempt.ID
 		continuation := attachWorkflowContinuationForTest(t, st, access.ID, accountID, now, 0)
 		if _, _, err := st.CommitWorkflowContinuation(continuation.RequestID, continuation.AccountID, 1, now.Add(time.Second)); err != nil {
 			t.Fatalf("CommitWorkflowContinuation returned error: %v", err)
@@ -268,6 +282,12 @@ func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
 	}
 	if _, err := st.GetFeishuUserOAuthCredential("feishu:second", "ou_requester", "u_requester"); err != nil {
 		t.Fatalf("other account OAuth credential was deleted: %v", err)
+	}
+	if _, err := st.GetFeishuOAuthRefreshAttempt(refreshAttemptIDs["feishu:first"], "feishu:first"); !errors.Is(err, ErrFeishuOAuthRefreshAttemptNotFound) {
+		t.Fatalf("deleted account refresh attempt error = %v, want ErrFeishuOAuthRefreshAttemptNotFound", err)
+	}
+	if _, err := st.GetFeishuOAuthRefreshAttempt(refreshAttemptIDs["feishu:second"], "feishu:second"); err != nil {
+		t.Fatalf("other account OAuth refresh attempt was deleted: %v", err)
 	}
 	if _, active, err := st.ActiveFeishuResourceCapability(
 		"feishu:first", "folder", "fld_feishu:first", "openchat", "oc_chat", FeishuResourcePermissionRead,

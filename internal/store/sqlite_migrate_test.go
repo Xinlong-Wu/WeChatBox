@@ -58,3 +58,45 @@ func TestMigrateAddsFeishuResourceAccessDisplayAndDecisionColumnsAndRemovesLegac
 		t.Fatalf("migrated columns = %#v", columns)
 	}
 }
+
+func TestMigrateCreatesFeishuOAuthRefreshAttemptSchema(t *testing.T) {
+	st := openFeishuDocsTestStore(t)
+	rows, err := st.db.Query(`PRAGMA table_info(feishu_oauth_refresh_attempts)`)
+	if err != nil {
+		t.Fatalf("inspect refresh attempt schema: %v", err)
+	}
+	defer rows.Close()
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue interface{}
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatalf("scan refresh attempt schema: %v", err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate refresh attempt schema: %v", err)
+	}
+	for _, name := range []string{
+		"attempt_id", "credential_id", "account_id", "expected_version", "state",
+		"lease_token", "lease_expires_at_ms", "access_token_ciphertext",
+		"refresh_token_ciphertext", "scopes", "error_category", "created_at_ms", "updated_at_ms",
+	} {
+		if !columns[name] {
+			t.Fatalf("refresh attempt schema missing %q: %#v", name, columns)
+		}
+	}
+	var indexCount int
+	if err := st.db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN (?, ?)`,
+		"idx_feishu_oauth_refresh_one_active",
+		"idx_feishu_oauth_refresh_account_state_lease",
+	).Scan(&indexCount); err != nil {
+		t.Fatalf("inspect refresh attempt indexes: %v", err)
+	}
+	if indexCount != 2 {
+		t.Fatalf("refresh attempt index count = %d, want 2", indexCount)
+	}
+}

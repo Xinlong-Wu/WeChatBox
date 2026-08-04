@@ -285,6 +285,9 @@ func (s *Store) DeleteFeishuDocsData(accountID string) error {
 	if _, err := tx.Exec(`DELETE FROM feishu_resource_capabilities WHERE account_id=?`, accountID); err != nil {
 		return fmt.Errorf("delete feishu resource capabilities: %w", err)
 	}
+	if _, err := tx.Exec(`DELETE FROM feishu_oauth_refresh_attempts WHERE account_id=?`, accountID); err != nil {
+		return fmt.Errorf("delete feishu oauth refresh attempts: %w", err)
+	}
 	if _, err := tx.Exec(`DELETE FROM feishu_user_oauth_credentials WHERE account_id=?`, accountID); err != nil {
 		return fmt.Errorf("delete feishu user oauth credentials: %w", err)
 	}

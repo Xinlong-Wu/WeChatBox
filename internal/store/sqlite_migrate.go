@@ -228,6 +228,25 @@ func (s *Store) migrate() error {
 			created_at_ms INTEGER NOT NULL,
 			updated_at_ms INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS feishu_oauth_refresh_attempts (
+			attempt_id TEXT PRIMARY KEY,
+			credential_id TEXT NOT NULL,
+			account_id TEXT NOT NULL,
+			actor_open_id TEXT NOT NULL DEFAULT '',
+			actor_user_id TEXT NOT NULL DEFAULT '',
+			expected_version INTEGER NOT NULL,
+			state TEXT NOT NULL,
+			lease_token TEXT NOT NULL DEFAULT '',
+			lease_expires_at_ms INTEGER NOT NULL DEFAULT 0,
+			access_token_ciphertext TEXT NOT NULL DEFAULT '',
+			access_token_expires_at_ms INTEGER NOT NULL DEFAULT 0,
+			refresh_token_ciphertext TEXT NOT NULL DEFAULT '',
+			refresh_token_expires_at_ms INTEGER NOT NULL DEFAULT 0,
+			scopes TEXT NOT NULL DEFAULT '',
+			error_category TEXT NOT NULL DEFAULT '',
+			created_at_ms INTEGER NOT NULL,
+			updated_at_ms INTEGER NOT NULL
+		)`,
 	}
 
 	for _, q := range queries {
@@ -317,6 +336,11 @@ func (s *Store) migrate() error {
 			 ON feishu_user_oauth_credentials(account_id, actor_user_id) WHERE actor_user_id<>''`,
 		`CREATE INDEX IF NOT EXISTS idx_feishu_user_oauth_account_status_expiry
 			 ON feishu_user_oauth_credentials(account_id, status, access_token_expires_at_ms, refresh_token_expires_at_ms)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_feishu_oauth_refresh_one_active
+			 ON feishu_oauth_refresh_attempts(account_id, credential_id)
+			 WHERE state IN ('prepared', 'response_staged')`,
+		`CREATE INDEX IF NOT EXISTS idx_feishu_oauth_refresh_account_state_lease
+			 ON feishu_oauth_refresh_attempts(account_id, state, lease_expires_at_ms, updated_at_ms)`,
 	}
 	for _, q := range indexes {
 		if _, err := s.db.Exec(q); err != nil {

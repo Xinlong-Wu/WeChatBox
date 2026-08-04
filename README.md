@@ -458,9 +458,13 @@ grant an external folder to the Bot and returns an `unsupported` result.
 Authorization codes and complete callback URLs are never persisted. Access and
 refresh tokens are encrypted with AES-256-GCM using an account-bound key derived
 from the Feishu App Secret; they are never included in logs, model context, or
-workflow continuations. Rotating the App Secret makes existing ciphertext
-unreadable and requires affected users to complete OAuth again. LingoBridge
-updates the original card with the terminal result and does not send a separate
+workflow continuations. Refresh responses are first encrypted with additional
+data bound to the exact Bot account, OAuth actor, refresh-attempt ID, and token
+field; they are re-encrypted with the normal credential context only while the
+durable response is atomically applied. Rotating the App Secret makes existing
+credential and staged-refresh ciphertext unreadable, causes affected
+credentials to fail closed, and requires the user to complete OAuth again.
+LingoBridge updates the original card with the terminal result and does not send a separate
 success/failure text message to the chat. In direct HTTP mode the browser is
 additionally redirected to the Feishu resource; in manual mode the requester
 stays in control of returning to the original Feishu chat. No custom H5
@@ -551,11 +555,24 @@ choice-card to OAuth-card transition and process recovery. Verified user OAuth
 credentials are kept separately as authenticated ciphertext with their exact Feishu response
 expiries, scopes, authorization time, refresh version, and mandatory
 reauthorization time. Access tokens are refreshed within five minutes of
-expiry; each successful refresh atomically replaces both the access token and
-the one-time refresh token. A revoked, expired, or already-consumed refresh
-token fails closed and requires OAuth again, as does the mandatory 365-day
-reauthorization boundary. Operations interrupted while already executing are
-marked failed rather than retried automatically, avoiding duplicate creation.
+expiry. Before calling Feishu, LingoBridge creates a leased
+`feishu_oauth_refresh_attempts` row in `prepared` state using the credential
+version as a compare-and-swap boundary, so concurrent processes do not consume
+the same one-time refresh token twice. A successful response is encrypted and
+persisted as `response_staged` before the credential row is changed; the final
+transaction re-encrypts and replaces both tokens, increments the credential
+version, clears staged ciphertext, and marks the attempt `completed`. Competing
+callers briefly wait and reload the credential instead of calling Feishu again.
+At startup, a `response_staged` attempt is completed without replaying the
+refresh API. An expired `prepared` attempt has an unknown remote outcome, so it
+is marked `ambiguous` and the credential requires OAuth again. Feishu provides
+no idempotency key for refresh: if the process stops after Feishu returns new
+tokens but before `response_staged` is committed, those response values cannot
+be recovered and LingoBridge deliberately fails closed. A revoked, expired, or
+already-consumed refresh token also requires OAuth again, as does the mandatory
+365-day reauthorization boundary. Operations interrupted while already
+executing are marked failed rather than retried automatically, avoiding
+duplicate creation.
 Feishu resource capabilities store the exact collaborator subject, actual
 read/write permission, source OAuth actor, source request, live-verification
 time, and active/revoked state. Local resource grants separately store the exact
@@ -862,8 +879,9 @@ session state, while Feishu and GitHub accounts live only under
 account removes the config entry and clears that account's sync cursor. Feishu
 account deletion also removes its chat-bound document/folder metadata,
 Bot-resource records, Feishu-side resource capabilities, local resource-access
-requests/grants, encrypted user OAuth credentials, pending/completed tool
-approvals, reusable approval grants, and their global workflow request rows.
+requests/grants, encrypted user OAuth credentials and their refresh-attempt
+records, pending/completed tool approvals, reusable approval grants, and their
+global workflow request rows.
 Sessions and media are left intact because current history records are not
 account-id scoped.
 
@@ -946,7 +964,7 @@ internal/platform/github/   # GitHub account/runtime definition, App auth, PR po
 internal/core/              # Middle layer: scoped platform config/data APIs, tool orchestration, commands, sessions, LLM orchestration
 internal/tools/             # Shared tool interfaces, provider-neutral spec/call/result types, and runtime-owned execution context
 internal/mcp/               # Global MCP host/client sessions and MCP tool adapters exposed through tools.Provider
-internal/store/             # Platform-scoped SQLite accounts/sessions/preferences/cursors/tool approvals, resource capabilities/grants, encrypted Feishu OAuth credentials, JSONL history, and media persistence
+internal/store/             # Platform-scoped SQLite accounts/sessions/preferences/cursors/tool approvals, resource capabilities/grants, encrypted Feishu OAuth credentials and durable refresh attempts, JSONL history, and media persistence
 internal/llm/               # Backend provider adapters: OpenAI-compatible and Anthropic APIs
 internal/session/           # Session manager backed by the scoped store
 internal/commands/          # Shared in-chat slash commands

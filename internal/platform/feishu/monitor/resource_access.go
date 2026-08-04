@@ -74,8 +74,18 @@ type resourceAccessStore interface {
 	RevokeFeishuResourceCapability(accountID, resourceType, resourceToken, subjectType, subjectID string, now time.Time) error
 	SaveFeishuUserOAuthCredential(store.FeishuUserOAuthCredential) (store.FeishuUserOAuthCredential, error)
 	GetFeishuUserOAuthCredential(accountID, actorOpenID, actorUserID string) (store.FeishuUserOAuthCredential, error)
+	GetFeishuUserOAuthCredentialByID(id, accountID string) (store.FeishuUserOAuthCredential, error)
 	RotateFeishuUserOAuthCredential(store.FeishuUserOAuthCredential, int64) (store.FeishuUserOAuthCredential, error)
 	MarkFeishuUserOAuthCredentialReauthRequired(id, accountID string, expectedVersion int64, now time.Time) (store.FeishuUserOAuthCredential, error)
+	PrepareFeishuOAuthRefreshAttempt(credentialID, accountID string, expectedVersion int64, leaseToken string, now time.Time, leaseDuration time.Duration) (store.FeishuOAuthRefreshAttempt, bool, error)
+	StageFeishuOAuthRefreshResponse(attemptID, accountID, leaseToken string, stage store.FeishuOAuthRefreshStage, now time.Time) (store.FeishuOAuthRefreshAttempt, error)
+	ApplyFeishuOAuthRefreshAttempt(attemptID, accountID string, update store.FeishuOAuthRefreshCredentialUpdate, now time.Time) (store.FeishuUserOAuthCredential, store.FeishuOAuthRefreshAttempt, error)
+	FailFeishuOAuthRefreshAttempt(attemptID, accountID, leaseToken, errorCategory string, requireReauthorization bool, now time.Time) (store.FeishuUserOAuthCredential, store.FeishuOAuthRefreshAttempt, error)
+	MarkFeishuOAuthRefreshAttemptAmbiguous(attemptID, accountID string, now time.Time) (store.FeishuUserOAuthCredential, store.FeishuOAuthRefreshAttempt, error)
+	InvalidateFeishuOAuthRefreshAttempt(attemptID, accountID, errorCategory string, now time.Time) (store.FeishuUserOAuthCredential, store.FeishuOAuthRefreshAttempt, error)
+	CompleteFeishuOAuthRefreshAttempt(attemptID, accountID string, now time.Time) (store.FeishuOAuthRefreshAttempt, error)
+	GetFeishuOAuthRefreshAttempt(attemptID, accountID string) (store.FeishuOAuthRefreshAttempt, error)
+	ListRecoverableFeishuOAuthRefreshAttempts(accountID string, now time.Time, limit int) ([]store.FeishuOAuthRefreshAttempt, error)
 }
 
 type resourceAccessOAuthConfig struct {
@@ -173,6 +183,9 @@ func newResourceAccessManager(
 }
 
 func (m *resourceAccessManager) recoverPersistedRequests(ctx context.Context) error {
+	if err := m.recoverFeishuOAuthRefreshAttempts(ctx); err != nil {
+		return fmt.Errorf("recover persisted feishu OAuth refresh attempts: %w", err)
+	}
 	now := m.currentTime()
 	expiredGrants, err := m.store.ExpireFeishuResourceGrants(m.account.ID, now)
 	if err != nil {
