@@ -5,13 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
-	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	larkdrive "github.com/larksuite/oapi-sdk-go/v3/service/drive/v1"
 
 	"lingobridge/internal/store"
@@ -25,28 +23,44 @@ const (
 )
 
 type docsFolderTool struct {
-	name           string
-	spec           tooltypes.Spec
-	client         *lark.Client
-	store          *store.Store
-	accountID      string
-	resourceAccess ResourceAccessController
-	now            func() time.Time
+	name    string
+	spec    tooltypes.Spec
+	service *docsFolderService
+}
+
+// docsFolderService owns Feishu folder authorization, persistence, sharing,
+// remote API orchestration, and create reconciliation. docsFolderTool remains
+// the thin provider-facing adapter for one tool name and schema.
+type docsFolderService struct {
+	client                *lark.Client
+	store                 *store.Store
+	accountID             string
+	resourceAccess        ResourceAccessGuard
+	remoteReconcileDelays []time.Duration
+	now                   func() time.Time
 }
 
 // NewDocsFolderTools returns chat-scoped application-folder tools.
-func NewDocsFolderTools(client *lark.Client, st *store.Store, accountID string, cfg Config, resourceAccess ResourceAccessController) []tooltypes.Tool {
+func NewDocsFolderTools(client *lark.Client, st *store.Store, accountID string, cfg Config, resourceAccess ResourceAccessGuard) []tooltypes.Tool {
 	cfg = NormalizeConfig(cfg)
 	accountID = strings.TrimSpace(accountID)
 	if client == nil || st == nil || st.PlatformID() != store.PlatformFeishu || accountID == "" || !cfg.Docs.Enabled {
 		return nil
 	}
+	service := &docsFolderService{
+		client:                client,
+		store:                 st,
+		accountID:             accountID,
+		resourceAccess:        resourceAccess,
+		remoteReconcileDelays: copyRemoteCreateReconciliationDelays(),
+		now:                   time.Now,
+	}
 	tools := []tooltypes.Tool{
-		docsFolderTool{name: folderListToolName, spec: docsFolderListSpec(), client: client, store: st, accountID: accountID, now: time.Now},
+		docsFolderTool{name: folderListToolName, spec: docsFolderListSpec(), service: service},
 	}
 	if cfg.Docs.AllowWrite && resourceAccess != nil {
 		tools = append([]tooltypes.Tool{
-			docsFolderTool{name: folderCreateToolName, spec: docsFolderCreateSpec(), client: client, store: st, accountID: accountID, resourceAccess: resourceAccess, now: time.Now},
+			docsFolderTool{name: folderCreateToolName, spec: docsFolderCreateSpec(), service: service},
 		}, tools...)
 	}
 	return tools
@@ -59,11 +73,15 @@ func (t docsFolderTool) Spec() tooltypes.Spec {
 func (t docsFolderTool) Execute(ctx context.Context, call tooltypes.Call) tooltypes.Result {
 	var content string
 	var err error
+	if t.service == nil {
+		err = fmt.Errorf("feishu docs folder service is unavailable")
+		return tooltypes.Result{CallID: call.ID, Name: t.name, Content: contentOrError("", err), IsError: true}
+	}
 	switch t.name {
 	case folderCreateToolName:
-		content, err = t.createFolder(ctx, call.Arguments)
+		content, err = t.service.createFolder(ctx, call.Arguments)
 	case folderListToolName:
-		content, err = t.listFolders(ctx, call.Arguments)
+		content, err = t.service.listFolders(ctx, call.Arguments)
 	default:
 		err = fmt.Errorf("unsupported feishu docs folder tool %q", t.name)
 	}
@@ -75,6 +93,8 @@ func (t docsFolderTool) Execute(ctx context.Context, call tooltypes.Call) toolty
 	}
 }
 
+var _ tooltypes.Tool = docsFolderTool{}
+
 type folderCreateArgs struct {
 	Name              string `json:"name,omitempty"`
 	ParentFolderToken string `json:"parent_folder_token,omitempty"`
@@ -85,7 +105,7 @@ type folderCreateArgs struct {
 type folderCreateOutput struct {
 	Status            string `json:"status"`
 	RequestID         string `json:"request_id"`
-	FolderToken       string `json:"folder_token"`
+	FolderToken       string `json:"folder_token,omitempty"`
 	Name              string `json:"name"`
 	URL               string `json:"url,omitempty"`
 	ParentFolderToken string `json:"parent_folder_token,omitempty"`
@@ -115,7 +135,7 @@ type applicationRootFolder struct {
 	UserID string
 }
 
-func (t docsFolderTool) createFolder(ctx context.Context, raw json.RawMessage) (string, error) {
+func (t *docsFolderService) createFolder(ctx context.Context, raw json.RawMessage) (string, error) {
 	var args folderCreateArgs
 	if err := json.Unmarshal(raw, &args); err != nil {
 		return "", fmt.Errorf("parse arguments: %w", err)
@@ -131,7 +151,7 @@ func (t docsFolderTool) createFolder(ctx context.Context, raw json.RawMessage) (
 		if args.Name != "" || args.ParentFolderToken != "" || args.SetDefault {
 			return "", fmt.Errorf("request_id retry must not include name, parent_folder_token, or set_default")
 		}
-		return t.retryFolderShare(ctx, actor, chat, args.RequestID)
+		return t.recoverFolderCreate(ctx, actor, chat, args.RequestID)
 	}
 	if args.Name == "" {
 		return "", fmt.Errorf("name is required")
@@ -144,6 +164,7 @@ func (t docsFolderTool) createFolder(ctx context.Context, raw json.RawMessage) (
 	}
 	parentToken := args.ParentFolderToken
 	createParentToken := parentToken
+	expectedOwnerID := ""
 	if parentToken != "" {
 		parent, err := t.store.GetFeishuChatFolder(t.accountID, chat.ChatID, parentToken)
 		if err != nil {
@@ -161,9 +182,10 @@ func (t docsFolderTool) createFolder(ctx context.Context, raw json.RawMessage) (
 			return "", err
 		}
 		createParentToken = root.Token
+		expectedOwnerID = root.UserID
 		feishuToolsLog.Debug(ctx, "resolved feishu application root account=%s root_id=%s owner_id=%s", t.accountID, root.ID, root.UserID)
 	}
-	if err := requireResourceAccess(ctx, t.resourceAccess, ResourceAccessRequirement{
+	if _, err := requireResourceAccess(ctx, t.resourceAccess, t.accountID, ResourceAccessRequirement{
 		ResourceType:  "folder",
 		ResourceToken: createParentToken,
 		Permission:    ResourcePermissionWrite,
@@ -186,129 +208,70 @@ func (t docsFolderTool) createFolder(ctx context.Context, raw json.RawMessage) (
 	if err != nil {
 		return "", fmt.Errorf("create feishu folder workflow request: %w", err)
 	}
-	if err := requireResourceAccess(ctx, t.resourceAccess, ResourceAccessRequirement{
+	payloadHash, err := remoteOperationPayloadHash(struct {
+		OperationKind      string `json:"operation_kind"`
+		ChatID             string `json:"chat_id"`
+		ActorOpenID        string `json:"actor_open_id,omitempty"`
+		ActorUserID        string `json:"actor_user_id,omitempty"`
+		ParentToken        string `json:"parent_token"`
+		BindingParentToken string `json:"binding_parent_token,omitempty"`
+		Name               string `json:"name"`
+		SetDefault         bool   `json:"set_default"`
+		ShareMemberType    string `json:"share_member_type"`
+		ShareMemberID      string `json:"share_member_id"`
+	}{
+		OperationKind:      store.FeishuRemoteOperationKindFolderCreate,
+		ChatID:             chat.ChatID,
+		ActorOpenID:        actor.OpenID,
+		ActorUserID:        actor.UserID,
+		ParentToken:        createParentToken,
+		BindingParentToken: parentToken,
+		Name:               args.Name,
+		SetDefault:         args.SetDefault,
+		ShareMemberType:    shareMemberType,
+		ShareMemberID:      shareMemberID,
+	})
+	if err != nil {
+		t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStateFailed)
+		return "", err
+	}
+	operation, err := t.store.PrepareFeishuRemoteOperation(store.FeishuRemoteOperation{
+		RequestID:           request.ID,
+		AccountID:           t.accountID,
+		OperationKind:       store.FeishuRemoteOperationKindFolderCreate,
+		ChatID:              chat.ChatID,
+		ActorOpenID:         actor.OpenID,
+		ActorUserID:         actor.UserID,
+		ParentResourceType:  "folder",
+		ParentResourceToken: createParentToken,
+		BindingParentToken:  parentToken,
+		RequestedName:       args.Name,
+		PayloadHash:         payloadHash,
+		SetDefault:          args.SetDefault,
+		ShareMemberType:     shareMemberType,
+		ShareMemberID:       shareMemberID,
+		RemoteResourceType:  "folder",
+		CreatedAt:           now,
+	})
+	if err != nil {
+		t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStateFailed)
+		return "", fmt.Errorf("prepare feishu folder remote operation: %w", err)
+	}
+	parent, err := requireResourceAccess(ctx, t.resourceAccess, t.accountID, ResourceAccessRequirement{
 		ResourceType:  "folder",
 		ResourceToken: createParentToken,
 		Permission:    ResourcePermissionWrite,
-	}); err != nil {
+	})
+	if err != nil {
 		t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStateFailed)
 		return "", fmt.Errorf("revalidate parent folder access: %w", err)
 	}
 	feishuToolsLog.Info(ctx, "creating feishu application folder request=%s account=%s chat=%s parent_ref=%s name_chars=%d",
 		shortToolRequestID(request.ID), t.accountID, chat.ChatID, hashString(createParentToken), utf8.RuneCountInString(args.Name))
-	created, err := t.createApplicationFolder(ctx, args.Name, createParentToken)
-	if err != nil {
-		t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStateFailed)
-		return "", fmt.Errorf("create feishu application folder: %w", err)
-	}
-	if _, err := t.store.SaveFeishuBotResource(store.FeishuBotResource{
-		AccountID:       t.accountID,
-		ResourceType:    "folder",
-		ResourceToken:   created.FolderToken,
-		ParentToken:     createParentToken,
-		Name:            args.Name,
-		URL:             created.URL,
-		SourceRequestID: request.ID,
-		CreatedAt:       now,
-	}); err != nil {
-		t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStatePartial)
-		feishuToolsLog.Error(ctx, "persist created feishu folder ownership failed request=%s account=%s chat=%s folder_ref=%s: %v",
-			shortToolRequestID(request.ID), t.accountID, chat.ChatID, hashString(created.FolderToken), err)
-		return marshalToolOutput(folderCreateOutput{
-			Status:            "partial",
-			RequestID:         request.ID,
-			FolderToken:       created.FolderToken,
-			Name:              args.Name,
-			URL:               created.URL,
-			ParentFolderToken: parentToken,
-			Shared:            false,
-			Warning:           "文件夹已创建，但 Bot 资源归属记录失败。请勿用相同名称重复创建；请联系管理员检查数据库。",
-		})
-	}
-	folder, saveErr := t.store.SaveFeishuChatFolder(store.FeishuChatFolder{
-		AccountID:         t.accountID,
-		ChatID:            chat.ChatID,
-		FolderToken:       created.FolderToken,
-		Name:              args.Name,
-		URL:               created.URL,
-		ParentFolderToken: parentToken,
-		Default:           args.SetDefault,
-		ShareMemberType:   shareMemberType,
-		ShareMemberID:     shareMemberID,
-		ShareState:        store.FeishuFolderShareStatePending,
-		CreateRequestID:   request.ID,
-		CreatedByOpenID:   actor.OpenID,
-		CreatedByUserID:   actor.UserID,
-		CreatedAt:         now,
-	})
-	if saveErr != nil {
-		t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStatePartial)
-		feishuToolsLog.Error(ctx, "persist created feishu folder failed request=%s account=%s chat=%s folder_ref=%s: %v",
-			shortToolRequestID(request.ID), t.accountID, chat.ChatID, hashString(created.FolderToken), saveErr)
-		return marshalToolOutput(folderCreateOutput{
-			Status:            "partial",
-			RequestID:         request.ID,
-			FolderToken:       created.FolderToken,
-			Name:              args.Name,
-			URL:               created.URL,
-			ParentFolderToken: parentToken,
-			Shared:            false,
-			Warning:           "文件夹已创建，但本地对话绑定保存失败。请勿用相同名称重复创建；请联系管理员检查数据库。",
-		})
-	}
-	if err := t.ensureFolderFullAccess(ctx, folder, false); err != nil {
-		t.updateFolderShareBestEffort(ctx, folder, store.FeishuFolderShareStateFailed)
-		t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStatePartial)
-		feishuToolsLog.Warn(ctx, "share feishu folder failed request=%s account=%s chat=%s folder_ref=%s target_type=%s: %v",
-			shortToolRequestID(request.ID), t.accountID, chat.ChatID, hashString(folder.FolderToken), folder.ShareMemberType, err)
-		return marshalToolOutput(folderCreateOutput{
-			Status:            "partial",
-			RequestID:         request.ID,
-			FolderToken:       folder.FolderToken,
-			Name:              folder.Name,
-			URL:               folder.URL,
-			ParentFolderToken: folder.ParentFolderToken,
-			Default:           folder.Default,
-			Shared:            false,
-			Warning:           "文件夹已创建，但未能授予当前对话完全访问权限。请勿重新创建文件夹。",
-			Retry:             fmt.Sprintf("再次调用 %s，并且只传 request_id=%s，以仅重试授权。", folderCreateToolName, request.ID),
-		})
-	}
-	if err := t.store.UpdateFeishuChatFolderShareState(folder.AccountID, folder.ChatID, folder.FolderToken, store.FeishuFolderShareStateSucceeded, t.currentTime()); err != nil {
-		t.updateWorkflowBestEffort(ctx, request.ID, store.WorkflowRequestStatePartial)
-		feishuToolsLog.Warn(ctx, "record feishu folder share success failed request=%s account=%s chat=%s folder_ref=%s: %v",
-			shortToolRequestID(request.ID), t.accountID, chat.ChatID, hashString(folder.FolderToken), err)
-		return marshalToolOutput(folderCreateOutput{
-			Status:            "partial",
-			RequestID:         request.ID,
-			FolderToken:       folder.FolderToken,
-			Name:              folder.Name,
-			URL:               folder.URL,
-			ParentFolderToken: folder.ParentFolderToken,
-			Default:           folder.Default,
-			Shared:            true,
-			Warning:           "文件夹已创建并授权，但本地状态尚未确认。",
-			Retry:             fmt.Sprintf("再次调用 %s，并且只传 request_id=%s，以核验并完成记录。", folderCreateToolName, request.ID),
-		})
-	}
-	if err := t.store.UpdateWorkflowRequestState(request.ID, t.accountID, store.WorkflowRequestStateSucceeded, t.currentTime()); err != nil {
-		feishuToolsLog.Warn(ctx, "mark feishu folder workflow succeeded failed request=%s account=%s: %v", shortToolRequestID(request.ID), t.accountID, err)
-		folder.ShareState = store.FeishuFolderShareStateSucceeded
-		return marshalToolOutput(folderOutput(
-			folder,
-			"partial",
-			true,
-			"文件夹已创建并授权，但请求状态尚未完成记录。",
-			fmt.Sprintf("再次调用 %s，并且只传 request_id=%s，以完成状态记录。", folderCreateToolName, request.ID),
-		))
-	}
-	folder.ShareState = store.FeishuFolderShareStateSucceeded
-	feishuToolsLog.Info(ctx, "created and shared feishu application folder request=%s account=%s chat=%s folder_ref=%s target_type=%s default=%t",
-		shortToolRequestID(request.ID), t.accountID, chat.ChatID, hashString(folder.FolderToken), folder.ShareMemberType, folder.Default)
-	return marshalToolOutput(folderOutput(folder, "created", true, "", ""))
+	return t.continueFolderCreate(ctx, operation, parent, expectedOwnerID)
 }
 
-func (t docsFolderTool) retryFolderShare(ctx context.Context, actor Actor, chat ChatContext, requestID string) (string, error) {
+func (t *docsFolderService) retryFolderShare(ctx context.Context, actor Actor, chat ChatContext, requestID string) (string, error) {
 	if actor.OpenID == "" && actor.UserID == "" {
 		return "", fmt.Errorf("feishu folder retry requires the requesting user identity")
 	}
@@ -325,9 +288,17 @@ func (t docsFolderTool) retryFolderShare(ctx context.Context, actor Actor, chat 
 		}
 		return marshalToolOutput(folderOutput(folder, "created", true, "", ""))
 	}
+	authorized, err := requireResourceAccess(ctx, t.resourceAccess, t.accountID, ResourceAccessRequirement{
+		ResourceType:  "folder",
+		ResourceToken: folder.FolderToken,
+		Permission:    ResourcePermissionWrite,
+	})
+	if err != nil {
+		return "", fmt.Errorf("authorize feishu folder sharing: %w", err)
+	}
 	feishuToolsLog.Info(ctx, "retrying feishu folder share request=%s account=%s chat=%s folder_ref=%s target_type=%s",
 		shortToolRequestID(requestID), t.accountID, chat.ChatID, hashString(folder.FolderToken), folder.ShareMemberType)
-	if err := t.ensureFolderFullAccess(ctx, folder, folder.ShareState == store.FeishuFolderShareStatePending); err != nil {
+	if err := t.ensureFolderFullAccess(ctx, folder, authorized); err != nil {
 		t.updateFolderShareBestEffort(ctx, folder, store.FeishuFolderShareStateFailed)
 		t.updateWorkflowBestEffort(ctx, requestID, store.WorkflowRequestStatePartial)
 		return marshalToolOutput(folderOutput(
@@ -351,7 +322,7 @@ func (t docsFolderTool) retryFolderShare(ctx context.Context, actor Actor, chat 
 	return marshalToolOutput(folderOutput(folder, "created", true, "", ""))
 }
 
-func (t docsFolderTool) listFolders(ctx context.Context, raw json.RawMessage) (string, error) {
+func (t *docsFolderService) listFolders(ctx context.Context, raw json.RawMessage) (string, error) {
 	if len(strings.TrimSpace(string(raw))) > 0 && strings.TrimSpace(string(raw)) != "{}" {
 		var args map[string]interface{}
 		if err := json.Unmarshal(raw, &args); err != nil {
@@ -407,72 +378,21 @@ func folderShareTarget(actor Actor, chat ChatContext) (string, string, error) {
 	return larkdrive.MemberTypeOpenId, actor.OpenID, nil
 }
 
-func (t docsFolderTool) applicationRootFolder(ctx context.Context) (applicationRootFolder, error) {
-	resp, err := t.client.Get(ctx, "/open-apis/drive/explorer/v2/root_folder/meta", nil, larkcore.AccessTokenTypeTenant)
-	if err != nil {
-		return applicationRootFolder{}, fmt.Errorf("get feishu application root folder: %w", err)
-	}
-	if resp == nil {
-		return applicationRootFolder{}, fmt.Errorf("get feishu application root folder: empty response")
-	}
-	var result struct {
-		Code int    `json:"code"`
-		Msg  string `json:"msg"`
-		Data struct {
-			Token  string `json:"token"`
-			ID     string `json:"id"`
-			UserID string `json:"user_id"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(resp.RawBody, &result); err != nil {
-		return applicationRootFolder{}, fmt.Errorf("parse feishu application root folder: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK || result.Code != 0 {
-		return applicationRootFolder{}, fmt.Errorf("get feishu application root folder status=%d code=%d msg=%s", resp.StatusCode, result.Code, result.Msg)
-	}
-	root := applicationRootFolder{
-		Token:  strings.TrimSpace(result.Data.Token),
-		ID:     strings.TrimSpace(result.Data.ID),
-		UserID: strings.TrimSpace(result.Data.UserID),
-	}
-	if root.Token == "" {
-		return applicationRootFolder{}, fmt.Errorf("get feishu application root folder returned no token")
-	}
-	return root, nil
+func (t *docsFolderService) applicationRootFolder(ctx context.Context) (applicationRootFolder, error) {
+	return getApplicationRootFolder(ctx, t.client)
 }
 
-func (t docsFolderTool) createApplicationFolder(ctx context.Context, name, parentToken string) (store.FeishuChatFolder, error) {
-	req := larkdrive.NewCreateFolderFileReqBuilder().
-		Body(larkdrive.NewCreateFolderFileReqBodyBuilder().Name(name).FolderToken(parentToken).Build()).
-		Build()
-	resp, err := t.client.Drive.File.CreateFolder(ctx, req)
-	if err != nil {
-		return store.FeishuChatFolder{}, err
+func (t *docsFolderService) ensureFolderFullAccess(ctx context.Context, folder store.FeishuChatFolder, authorized AuthorizedResource) error {
+	if authorized.AccountID != folder.AccountID || authorized.ChatID != folder.ChatID ||
+		!authorizedResourcePermits(authorized, "folder", folder.FolderToken, ResourcePermissionWrite) {
+		return fmt.Errorf("grant feishu folder full access: authorized folder/write resource does not match the stored chat folder")
 	}
-	if resp == nil || !resp.Success() {
-		if resp == nil {
-			return store.FeishuChatFolder{}, fmt.Errorf("empty response")
-		}
-		return store.FeishuChatFolder{}, fmt.Errorf("code=%d msg=%s", resp.Code, resp.Msg)
-	}
-	if resp.Data == nil || strings.TrimSpace(deref(resp.Data.Token)) == "" {
-		return store.FeishuChatFolder{}, fmt.Errorf("response missing folder token")
-	}
-	token := strings.TrimSpace(deref(resp.Data.Token))
-	url := strings.TrimSpace(deref(resp.Data.Url))
-	if url == "" {
-		url = "https://docs.feishu.cn/drive/folder/" + token
-	}
-	return store.FeishuChatFolder{FolderToken: token, URL: url}, nil
-}
-
-func (t docsFolderTool) ensureFolderFullAccess(ctx context.Context, folder store.FeishuChatFolder, acceptExisting bool) error {
 	memberType := larkdrive.TypeCreatePermissionMemberUser
 	if folder.ShareMemberType == larkdrive.MemberTypeOpenChat {
 		memberType = larkdrive.TypeCreatePermissionMemberChat
 	}
 	createReq := larkdrive.NewCreatePermissionMemberReqBuilder().
-		Token(folder.FolderToken).
+		Token(authorized.ResourceToken).
 		Type(larkdrive.TokenTypeV2CreatePermissionMemberFolder).
 		NeedNotification(false).
 		BaseMember(larkdrive.NewBaseMemberBuilder().
@@ -490,32 +410,59 @@ func (t docsFolderTool) ensureFolderFullAccess(ctx context.Context, folder store
 		if createResp == nil {
 			return fmt.Errorf("grant feishu folder full access: empty response")
 		}
-		// A pending local state can mean Feishu accepted the previous request but
-		// the local success update failed. In that exact retry case, the official
-		// "invalid operation" response is treated as already granted.
-		if acceptExisting && createResp.Code == 1063003 {
-			feishuToolsLog.Debug(ctx, "feishu folder collaborator already exists during retry request=%s folder_ref=%s", shortToolRequestID(folder.CreateRequestID), hashString(folder.FolderToken))
-			return nil
+		if createResp.Code == 1063003 {
+			return t.upgradeFolderCollaboratorToFullAccess(ctx, folder, authorized)
 		}
 		return fmt.Errorf("grant feishu folder full access code=%d msg=%s", createResp.Code, createResp.Msg)
 	}
 	return nil
 }
 
-func (t docsFolderTool) updateFolderShareBestEffort(ctx context.Context, folder store.FeishuChatFolder, state string) {
+func (t *docsFolderService) upgradeFolderCollaboratorToFullAccess(ctx context.Context, folder store.FeishuChatFolder, authorized AuthorizedResource) error {
+	memberType := larkdrive.TypeUpdatePermissionMemberUser
+	if folder.ShareMemberType == larkdrive.MemberTypeOpenChat {
+		memberType = larkdrive.TypeUpdatePermissionMemberChat
+	}
+	updateReq := larkdrive.NewUpdatePermissionMemberReqBuilder().
+		Token(authorized.ResourceToken).
+		MemberId(folder.ShareMemberID).
+		Type(larkdrive.TokenTypeV2CreatePermissionMemberFolder).
+		BaseMember(larkdrive.NewBaseMemberBuilder().
+			MemberType(folder.ShareMemberType).
+			MemberId(folder.ShareMemberID).
+			Perm(larkdrive.PermUpdatePermissionMemberFullAccess).
+			Type(memberType).
+			Build()).
+		Build()
+	updateResp, err := t.client.Drive.PermissionMember.Update(ctx, updateReq)
+	if err != nil {
+		return fmt.Errorf("upgrade existing feishu folder collaborator to full access: %w", err)
+	}
+	if updateResp == nil {
+		return fmt.Errorf("upgrade existing feishu folder collaborator to full access: empty response")
+	}
+	if !updateResp.Success() {
+		return fmt.Errorf("upgrade existing feishu folder collaborator to full access code=%d msg=%s", updateResp.Code, updateResp.Msg)
+	}
+	feishuToolsLog.Info(ctx, "upgraded existing feishu folder collaborator to full access request=%s account=%s chat=%s folder_ref=%s target_type=%s",
+		shortToolRequestID(folder.CreateRequestID), folder.AccountID, folder.ChatID, hashString(folder.FolderToken), folder.ShareMemberType)
+	return nil
+}
+
+func (t *docsFolderService) updateFolderShareBestEffort(ctx context.Context, folder store.FeishuChatFolder, state string) {
 	if err := t.store.UpdateFeishuChatFolderShareState(folder.AccountID, folder.ChatID, folder.FolderToken, state, t.currentTime()); err != nil {
 		feishuToolsLog.Warn(ctx, "update feishu folder share state failed request=%s account=%s chat=%s folder_ref=%s state=%s: %v",
 			shortToolRequestID(folder.CreateRequestID), folder.AccountID, folder.ChatID, hashString(folder.FolderToken), state, err)
 	}
 }
 
-func (t docsFolderTool) updateWorkflowBestEffort(ctx context.Context, requestID, state string) {
+func (t *docsFolderService) updateWorkflowBestEffort(ctx context.Context, requestID, state string) {
 	if err := t.store.UpdateWorkflowRequestState(requestID, t.accountID, state, t.currentTime()); err != nil {
 		feishuToolsLog.Warn(ctx, "update feishu folder workflow failed request=%s account=%s state=%s: %v", shortToolRequestID(requestID), t.accountID, state, err)
 	}
 }
 
-func (t docsFolderTool) currentTime() time.Time {
+func (t *docsFolderService) currentTime() time.Time {
 	if t.now == nil {
 		return time.Now().UTC()
 	}
@@ -540,8 +487,8 @@ func folderOutput(folder store.FeishuChatFolder, status string, shared bool, war
 func docsFolderCreateSpec() tooltypes.Spec {
 	return tooltypes.Spec{
 		Name:        folderCreateToolName,
-		Description: "Create a Bot-owned Feishu folder under the Bot root or another Bot-owned folder bound to the current trusted chat, then grant the chat or private-chat user full access. The tool checks folder/write access from trusted context before creation and returns resource_authorization_required if it is missing; it does not send a resource card itself. This operation has no separate operation-approval card. If sharing fails after creation, retry with only request_id so the folder is not created twice.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"name":{"type":"string","description":"Folder name for a new folder; maximum 256 UTF-8 bytes."},"parent_folder_token":{"type":"string","description":"Optional Bot-owned parent folder already bound to this exact Feishu chat. Omit to use the Bot root."},"set_default":{"type":"boolean","description":"Make the new folder the default for this chat. The first folder is always default."},"request_id":{"type":"string","description":"Retry a prior partial result by sharing the already-created folder; when set, omit all other fields."}},"oneOf":[{"required":["name"]},{"required":["request_id"]}],"additionalProperties":false}`),
+		Description: "Create a Bot-owned Feishu folder under the Bot root or another Bot-owned folder bound to the current trusted chat, then grant the chat or private-chat user full access. The tool checks folder/write access from trusted context before creation and returns resource_authorization_required if it is missing; it does not send a resource card itself. This operation has no separate operation-approval card. If creation is uncertain or later persistence/sharing is incomplete, retry with only request_id; recovery never repeats the create API call.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"name":{"type":"string","description":"Folder name for a new folder; maximum 256 UTF-8 bytes."},"parent_folder_token":{"type":"string","description":"Optional Bot-owned parent folder already bound to this exact Feishu chat. Omit to use the Bot root."},"set_default":{"type":"boolean","description":"Make the new folder the default for this chat. The first folder is always default."},"request_id":{"type":"string","description":"Recover a prior partial or uncertain creation without repeating the create API call; when set, omit all other fields."}},"oneOf":[{"required":["name"]},{"required":["request_id"]}],"additionalProperties":false}`),
 	}
 }
 

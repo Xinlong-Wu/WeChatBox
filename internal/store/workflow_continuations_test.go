@@ -240,6 +240,63 @@ func TestWorkflowContinuationLeaseRetryAndDelivery(t *testing.T) {
 	}
 }
 
+func TestWorkflowContinuationReleaseRestoresAttemptBudget(t *testing.T) {
+	st := openTestStore(t)
+	now := time.Date(2026, time.August, 3, 12, 55, 0, 0, time.UTC)
+	continuation := createReadyWorkflowContinuationForTest(t, st, now)
+
+	claimed, err := st.ClaimWorkflowContinuation(
+		continuation.RequestID,
+		continuation.AccountID,
+		"shutdown-lease",
+		now.Add(2*time.Second),
+		time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("ClaimWorkflowContinuation returned error: %v", err)
+	}
+	if claimed.Attempts != 1 || claimed.State != WorkflowContinuationStateProcessing {
+		t.Fatalf("claimed continuation = %#v, want processing attempt 1", claimed)
+	}
+
+	err = st.ReleaseWorkflowContinuation(
+		continuation.RequestID,
+		continuation.AccountID,
+		"wrong-lease",
+		"runtime shutting down",
+		now.Add(3*time.Second),
+	)
+	if !errors.Is(err, ErrWorkflowContinuationLeaseLost) {
+		t.Fatalf("wrong lease release error = %v, want ErrWorkflowContinuationLeaseLost", err)
+	}
+	stillClaimed, err := st.GetWorkflowContinuation(continuation.RequestID, continuation.AccountID)
+	if err != nil {
+		t.Fatalf("GetWorkflowContinuation after wrong lease returned error: %v", err)
+	}
+	if stillClaimed.Attempts != 1 || stillClaimed.State != WorkflowContinuationStateProcessing || stillClaimed.LeaseToken != "shutdown-lease" {
+		t.Fatalf("continuation after wrong lease = %#v, want unchanged processing attempt", stillClaimed)
+	}
+
+	if err := st.ReleaseWorkflowContinuation(
+		continuation.RequestID,
+		continuation.AccountID,
+		"shutdown-lease",
+		"runtime shutting down",
+		now.Add(4*time.Second),
+	); err != nil {
+		t.Fatalf("ReleaseWorkflowContinuation returned error: %v", err)
+	}
+	released, err := st.GetWorkflowContinuation(continuation.RequestID, continuation.AccountID)
+	if err != nil {
+		t.Fatalf("GetWorkflowContinuation after release returned error: %v", err)
+	}
+	if released.State != WorkflowContinuationStateReady || released.Attempts != 0 ||
+		released.LeaseToken != "" || !released.LeaseExpiresAt.IsZero() ||
+		!released.AvailableAt.Equal(now.Add(4*time.Second)) || released.LastError != "runtime shutting down" {
+		t.Fatalf("released continuation = %#v, want immediately ready with restored attempt budget", released)
+	}
+}
+
 func TestWorkflowContinuationExpiredLeaseIsResumable(t *testing.T) {
 	st := openTestStore(t)
 	now := time.Date(2026, time.August, 3, 13, 0, 0, 0, time.UTC)

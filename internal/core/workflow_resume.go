@@ -97,6 +97,13 @@ func (b *Bot) ResumeWorkflow(ctx context.Context, request WorkflowResumeRequest,
 
 	buffer := &workflowResumeBuffer{}
 	err = b.withSessionLane(ctx, msg, continuation.SessionID, func(laneCtx context.Context) error {
+		targetSession, sessionErr := b.Sessions.GetSession(continuation.UserKey, continuation.SessionID)
+		if sessionErr != nil {
+			return fmt.Errorf("load workflow resume target session: %w", sessionErr)
+		}
+		if targetSession == nil || targetSession.ID != continuation.SessionID || targetSession.UserID != continuation.UserKey || targetSession.Archived {
+			return fmt.Errorf("%w: workflow resume target session is unavailable", store.ErrSessionNotFound)
+		}
 		conv, loadErr := b.Sessions.LoadHistory(continuation.UserKey, continuation.SessionID)
 		if loadErr != nil {
 			return fmt.Errorf("load workflow resume conversation: %w", loadErr)
@@ -104,7 +111,7 @@ func (b *Bot) ResumeWorkflow(ctx context.Context, request WorkflowResumeRequest,
 		if conv == nil {
 			conv = &store.Conversation{}
 		}
-		assistant, committedRevision, found, findErr := committedWorkflowResumeAssistant(conv, continuation.RequestID)
+		assistant, textChunks, committedRevision, found, findErr := committedWorkflowResumeAssistant(conv, continuation.RequestID)
 		if findErr != nil {
 			return findErr
 		}
@@ -113,12 +120,11 @@ func (b *Bot) ResumeWorkflow(ctx context.Context, request WorkflowResumeRequest,
 			if commitErr := b.commitPendingWorkflows(laneCtx, continuation.AccountID, pending, committedRevision); commitErr != nil {
 				return fmt.Errorf("reconcile chained workflow continuations: %w", commitErr)
 			}
-			buffer.appendStoredAssistant(assistant, b.chunkLimit())
+			buffer.appendStoredAssistant(assistant, textChunks, b.chunkLimit())
 			coreLog.Debug(laneCtx, "replaying committed workflow resume request=%s account=%s session=%s revision=%d",
 				continuation.RequestID, continuation.AccountID, continuation.SessionID, conv.Revision)
 		} else {
-			sess := &store.Session{ID: continuation.SessionID, UserID: continuation.UserKey}
-			if replyErr := b.replyInSession(laneCtx, msg, buffer, selection.Options, sess); replyErr != nil {
+			if replyErr := b.replyInSession(laneCtx, msg, buffer, selection.Options, targetSession); replyErr != nil {
 				return fmt.Errorf("resume workflow conversation: %w", replyErr)
 			}
 		}
@@ -193,29 +199,137 @@ func strconvQuote(value string) string {
 	return string(raw)
 }
 
-func committedWorkflowResumeAssistant(conv *store.Conversation, requestID string) (store.Message, int64, bool, error) {
+func committedWorkflowResumeAssistant(conv *store.Conversation, requestID string) (store.Message, []string, int64, bool, error) {
 	if conv == nil {
-		return store.Message{}, 0, false, nil
+		return store.Message{}, nil, 0, false, nil
+	}
+	requestID = strings.TrimSpace(requestID)
+	if receipt, ok := conv.WorkflowResumeReceipts[requestID]; ok {
+		if receipt.CommittedRevision <= 0 || receipt.Assistant.Role != "assistant" {
+			return store.Message{}, nil, 0, false, fmt.Errorf("%w: workflow resume receipt %s is invalid", ErrWorkflowResumeInvalid, requestID)
+		}
+		return receipt.Assistant, cloneWorkflowResumeTextChunks(receipt.TextChunks), receipt.CommittedRevision, true, nil
 	}
 	for index, message := range conv.Messages {
 		if message.Internal == nil || message.Internal.Kind != workflowResultInternalEventKind || message.Internal.ID != requestID {
 			continue
 		}
 		if message.Internal.CommittedRevision <= 0 {
-			return store.Message{}, 0, false, fmt.Errorf("%w: workflow resume event %s has no committed revision", ErrWorkflowResumeInvalid, requestID)
+			return store.Message{}, nil, 0, false, fmt.Errorf("%w: workflow resume event %s has no committed revision", ErrWorkflowResumeInvalid, requestID)
 		}
 		for next := index + 1; next < len(conv.Messages); next++ {
 			candidate := conv.Messages[next]
 			if candidate.Role == "assistant" {
-				return candidate, message.Internal.CommittedRevision, true, nil
+				return candidate, nil, message.Internal.CommittedRevision, true, nil
 			}
 			if candidate.Role == "user" || candidate.Internal != nil {
 				break
 			}
 		}
-		return store.Message{}, 0, false, fmt.Errorf("%w: workflow resume event %s was saved without an assistant response", ErrWorkflowResumeInvalid, requestID)
+		return store.Message{}, nil, 0, false, fmt.Errorf("%w: workflow resume event %s was saved without an assistant response", ErrWorkflowResumeInvalid, requestID)
 	}
-	return store.Message{}, 0, false, nil
+	return store.Message{}, nil, 0, false, nil
+}
+
+func rememberWorkflowResumeReceipt(conv *store.Conversation, event, assistant store.Message, textChunks []string) {
+	if conv == nil || event.Internal == nil || event.Internal.Kind != workflowResultInternalEventKind ||
+		strings.TrimSpace(event.Internal.ID) == "" || event.Internal.CommittedRevision <= 0 || assistant.Role != "assistant" {
+		return
+	}
+	if conv.WorkflowResumeReceipts == nil {
+		conv.WorkflowResumeReceipts = make(map[string]store.WorkflowResumeReceipt)
+	}
+	conv.WorkflowResumeReceipts[event.Internal.ID] = store.WorkflowResumeReceipt{
+		Assistant:         workflowResumeReceiptAssistant(assistant),
+		CommittedRevision: event.Internal.CommittedRevision,
+		TextChunks:        cloneWorkflowResumeTextChunks(textChunks),
+	}
+}
+
+func workflowResumeReceiptAssistant(assistant store.Message) store.Message {
+	receipt := store.Message{
+		Role:        assistant.Role,
+		Content:     assistant.Content,
+		Attachments: append([]store.Attachment(nil), assistant.Attachments...),
+	}
+	for _, trace := range assistant.ToolTraces {
+		requestID := strings.TrimSpace(trace.PendingWorkflowID)
+		if requestID == "" {
+			continue
+		}
+		receipt.ToolTraces = append(receipt.ToolTraces, store.ToolTrace{
+			CallID:            strings.TrimSpace(trace.CallID),
+			Name:              strings.TrimSpace(trace.Name),
+			PendingWorkflowID: requestID,
+		})
+	}
+	return receipt
+}
+
+func rememberWorkflowOriginReceipts(conv *store.Conversation, traces []store.ToolTrace, committedRevision int64) {
+	if conv == nil || committedRevision <= 0 {
+		return
+	}
+	for _, trace := range traces {
+		requestID := strings.TrimSpace(trace.PendingWorkflowID)
+		toolCallID := strings.TrimSpace(trace.CallID)
+		toolName := strings.TrimSpace(trace.Name)
+		if requestID == "" || toolCallID == "" || toolName == "" {
+			continue
+		}
+		if conv.WorkflowOriginReceipts == nil {
+			conv.WorkflowOriginReceipts = make(map[string]store.WorkflowOriginReceipt)
+		}
+		if _, exists := conv.WorkflowOriginReceipts[requestID]; exists {
+			continue
+		}
+		conv.WorkflowOriginReceipts[requestID] = store.WorkflowOriginReceipt{
+			ToolCallID:        toolCallID,
+			ToolName:          toolName,
+			CommittedRevision: committedRevision,
+		}
+	}
+}
+
+func workflowResumeDeliveryTextChunks(text string, chunkLimit int) []string {
+	if text == "" {
+		return []string{}
+	}
+	return SplitTextChunks(text, chunkLimit)
+}
+
+func cloneWorkflowResumeTextChunks(chunks []string) []string {
+	if chunks == nil {
+		return nil
+	}
+	cloned := make([]string, len(chunks))
+	copy(cloned, chunks)
+	return cloned
+}
+
+func backfillWorkflowResumeReceipts(conv *store.Conversation) {
+	if conv == nil {
+		return
+	}
+	for index, event := range conv.Messages {
+		if event.Internal == nil || event.Internal.Kind != workflowResultInternalEventKind ||
+			strings.TrimSpace(event.Internal.ID) == "" || event.Internal.CommittedRevision <= 0 {
+			continue
+		}
+		if _, exists := conv.WorkflowResumeReceipts[event.Internal.ID]; exists {
+			continue
+		}
+		for next := index + 1; next < len(conv.Messages); next++ {
+			candidate := conv.Messages[next]
+			if candidate.Role == "assistant" {
+				rememberWorkflowResumeReceipt(conv, event, candidate, nil)
+				break
+			}
+			if candidate.Role == "user" || candidate.Internal != nil {
+				break
+			}
+		}
+	}
 }
 
 func pendingWorkflowIDsFromTraces(traces []store.ToolTrace) []string {
@@ -249,8 +363,14 @@ func (b *workflowResumeBuffer) FinishCompactNotice(context.Context, CompactNotic
 	return nil
 }
 
-func (b *workflowResumeBuffer) appendStoredAssistant(message store.Message, chunkLimit int) {
-	for _, chunk := range SplitTextChunks(message.Content, chunkLimit) {
+func (b *workflowResumeBuffer) appendStoredAssistant(message store.Message, textChunks []string, fallbackChunkLimit int) {
+	if textChunks == nil {
+		textChunks = SplitTextChunks(message.Content, fallbackChunkLimit)
+	}
+	for _, chunk := range textChunks {
+		if chunk == "" {
+			continue
+		}
 		b.messages = append(b.messages, OutboundMessage{Text: chunk})
 	}
 	for _, attachment := range message.Attachments {

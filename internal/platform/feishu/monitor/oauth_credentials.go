@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	lark "github.com/larksuite/oapi-sdk-go/v3"
+	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	"github.com/larksuite/oapi-sdk-go/v3/core/accesstoken"
 	"github.com/larksuite/oapi-sdk-go/v3/core/accesstoken/refreshtoken"
 
@@ -56,6 +58,65 @@ type feishuOAuthTokenBundle struct {
 	RefreshToken          string
 	RefreshTokenExpiresIn time.Duration
 	Scopes                string
+}
+
+// oauthCredentialService owns persisted user OAuth credentials and durable
+// refresh-token rotation. It intentionally depends only on OAuth storage and
+// the Feishu REST client, not cards, resource requests, or callback routing.
+type oauthCredentialService struct {
+	store            oauthCredentialStore
+	client           *lark.Client
+	account          store.Account
+	credentialCipher *feishuOAuthCredentialCipher
+	now              func() time.Time
+	refreshPeerWait  time.Duration
+	refreshPoll      time.Duration
+}
+
+func (s *oauthCredentialService) currentTime() time.Time {
+	if s == nil || s.now == nil {
+		return time.Now().UTC()
+	}
+	return s.now().UTC()
+}
+
+func (m *resourceAccessManager) oauthCredentialService() *oauthCredentialService {
+	if m == nil {
+		return nil
+	}
+	return &oauthCredentialService{
+		store:            m.store,
+		client:           m.client,
+		account:          m.account,
+		credentialCipher: m.credentialCipher,
+		now:              m.currentTime,
+		refreshPeerWait:  m.refreshPeerWait,
+		refreshPoll:      m.refreshPoll,
+	}
+}
+
+func (m *resourceAccessManager) persistFeishuOAuthCredential(ctx context.Context, identity feishuOAuthIdentity, tokens feishuOAuthTokenBundle) (store.FeishuUserOAuthCredential, error) {
+	return m.oauthCredentialService().persistFeishuOAuthCredential(ctx, identity, tokens)
+}
+
+func (m *resourceAccessManager) feishuUserAccessToken(ctx context.Context, actorOpenID, actorUserID string) (string, error) {
+	return m.oauthCredentialService().feishuUserAccessToken(ctx, actorOpenID, actorUserID)
+}
+
+func (m *resourceAccessManager) recoverFeishuOAuthRefreshAttempts(ctx context.Context) error {
+	return m.oauthCredentialService().recoverFeishuOAuthRefreshAttempts(ctx)
+}
+
+func (m *resourceAccessManager) accessTokenFromStagedFeishuOAuthRefresh(ctx context.Context, attempt store.FeishuOAuthRefreshAttempt) (string, error) {
+	return m.oauthCredentialService().accessTokenFromStagedFeishuOAuthRefresh(ctx, attempt)
+}
+
+func (m *resourceAccessManager) waitForFeishuOAuthRefresh(ctx context.Context, original store.FeishuUserOAuthCredential, attempt store.FeishuOAuthRefreshAttempt) (string, error) {
+	return m.oauthCredentialService().waitForFeishuOAuthRefresh(ctx, original, attempt)
+}
+
+func (m *resourceAccessManager) resolveFeishuOAuthRefreshPeerTimeout(ctx context.Context, original store.FeishuUserOAuthCredential, attempt store.FeishuOAuthRefreshAttempt) (string, error) {
+	return m.oauthCredentialService().resolveFeishuOAuthRefreshPeerTimeout(ctx, original, attempt)
 }
 
 func newFeishuOAuthCredentialCipher(secret, accountID string) (*feishuOAuthCredentialCipher, error) {
@@ -186,7 +247,7 @@ func feishuOAuthIdentityKey(identity feishuOAuthIdentity) (string, string) {
 	return "user_id", strings.TrimSpace(identity.UserID)
 }
 
-func (m *resourceAccessManager) persistFeishuOAuthCredential(ctx context.Context, identity feishuOAuthIdentity, tokens feishuOAuthTokenBundle) (store.FeishuUserOAuthCredential, error) {
+func (m *oauthCredentialService) persistFeishuOAuthCredential(ctx context.Context, identity feishuOAuthIdentity, tokens feishuOAuthTokenBundle) (store.FeishuUserOAuthCredential, error) {
 	if m == nil || m.credentialCipher == nil {
 		return store.FeishuUserOAuthCredential{}, ErrFeishuUserOAuthCredentialUnavailable
 	}
@@ -200,6 +261,49 @@ func (m *resourceAccessManager) persistFeishuOAuthCredential(ctx context.Context
 		return store.FeishuUserOAuthCredential{}, fmt.Errorf("feishu OAuth access token and positive expiry are required")
 	}
 	now := m.currentTime()
+	var credential store.FeishuUserOAuthCredential
+	for saveAttempt := 0; saveAttempt < 2; saveAttempt++ {
+		encrypted, err := m.encryptedFeishuOAuthCredential(identity, tokens, now)
+		if err != nil {
+			return store.FeishuUserOAuthCredential{}, err
+		}
+		credential, err = m.store.SaveFeishuUserOAuthCredential(encrypted)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, store.ErrFeishuUserOAuthIdentityChanged) {
+			return store.FeishuUserOAuthCredential{}, fmt.Errorf("persist encrypted feishu OAuth credential: %w", err)
+		}
+		canonical := feishuOAuthIdentity{OpenID: credential.ActorOpenID, UserID: credential.ActorUserID}
+		currentType, currentID := feishuOAuthIdentityKey(identity)
+		canonicalType, canonicalID := feishuOAuthIdentityKey(canonical)
+		if canonicalID == "" || (currentType == canonicalType && currentID == canonicalID) {
+			return store.FeishuUserOAuthCredential{}, fmt.Errorf("persist encrypted feishu OAuth credential: %w", err)
+		}
+		identity = canonical
+		feishuLog.Debug(ctx, "re-encrypting feishu user OAuth credential with canonical identity account=%s credential=%s user_ref=%s",
+			m.account.ID, shortResourceRef(credential.ID), shortResourceRef(canonicalID))
+	}
+	if credential.ID == "" {
+		return store.FeishuUserOAuthCredential{}, fmt.Errorf("persist encrypted feishu OAuth credential: canonical identity did not stabilize")
+	}
+	_, actorID := feishuOAuthIdentityKey(feishuOAuthIdentity{OpenID: credential.ActorOpenID, UserID: credential.ActorUserID})
+	feishuLog.Info(ctx, "persisted encrypted feishu user OAuth credential account=%s user_ref=%s access_expires_at=%s refresh_present=%t refresh_expires_at=%s scope_count=%d version=%d",
+		m.account.ID,
+		shortResourceRef(actorID),
+		credential.AccessTokenExpiresAt.Format(time.RFC3339),
+		credential.RefreshTokenCiphertext != "",
+		formatOptionalOAuthTime(credential.RefreshTokenExpiresAt),
+		len(strings.Fields(credential.Scopes)),
+		credential.Version)
+	return credential, nil
+}
+
+func (m *oauthCredentialService) encryptedFeishuOAuthCredential(
+	identity feishuOAuthIdentity,
+	tokens feishuOAuthTokenBundle,
+	now time.Time,
+) (store.FeishuUserOAuthCredential, error) {
 	accessCiphertext, err := m.credentialCipher.Encrypt(identity, "access_token", tokens.AccessToken)
 	if err != nil {
 		return store.FeishuUserOAuthCredential{}, err
@@ -213,7 +317,7 @@ func (m *resourceAccessManager) persistFeishuOAuthCredential(ctx context.Context
 		}
 		refreshExpiresAt = now.Add(tokens.RefreshTokenExpiresIn)
 	}
-	credential, err := m.store.SaveFeishuUserOAuthCredential(store.FeishuUserOAuthCredential{
+	return store.FeishuUserOAuthCredential{
 		AccountID:              m.account.ID,
 		ActorOpenID:            identity.OpenID,
 		ActorUserID:            identity.UserID,
@@ -227,30 +331,15 @@ func (m *resourceAccessManager) persistFeishuOAuthCredential(ctx context.Context
 		Status:                 store.FeishuUserOAuthCredentialStatusActive,
 		CreatedAt:              now,
 		UpdatedAt:              now,
-	})
-	if err != nil {
-		return store.FeishuUserOAuthCredential{}, fmt.Errorf("persist encrypted feishu OAuth credential: %w", err)
-	}
-	_, actorID := feishuOAuthIdentityKey(identity)
-	feishuLog.Info(ctx, "persisted encrypted feishu user OAuth credential account=%s user_ref=%s access_expires_at=%s refresh_present=%t refresh_expires_at=%s scope_count=%d version=%d",
-		m.account.ID,
-		shortResourceRef(actorID),
-		credential.AccessTokenExpiresAt.Format(time.RFC3339),
-		credential.RefreshTokenCiphertext != "",
-		formatOptionalOAuthTime(credential.RefreshTokenExpiresAt),
-		len(strings.Fields(credential.Scopes)),
-		credential.Version)
-	return credential, nil
+	}, nil
 }
 
 // feishuUserAccessToken returns a decrypted usable token and silently rotates
 // the one-time refresh token when the access token is near expiry.
-func (m *resourceAccessManager) feishuUserAccessToken(ctx context.Context, actorOpenID, actorUserID string) (string, error) {
+func (m *oauthCredentialService) feishuUserAccessToken(ctx context.Context, actorOpenID, actorUserID string) (string, error) {
 	if m == nil || m.credentialCipher == nil {
 		return "", ErrFeishuUserOAuthCredentialUnavailable
 	}
-	m.credentialMu.Lock()
-	defer m.credentialMu.Unlock()
 
 	credential, err := m.store.GetFeishuUserOAuthCredential(m.account.ID, actorOpenID, actorUserID)
 	if err != nil {
@@ -262,7 +351,7 @@ func (m *resourceAccessManager) feishuUserAccessToken(ctx context.Context, actor
 	return m.usableFeishuUserAccessToken(ctx, credential)
 }
 
-func (m *resourceAccessManager) usableFeishuUserAccessToken(ctx context.Context, credential store.FeishuUserOAuthCredential) (string, error) {
+func (m *oauthCredentialService) usableFeishuUserAccessToken(ctx context.Context, credential store.FeishuUserOAuthCredential) (string, error) {
 	now := m.currentTime()
 	if credential.Status != store.FeishuUserOAuthCredentialStatusActive {
 		return "", ErrFeishuUserOAuthReauthorizationNeeded
@@ -292,7 +381,10 @@ func (m *resourceAccessManager) usableFeishuUserAccessToken(ctx context.Context,
 	return m.refreshFeishuUserAccessToken(ctx, credential)
 }
 
-func (m *resourceAccessManager) refreshFeishuUserAccessToken(ctx context.Context, credential store.FeishuUserOAuthCredential) (string, error) {
+func (m *oauthCredentialService) refreshFeishuUserAccessToken(ctx context.Context, credential store.FeishuUserOAuthCredential) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	leaseToken, err := randomBase64URL(24)
 	if err != nil {
 		return "", fmt.Errorf("create feishu OAuth refresh lease: %w", err)
@@ -321,10 +413,11 @@ func (m *resourceAccessManager) refreshFeishuUserAccessToken(ctx context.Context
 	identity := feishuOAuthIdentity{OpenID: credential.ActorOpenID, UserID: credential.ActorUserID}
 	refreshToken, err := m.credentialCipher.Decrypt(identity, "refresh_token", credential.RefreshTokenCiphertext)
 	if err != nil {
-		if failErr := m.failOwnedFeishuOAuthRefreshAttempt(ctx, attempt, "refresh_token_decrypt_failed", true); failErr != nil {
-			if token, handled, latestErr := m.useAdvancedFeishuOAuthCredential(ctx, credential); handled {
-				return token, latestErr
-			}
+		failErr := m.failOwnedFeishuOAuthRefreshAttempt(ctx, attempt, "refresh_token_decrypt_failed", true)
+		if token, handled, latestErr := m.useAdvancedFeishuOAuthCredential(ctx, credential); handled {
+			return token, latestErr
+		}
+		if failErr != nil {
 			return "", fmt.Errorf("persist feishu OAuth refresh decryption failure: %w", failErr)
 		}
 		return "", fmt.Errorf("%w: stored refresh token cannot be decrypted", ErrFeishuUserOAuthReauthorizationNeeded)
@@ -334,6 +427,23 @@ func (m *resourceAccessManager) refreshFeishuUserAccessToken(ctx context.Context
 	request := refreshtoken.NewTokenRequestBuilder().RefreshToken(refreshToken).Build()
 	resp, err := m.client.AccessToken.Refresh(ctx, request)
 	if err != nil {
+		if feishuOAuthRefreshOutcomeAmbiguous(err) {
+			_, _, markErr := m.store.MarkOwnedFeishuOAuthRefreshAttemptAmbiguous(
+				attempt.ID,
+				attempt.AccountID,
+				attempt.LeaseToken,
+				m.currentTime(),
+			)
+			if token, handled, latestErr := m.useAdvancedFeishuOAuthCredential(ctx, credential); handled {
+				return token, latestErr
+			}
+			if markErr != nil {
+				return "", fmt.Errorf("persist ambiguous feishu OAuth refresh outcome: %w", markErr)
+			}
+			feishuLog.Warn(ctx, "feishu user OAuth refresh outcome is ambiguous; reauthorization required account=%s credential=%s attempt=%s error_type=%T",
+				m.account.ID, shortResourceRef(credential.ID), shortResourceRef(attempt.ID), err)
+			return "", fmt.Errorf("%w: refresh response outcome could not be verified", ErrFeishuUserOAuthReauthorizationNeeded)
+		}
 		requiresReauthorization := feishuOAuthRefreshRequiresReauthorization(err)
 		failErr := m.failOwnedFeishuOAuthRefreshAttempt(
 			ctx,
@@ -341,12 +451,8 @@ func (m *resourceAccessManager) refreshFeishuUserAccessToken(ctx context.Context
 			feishuOAuthRefreshErrorCategory(err),
 			requiresReauthorization,
 		)
-		if failErr != nil && (errors.Is(failErr, store.ErrFeishuUserOAuthCredentialConflict) ||
-			errors.Is(failErr, store.ErrFeishuOAuthRefreshAttemptConflict) ||
-			errors.Is(failErr, store.ErrFeishuOAuthRefreshAttemptLeaseLost)) {
-			if token, handled, latestErr := m.useAdvancedFeishuOAuthCredential(ctx, credential); handled {
-				return token, latestErr
-			}
+		if token, handled, latestErr := m.useAdvancedFeishuOAuthCredential(ctx, credential); handled {
+			return token, latestErr
 		}
 		if failErr != nil {
 			return "", fmt.Errorf("persist feishu OAuth refresh failure: %w", failErr)
@@ -366,10 +472,11 @@ func (m *resourceAccessManager) refreshFeishuUserAccessToken(ctx context.Context
 	}
 	bundle, err := feishuOAuthTokenBundleFromResponse(resp, credential.Scopes)
 	if err != nil || bundle.RefreshToken == "" || bundle.RefreshTokenExpiresIn <= 0 {
-		if failErr := m.failOwnedFeishuOAuthRefreshAttempt(ctx, attempt, "invalid_refresh_response", true); failErr != nil {
-			if token, handled, latestErr := m.useAdvancedFeishuOAuthCredential(ctx, credential); handled {
-				return token, latestErr
-			}
+		failErr := m.failOwnedFeishuOAuthRefreshAttempt(ctx, attempt, "invalid_refresh_response", true)
+		if token, handled, latestErr := m.useAdvancedFeishuOAuthCredential(ctx, credential); handled {
+			return token, latestErr
+		}
+		if failErr != nil {
 			return "", fmt.Errorf("persist unusable feishu OAuth refresh response: %w", failErr)
 		}
 		return "", fmt.Errorf("%w: refresh response was unusable", ErrFeishuUserOAuthReauthorizationNeeded)
@@ -377,20 +484,22 @@ func (m *resourceAccessManager) refreshFeishuUserAccessToken(ctx context.Context
 	responseAt := m.currentTime()
 	accessCiphertext, err := m.credentialCipher.EncryptRefreshAttempt(attempt, "access_token", bundle.AccessToken)
 	if err != nil {
-		if failErr := m.failOwnedFeishuOAuthRefreshAttempt(ctx, attempt, "stage_encryption_failed", true); failErr != nil {
-			if token, handled, latestErr := m.useAdvancedFeishuOAuthCredential(ctx, credential); handled {
-				return token, latestErr
-			}
+		failErr := m.failOwnedFeishuOAuthRefreshAttempt(ctx, attempt, "stage_encryption_failed", true)
+		if token, handled, latestErr := m.useAdvancedFeishuOAuthCredential(ctx, credential); handled {
+			return token, latestErr
+		}
+		if failErr != nil {
 			return "", fmt.Errorf("persist feishu OAuth refresh staging failure: %w", failErr)
 		}
 		return "", fmt.Errorf("%w: refreshed credential could not be staged", ErrFeishuUserOAuthReauthorizationNeeded)
 	}
 	refreshCiphertext, err := m.credentialCipher.EncryptRefreshAttempt(attempt, "refresh_token", bundle.RefreshToken)
 	if err != nil {
-		if failErr := m.failOwnedFeishuOAuthRefreshAttempt(ctx, attempt, "stage_encryption_failed", true); failErr != nil {
-			if token, handled, latestErr := m.useAdvancedFeishuOAuthCredential(ctx, credential); handled {
-				return token, latestErr
-			}
+		failErr := m.failOwnedFeishuOAuthRefreshAttempt(ctx, attempt, "stage_encryption_failed", true)
+		if token, handled, latestErr := m.useAdvancedFeishuOAuthCredential(ctx, credential); handled {
+			return token, latestErr
+		}
+		if failErr != nil {
 			return "", fmt.Errorf("persist feishu OAuth refresh staging failure: %w", failErr)
 		}
 		return "", fmt.Errorf("%w: refreshed credential could not be staged", ErrFeishuUserOAuthReauthorizationNeeded)
@@ -413,6 +522,9 @@ func (m *resourceAccessManager) refreshFeishuUserAccessToken(ctx context.Context
 		if errors.Is(err, store.ErrFeishuOAuthRefreshAttemptConflict) && staged.State == store.FeishuOAuthRefreshAttemptStateResponseStaged {
 			return m.accessTokenFromStagedFeishuOAuthRefresh(ctx, staged)
 		}
+		if token, handled, latestErr := m.useAdvancedFeishuOAuthCredential(ctx, credential); handled {
+			return token, latestErr
+		}
 		if errors.Is(failErr, store.ErrFeishuOAuthRefreshAttemptConflict) || errors.Is(failErr, store.ErrFeishuOAuthRefreshAttemptLeaseLost) {
 			current, loadErr := m.store.GetFeishuOAuthRefreshAttempt(attempt.ID, attempt.AccountID)
 			if loadErr == nil && current.State == store.FeishuOAuthRefreshAttemptStateResponseStaged {
@@ -427,7 +539,7 @@ func (m *resourceAccessManager) refreshFeishuUserAccessToken(ctx context.Context
 	return m.accessTokenFromStagedFeishuOAuthRefresh(ctx, staged)
 }
 
-func (m *resourceAccessManager) accessTokenFromStagedFeishuOAuthRefresh(
+func (m *oauthCredentialService) accessTokenFromStagedFeishuOAuthRefresh(
 	ctx context.Context,
 	attempt store.FeishuOAuthRefreshAttempt,
 ) (string, error) {
@@ -435,16 +547,10 @@ func (m *resourceAccessManager) accessTokenFromStagedFeishuOAuthRefresh(
 	if err != nil {
 		return "", err
 	}
-	return m.decryptStoredFeishuOAuthToken(
-		ctx,
-		credential,
-		feishuOAuthIdentity{OpenID: credential.ActorOpenID, UserID: credential.ActorUserID},
-		"access_token",
-		credential.AccessTokenCiphertext,
-	)
+	return m.usableFeishuUserAccessToken(ctx, credential)
 }
 
-func (m *resourceAccessManager) applyStagedFeishuOAuthRefresh(
+func (m *oauthCredentialService) applyStagedFeishuOAuthRefresh(
 	ctx context.Context,
 	attempt store.FeishuOAuthRefreshAttempt,
 ) (store.FeishuUserOAuthCredential, error) {
@@ -453,44 +559,72 @@ func (m *resourceAccessManager) applyStagedFeishuOAuthRefresh(
 		return store.FeishuUserOAuthCredential{}, fmt.Errorf("load staged feishu OAuth credential: %w", err)
 	}
 	if credential.Version > attempt.ExpectedVersion {
-		if _, err := m.store.CompleteFeishuOAuthRefreshAttempt(attempt.ID, attempt.AccountID, m.currentTime()); err != nil &&
-			!errors.Is(err, store.ErrFeishuOAuthRefreshAttemptConflict) {
+		rotated, _, err := m.store.ApplyFeishuOAuthRefreshAttempt(
+			attempt.ID,
+			attempt.AccountID,
+			store.FeishuOAuthRefreshCredentialUpdate{},
+			m.currentTime(),
+		)
+		if err != nil && !errors.Is(err, store.ErrFeishuOAuthRefreshAttemptConflict) {
 			return store.FeishuUserOAuthCredential{}, fmt.Errorf("complete superseded feishu OAuth refresh: %w", err)
+		}
+		if err == nil {
+			credential = rotated
 		}
 		return credential, nil
 	}
 	if credential.Version != attempt.ExpectedVersion || credential.Status != store.FeishuUserOAuthCredentialStatusActive || m.credentialCipher == nil {
-		if err := m.invalidateStagedFeishuOAuthRefresh(ctx, attempt, "staged_context_invalid"); err != nil {
-			return store.FeishuUserOAuthCredential{}, fmt.Errorf("invalidate staged feishu OAuth refresh context: %w", err)
+		resolved, invalidateErr := m.invalidateStagedFeishuOAuthRefresh(ctx, attempt, "staged_context_invalid")
+		if invalidateErr != nil {
+			return store.FeishuUserOAuthCredential{}, fmt.Errorf("invalidate staged feishu OAuth refresh context: %w", invalidateErr)
+		}
+		if resolved.Version > credential.Version && resolved.Status == store.FeishuUserOAuthCredentialStatusActive {
+			return resolved, nil
 		}
 		return store.FeishuUserOAuthCredential{}, ErrFeishuUserOAuthReauthorizationNeeded
 	}
 	accessToken, err := m.credentialCipher.DecryptRefreshAttempt(attempt, "access_token", attempt.AccessTokenCiphertext)
 	if err != nil {
-		if invalidateErr := m.invalidateStagedFeishuOAuthRefresh(ctx, attempt, "staged_access_decrypt_failed"); invalidateErr != nil {
+		resolved, invalidateErr := m.invalidateStagedFeishuOAuthRefresh(ctx, attempt, "staged_access_decrypt_failed")
+		if invalidateErr != nil {
 			return store.FeishuUserOAuthCredential{}, fmt.Errorf("invalidate unreadable staged feishu OAuth access token: %w", invalidateErr)
+		}
+		if resolved.Version > credential.Version && resolved.Status == store.FeishuUserOAuthCredentialStatusActive {
+			return resolved, nil
 		}
 		return store.FeishuUserOAuthCredential{}, fmt.Errorf("%w: staged access token cannot be decrypted", ErrFeishuUserOAuthReauthorizationNeeded)
 	}
 	refreshToken, err := m.credentialCipher.DecryptRefreshAttempt(attempt, "refresh_token", attempt.RefreshTokenCiphertext)
 	if err != nil {
-		if invalidateErr := m.invalidateStagedFeishuOAuthRefresh(ctx, attempt, "staged_refresh_decrypt_failed"); invalidateErr != nil {
+		resolved, invalidateErr := m.invalidateStagedFeishuOAuthRefresh(ctx, attempt, "staged_refresh_decrypt_failed")
+		if invalidateErr != nil {
 			return store.FeishuUserOAuthCredential{}, fmt.Errorf("invalidate unreadable staged feishu OAuth refresh token: %w", invalidateErr)
+		}
+		if resolved.Version > credential.Version && resolved.Status == store.FeishuUserOAuthCredentialStatusActive {
+			return resolved, nil
 		}
 		return store.FeishuUserOAuthCredential{}, fmt.Errorf("%w: staged refresh token cannot be decrypted", ErrFeishuUserOAuthReauthorizationNeeded)
 	}
 	identity := feishuOAuthIdentity{OpenID: credential.ActorOpenID, UserID: credential.ActorUserID}
 	accessCiphertext, err := m.credentialCipher.Encrypt(identity, "access_token", accessToken)
 	if err != nil {
-		if invalidateErr := m.invalidateStagedFeishuOAuthRefresh(ctx, attempt, "credential_encryption_failed"); invalidateErr != nil {
+		resolved, invalidateErr := m.invalidateStagedFeishuOAuthRefresh(ctx, attempt, "credential_encryption_failed")
+		if invalidateErr != nil {
 			return store.FeishuUserOAuthCredential{}, fmt.Errorf("invalidate unencryptable feishu OAuth access token: %w", invalidateErr)
+		}
+		if resolved.Version > credential.Version && resolved.Status == store.FeishuUserOAuthCredentialStatusActive {
+			return resolved, nil
 		}
 		return store.FeishuUserOAuthCredential{}, fmt.Errorf("%w: refreshed access token cannot be encrypted", ErrFeishuUserOAuthReauthorizationNeeded)
 	}
 	refreshCiphertext, err := m.credentialCipher.Encrypt(identity, "refresh_token", refreshToken)
 	if err != nil {
-		if invalidateErr := m.invalidateStagedFeishuOAuthRefresh(ctx, attempt, "credential_encryption_failed"); invalidateErr != nil {
+		resolved, invalidateErr := m.invalidateStagedFeishuOAuthRefresh(ctx, attempt, "credential_encryption_failed")
+		if invalidateErr != nil {
 			return store.FeishuUserOAuthCredential{}, fmt.Errorf("invalidate unencryptable feishu OAuth refresh token: %w", invalidateErr)
+		}
+		if resolved.Version > credential.Version && resolved.Status == store.FeishuUserOAuthCredentialStatusActive {
+			return resolved, nil
 		}
 		return store.FeishuUserOAuthCredential{}, fmt.Errorf("%w: refreshed refresh token cannot be encrypted", ErrFeishuUserOAuthReauthorizationNeeded)
 	}
@@ -521,14 +655,14 @@ func (m *resourceAccessManager) applyStagedFeishuOAuthRefresh(
 	return rotated, nil
 }
 
-func (m *resourceAccessManager) waitForFeishuOAuthRefresh(
+func (m *oauthCredentialService) waitForFeishuOAuthRefresh(
 	ctx context.Context,
 	original store.FeishuUserOAuthCredential,
 	attempt store.FeishuOAuthRefreshAttempt,
 ) (string, error) {
-	timer := time.NewTimer(feishuOAuthRefreshPeerWait)
+	timer := time.NewTimer(m.effectiveFeishuOAuthRefreshPeerWait())
 	defer timer.Stop()
-	ticker := time.NewTicker(feishuOAuthRefreshPollInterval)
+	ticker := time.NewTicker(m.effectiveFeishuOAuthRefreshPollInterval())
 	defer ticker.Stop()
 	for {
 		latest, err := m.store.GetFeishuUserOAuthCredentialByID(original.ID, original.AccountID)
@@ -558,9 +692,9 @@ func (m *resourceAccessManager) waitForFeishuOAuthRefresh(
 				return "", ErrFeishuUserOAuthCredentialUnavailable
 			case store.FeishuOAuthRefreshAttemptStatePrepared:
 				if !current.LeaseExpiresAt.After(m.currentTime()) {
-					_, _, markErr := m.store.MarkFeishuOAuthRefreshAttemptAmbiguous(current.ID, current.AccountID, m.currentTime())
+					resolvedCredential, _, markErr := m.store.MarkFeishuOAuthRefreshAttemptAmbiguous(current.ID, current.AccountID, m.currentTime())
 					if markErr == nil {
-						return "", ErrFeishuUserOAuthReauthorizationNeeded
+						return m.usableFeishuUserAccessToken(ctx, resolvedCredential)
 					}
 					if !errors.Is(markErr, store.ErrFeishuOAuthRefreshAttemptConflict) && !errors.Is(markErr, store.ErrFeishuOAuthRefreshAttemptLeaseLost) {
 						return "", fmt.Errorf("resolve expired feishu OAuth refresh attempt: %w", markErr)
@@ -572,18 +706,83 @@ func (m *resourceAccessManager) waitForFeishuOAuthRefresh(
 		case <-ctx.Done():
 			return "", ctx.Err()
 		case <-timer.C:
-			if token, ok, fallbackErr := m.fallbackFeishuOAuthAccessToken(ctx, latest); ok {
-				feishuLog.Warn(ctx, "feishu OAuth refresh is still owned by another worker; using still-valid access token account=%s credential=%s attempt=%s version=%d",
-					m.account.ID, shortResourceRef(original.ID), shortResourceRef(attempt.ID), original.Version)
-				return token, fallbackErr
-			}
-			return "", fmt.Errorf("%w: refresh is already in progress", ErrFeishuUserOAuthCredentialUnavailable)
+			return m.resolveFeishuOAuthRefreshPeerTimeout(ctx, original, attempt)
 		case <-ticker.C:
 		}
 	}
 }
 
-func (m *resourceAccessManager) fallbackFeishuOAuthAccessToken(
+func (m *oauthCredentialService) resolveFeishuOAuthRefreshPeerTimeout(
+	ctx context.Context,
+	original store.FeishuUserOAuthCredential,
+	attempt store.FeishuOAuthRefreshAttempt,
+) (string, error) {
+	// One bounded reload closes the race where the lease owner stages or
+	// completes its response after our read but before our ambiguous claim.
+	for loadAttempt := 0; loadAttempt < 2; loadAttempt++ {
+		latest, err := m.store.GetFeishuUserOAuthCredentialByID(original.ID, original.AccountID)
+		if err != nil {
+			return "", fmt.Errorf("reload feishu OAuth credential after peer wait: %w", err)
+		}
+		current, attemptErr := m.store.GetFeishuOAuthRefreshAttempt(attempt.ID, attempt.AccountID)
+		if attemptErr != nil && !errors.Is(attemptErr, store.ErrFeishuOAuthRefreshAttemptNotFound) {
+			return "", fmt.Errorf("reload feishu OAuth refresh attempt after peer wait: %w", attemptErr)
+		}
+		if latest.Version > original.Version || latest.Status != store.FeishuUserOAuthCredentialStatusActive {
+			return m.usableFeishuUserAccessToken(ctx, latest)
+		}
+		if attemptErr == nil {
+			switch current.State {
+			case store.FeishuOAuthRefreshAttemptStateResponseStaged:
+				return m.accessTokenFromStagedFeishuOAuthRefresh(ctx, current)
+			case store.FeishuOAuthRefreshAttemptStateCompleted:
+				return m.usableFeishuUserAccessToken(ctx, latest)
+			case store.FeishuOAuthRefreshAttemptStateAmbiguous:
+				return "", ErrFeishuUserOAuthReauthorizationNeeded
+			case store.FeishuOAuthRefreshAttemptStateFailed:
+				if token, ok, fallbackErr := m.fallbackFeishuOAuthAccessToken(ctx, latest); ok {
+					return token, fallbackErr
+				}
+				return "", ErrFeishuUserOAuthCredentialUnavailable
+			case store.FeishuOAuthRefreshAttemptStatePrepared:
+				if !current.LeaseExpiresAt.After(m.currentTime()) {
+					resolvedCredential, _, markErr := m.store.MarkFeishuOAuthRefreshAttemptAmbiguous(current.ID, current.AccountID, m.currentTime())
+					if markErr == nil {
+						return m.usableFeishuUserAccessToken(ctx, resolvedCredential)
+					}
+					if errors.Is(markErr, store.ErrFeishuOAuthRefreshAttemptConflict) ||
+						errors.Is(markErr, store.ErrFeishuOAuthRefreshAttemptLeaseLost) {
+						continue
+					}
+					return "", fmt.Errorf("resolve expired feishu OAuth refresh attempt after peer wait: %w", markErr)
+				}
+			}
+		}
+		if token, ok, fallbackErr := m.fallbackFeishuOAuthAccessToken(ctx, latest); ok {
+			feishuLog.Warn(ctx, "feishu OAuth refresh is still owned by another worker; using still-valid access token account=%s credential=%s attempt=%s version=%d",
+				m.account.ID, shortResourceRef(original.ID), shortResourceRef(attempt.ID), original.Version)
+			return token, fallbackErr
+		}
+		return "", fmt.Errorf("%w: refresh is already in progress", ErrFeishuUserOAuthCredentialUnavailable)
+	}
+	return "", fmt.Errorf("%w: refresh state changed repeatedly while resolving peer timeout", ErrFeishuUserOAuthCredentialUnavailable)
+}
+
+func (m *oauthCredentialService) effectiveFeishuOAuthRefreshPeerWait() time.Duration {
+	if m.refreshPeerWait <= 0 {
+		return feishuOAuthRefreshPeerWait
+	}
+	return m.refreshPeerWait
+}
+
+func (m *oauthCredentialService) effectiveFeishuOAuthRefreshPollInterval() time.Duration {
+	if m.refreshPoll <= 0 {
+		return feishuOAuthRefreshPollInterval
+	}
+	return m.refreshPoll
+}
+
+func (m *oauthCredentialService) fallbackFeishuOAuthAccessToken(
 	ctx context.Context,
 	credential store.FeishuUserOAuthCredential,
 ) (string, bool, error) {
@@ -600,7 +799,7 @@ func (m *resourceAccessManager) fallbackFeishuOAuthAccessToken(
 	return token, true, err
 }
 
-func (m *resourceAccessManager) useAdvancedFeishuOAuthCredential(
+func (m *oauthCredentialService) useAdvancedFeishuOAuthCredential(
 	ctx context.Context,
 	original store.FeishuUserOAuthCredential,
 ) (string, bool, error) {
@@ -615,7 +814,7 @@ func (m *resourceAccessManager) useAdvancedFeishuOAuthCredential(
 	return returnToken, true, tokenErr
 }
 
-func (m *resourceAccessManager) failOwnedFeishuOAuthRefreshAttempt(
+func (m *oauthCredentialService) failOwnedFeishuOAuthRefreshAttempt(
 	ctx context.Context,
 	attempt store.FeishuOAuthRefreshAttempt,
 	errorCategory string,
@@ -638,82 +837,112 @@ func (m *resourceAccessManager) failOwnedFeishuOAuthRefreshAttempt(
 	return err
 }
 
-func (m *resourceAccessManager) invalidateStagedFeishuOAuthRefresh(
+func (m *oauthCredentialService) invalidateStagedFeishuOAuthRefresh(
 	ctx context.Context,
 	attempt store.FeishuOAuthRefreshAttempt,
 	errorCategory string,
-) error {
-	_, _, err := m.store.InvalidateFeishuOAuthRefreshAttempt(
+) (store.FeishuUserOAuthCredential, error) {
+	credential, _, err := m.store.InvalidateFeishuOAuthRefreshAttempt(
 		attempt.ID,
 		attempt.AccountID,
 		errorCategory,
 		m.currentTime(),
 	)
-	if err != nil && !errors.Is(err, store.ErrFeishuOAuthRefreshAttemptConflict) &&
-		!errors.Is(err, store.ErrFeishuUserOAuthCredentialConflict) {
-		feishuLog.Warn(ctx, "invalidate staged feishu OAuth refresh failed account=%s credential=%s attempt=%s category=%s error_type=%T",
-			m.account.ID, shortResourceRef(attempt.CredentialID), shortResourceRef(attempt.ID), errorCategory, err)
-		return err
+	if err == nil {
+		return credential, nil
 	}
-	return nil
+	if errors.Is(err, store.ErrFeishuOAuthRefreshAttemptConflict) ||
+		errors.Is(err, store.ErrFeishuUserOAuthCredentialConflict) {
+		latest, loadErr := m.store.GetFeishuUserOAuthCredentialByID(attempt.CredentialID, attempt.AccountID)
+		if loadErr != nil {
+			return store.FeishuUserOAuthCredential{}, fmt.Errorf("reload credential after staged refresh invalidation conflict: %w", loadErr)
+		}
+		return latest, nil
+	}
+	feishuLog.Warn(ctx, "invalidate staged feishu OAuth refresh failed account=%s credential=%s attempt=%s category=%s error_type=%T",
+		m.account.ID, shortResourceRef(attempt.CredentialID), shortResourceRef(attempt.ID), errorCategory, err)
+	return store.FeishuUserOAuthCredential{}, err
 }
 
-func (m *resourceAccessManager) recoverFeishuOAuthRefreshAttempts(ctx context.Context) error {
+func (m *oauthCredentialService) recoverFeishuOAuthRefreshAttempts(ctx context.Context) error {
 	if m == nil || m.store == nil {
 		return ErrFeishuUserOAuthCredentialUnavailable
 	}
 	now := m.currentTime()
-	attempts, err := m.store.ListRecoverableFeishuOAuthRefreshAttempts(
-		m.account.ID,
-		now,
-		feishuOAuthRefreshRecoveryLimit,
-	)
-	if err != nil {
-		return fmt.Errorf("list recoverable feishu OAuth refresh attempts: %w", err)
-	}
+	scanned := 0
 	completed := 0
 	ambiguous := 0
-	for _, attempt := range attempts {
-		switch attempt.State {
-		case store.FeishuOAuthRefreshAttemptStateResponseStaged:
-			_, applyErr := m.applyStagedFeishuOAuthRefresh(ctx, attempt)
-			if applyErr != nil {
-				if errors.Is(applyErr, ErrFeishuUserOAuthReauthorizationNeeded) ||
-					errors.Is(applyErr, store.ErrFeishuOAuthRefreshAttemptConflict) {
-					continue
+	failed := 0
+	for {
+		attempts, err := m.store.ListRecoverableFeishuOAuthRefreshAttempts(
+			m.account.ID,
+			now,
+			feishuOAuthRefreshRecoveryLimit,
+		)
+		if err != nil {
+			return fmt.Errorf("list recoverable feishu OAuth refresh attempts: %w", err)
+		}
+		if len(attempts) == 0 {
+			break
+		}
+		scanned += len(attempts)
+		resolvedThisBatch := 0
+		for _, attempt := range attempts {
+			switch attempt.State {
+			case store.FeishuOAuthRefreshAttemptStateResponseStaged:
+				_, applyErr := m.applyStagedFeishuOAuthRefresh(ctx, attempt)
+				if applyErr != nil {
+					if errors.Is(applyErr, ErrFeishuUserOAuthReauthorizationNeeded) {
+						failed++
+						resolvedThisBatch++
+						continue
+					}
+					if errors.Is(applyErr, store.ErrFeishuOAuthRefreshAttemptConflict) {
+						continue
+					}
+					return fmt.Errorf("recover staged feishu OAuth refresh attempt: %w", applyErr)
 				}
-				return fmt.Errorf("recover staged feishu OAuth refresh attempt: %w", applyErr)
-			}
-			completed++
-		case store.FeishuOAuthRefreshAttemptStatePrepared:
-			_, resolved, markErr := m.store.MarkFeishuOAuthRefreshAttemptAmbiguous(
-				attempt.ID,
-				attempt.AccountID,
-				now,
-			)
-			if markErr != nil {
-				if errors.Is(markErr, store.ErrFeishuOAuthRefreshAttemptConflict) ||
-					errors.Is(markErr, store.ErrFeishuOAuthRefreshAttemptLeaseLost) ||
-					errors.Is(markErr, store.ErrFeishuUserOAuthCredentialConflict) {
-					continue
-				}
-				return fmt.Errorf("resolve interrupted feishu OAuth refresh attempt: %w", markErr)
-			}
-			if resolved.State == store.FeishuOAuthRefreshAttemptStateAmbiguous {
-				ambiguous++
-			} else if resolved.State == store.FeishuOAuthRefreshAttemptStateCompleted {
 				completed++
+				resolvedThisBatch++
+			case store.FeishuOAuthRefreshAttemptStatePrepared:
+				_, resolved, markErr := m.store.MarkFeishuOAuthRefreshAttemptAmbiguous(
+					attempt.ID,
+					attempt.AccountID,
+					now,
+				)
+				if markErr != nil {
+					if errors.Is(markErr, store.ErrFeishuOAuthRefreshAttemptConflict) ||
+						errors.Is(markErr, store.ErrFeishuOAuthRefreshAttemptLeaseLost) ||
+						errors.Is(markErr, store.ErrFeishuUserOAuthCredentialConflict) {
+						continue
+					}
+					return fmt.Errorf("resolve interrupted feishu OAuth refresh attempt: %w", markErr)
+				}
+				resolvedThisBatch++
+				if resolved.State == store.FeishuOAuthRefreshAttemptStateAmbiguous {
+					ambiguous++
+				} else if resolved.State == store.FeishuOAuthRefreshAttemptStateCompleted {
+					completed++
+				}
 			}
 		}
+		if len(attempts) < feishuOAuthRefreshRecoveryLimit {
+			break
+		}
+		if resolvedThisBatch == 0 {
+			feishuLog.Warn(ctx, "stopped feishu OAuth refresh recovery without progress account=%s batch_size=%d",
+				m.account.ID, len(attempts))
+			break
+		}
 	}
-	if completed > 0 || ambiguous > 0 {
-		feishuLog.Info(ctx, "recovered durable feishu OAuth refresh attempts account=%s scanned=%d completed=%d ambiguous=%d",
-			m.account.ID, len(attempts), completed, ambiguous)
+	if completed > 0 || ambiguous > 0 || failed > 0 {
+		feishuLog.Info(ctx, "recovered durable feishu OAuth refresh attempts account=%s scanned=%d completed=%d ambiguous=%d failed=%d",
+			m.account.ID, scanned, completed, ambiguous, failed)
 	}
 	return nil
 }
 
-func (m *resourceAccessManager) decryptStoredFeishuOAuthToken(
+func (m *oauthCredentialService) decryptStoredFeishuOAuthToken(
 	ctx context.Context,
 	credential store.FeishuUserOAuthCredential,
 	identity feishuOAuthIdentity,
@@ -730,7 +959,7 @@ func (m *resourceAccessManager) decryptStoredFeishuOAuthToken(
 	return "", fmt.Errorf("%w: stored %s cannot be decrypted", ErrFeishuUserOAuthReauthorizationNeeded, field)
 }
 
-func (m *resourceAccessManager) markFeishuOAuthReauthorizationBestEffort(ctx context.Context, credential store.FeishuUserOAuthCredential) {
+func (m *oauthCredentialService) markFeishuOAuthReauthorizationBestEffort(ctx context.Context, credential store.FeishuUserOAuthCredential) {
 	if credential.ID == "" || credential.Version <= 0 {
 		return
 	}
@@ -810,18 +1039,30 @@ func feishuOAuthRefreshRequiresReauthorization(err error) bool {
 	if !errors.As(err, &tokenErr) {
 		return false
 	}
-	if strings.EqualFold(strings.TrimSpace(tokenErr.ErrorType), "invalid_grant") {
-		return true
-	}
-	if tokenErr.ApiResp == nil {
+	return strings.EqualFold(strings.TrimSpace(tokenErr.ErrorType), "invalid_grant")
+}
+
+func feishuOAuthRefreshOutcomeAmbiguous(err error) bool {
+	if err == nil {
 		return false
 	}
-	switch tokenErr.ApiResp.StatusCode {
-	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
-		return true
-	default:
+	var tokenErr *accesstoken.AccessTokenError
+	if errors.As(err, &tokenErr) {
+		if tokenErr.ApiResp != nil {
+			return tokenErr.ApiResp.StatusCode == http.StatusRequestTimeout || tokenErr.ApiResp.StatusCode >= http.StatusInternalServerError
+		}
+		return tokenErr.Code == 0 && strings.TrimSpace(tokenErr.ErrorType) == ""
+	}
+	var dialErr *larkcore.DialFailedError
+	if errors.As(err, &dialErr) {
 		return false
 	}
+	var illegalParamErr *larkcore.IllegalParamError
+	if errors.As(err, &illegalParamErr) {
+		return false
+	}
+	var codeErr *larkcore.CodeError
+	return !errors.As(err, &codeErr)
 }
 
 func feishuOAuthRefreshErrorCategory(err error) string {

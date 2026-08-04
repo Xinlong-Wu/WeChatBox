@@ -31,6 +31,10 @@ const (
 	ResourceAccessSourceExistingGrant = "existing_grant"
 	ResourceAccessSourceNewlyGranted  = "newly_granted"
 
+	ResourceAccessGrantModeBotOwner = "bot_owner"
+	ResourceAccessGrantModeOnce     = "once"
+	ResourceAccessGrantModeAll      = "all"
+
 	ResourceAccessMinOnceDurationMinutes = 10
 	ResourceAccessMaxOnceDurationMinutes = 60
 
@@ -79,6 +83,24 @@ type ResourceAccessRequirement struct {
 	ResourceType  string
 	ResourceToken string
 	Permission    string
+}
+
+// AuthorizedResource is the trusted capability returned by the centralized
+// resource guard. Protected services consume this value instead of treating a
+// model-provided token as proof of authorization.
+type AuthorizedResource struct {
+	AccountID             string
+	ActorOpenID           string
+	ActorUserID           string
+	ChatID                string
+	ResourceType          string
+	ResourceToken         string
+	EffectivePermission   string
+	GrantMode             string
+	ExpiresAt             time.Time
+	CapabilitySubjectType string
+	CapabilitySubjectID   string
+	Source                string
 }
 
 // ResourceAuthorizationRequiredError tells the model which exact resource grant
@@ -135,25 +157,87 @@ func NewResourceAuthorizationRequiredError(requirement ResourceAccessRequirement
 	}
 }
 
-// ResourceAccessController owns resource authorization workflows and
-// side-effect-free protected-tool checks.
-type ResourceAccessController interface {
-	RequestAccess(context.Context, ResourceAccessRequest) (ResourceAccessResult, error)
-	RequireResourceAccess(context.Context, ResourceAccessRequirement) error
+// ResourceAccessGuard is the only authorization entry point for protected
+// Feishu resource operations.
+type ResourceAccessGuard interface {
+	Require(context.Context, ResourceAccessRequirement) (AuthorizedResource, error)
 }
 
-func requireResourceAccess(ctx context.Context, controller ResourceAccessController, requirement ResourceAccessRequirement) error {
+// ResourceAccessController owns both the explicit authorization workflow and
+// the side-effect-free guard used by protected tools.
+type ResourceAccessController interface {
+	ResourceAccessGuard
+	RequestAccess(context.Context, ResourceAccessRequest) (ResourceAccessResult, error)
+}
+
+func requireResourceAccess(ctx context.Context, guard ResourceAccessGuard, accountID string, requirement ResourceAccessRequirement) (AuthorizedResource, error) {
+	accountID = strings.TrimSpace(accountID)
 	requirement.ResourceType = NormalizeResourceType(requirement.ResourceType)
 	requirement.ResourceToken = strings.TrimSpace(requirement.ResourceToken)
 	requirement.Permission = strings.ToLower(strings.TrimSpace(requirement.Permission))
-	if controller == nil {
-		return fmt.Errorf("feishu resource access checker is unavailable")
+	if guard == nil {
+		return AuthorizedResource{}, fmt.Errorf("feishu resource access guard is unavailable")
 	}
-	if !SupportedResourceType(requirement.ResourceType) || requirement.ResourceToken == "" ||
+	if accountID == "" || !SupportedResourceType(requirement.ResourceType) || requirement.ResourceToken == "" ||
 		(requirement.Permission != ResourcePermissionRead && requirement.Permission != ResourcePermissionWrite) {
-		return fmt.Errorf("valid feishu resource type, token, and read/write permission are required")
+		return AuthorizedResource{}, fmt.Errorf("valid feishu account, resource type, token, and read/write permission are required")
 	}
-	return controller.RequireResourceAccess(ctx, requirement)
+	authorized, err := guard.Require(ctx, requirement)
+	if err != nil {
+		return AuthorizedResource{}, err
+	}
+	authorized.AccountID = strings.TrimSpace(authorized.AccountID)
+	authorized.ActorOpenID = strings.TrimSpace(authorized.ActorOpenID)
+	authorized.ActorUserID = strings.TrimSpace(authorized.ActorUserID)
+	authorized.ChatID = strings.TrimSpace(authorized.ChatID)
+	authorized.ResourceType = NormalizeResourceType(authorized.ResourceType)
+	authorized.ResourceToken = strings.TrimSpace(authorized.ResourceToken)
+	authorized.EffectivePermission = strings.ToLower(strings.TrimSpace(authorized.EffectivePermission))
+	authorized.GrantMode = strings.ToLower(strings.TrimSpace(authorized.GrantMode))
+	authorized.CapabilitySubjectType = strings.TrimSpace(authorized.CapabilitySubjectType)
+	authorized.CapabilitySubjectID = strings.TrimSpace(authorized.CapabilitySubjectID)
+	authorized.Source = strings.TrimSpace(authorized.Source)
+	actor, actorOK := ActorFromContext(ctx)
+	chat, chatOK := ChatContextFromContext(ctx)
+	if !actorOK || (actor.OpenID == "" && actor.UserID == "") || !chatOK || chat.ChatID == "" {
+		return AuthorizedResource{}, fmt.Errorf("trusted feishu actor and chat are required for resource access")
+	}
+	actorMatches := authorized.ActorOpenID != "" || authorized.ActorUserID != ""
+	if authorized.ActorOpenID != "" && authorized.ActorOpenID != strings.TrimSpace(actor.OpenID) {
+		actorMatches = false
+	}
+	if authorized.ActorUserID != "" && authorized.ActorUserID != strings.TrimSpace(actor.UserID) {
+		actorMatches = false
+	}
+	grantValid := false
+	switch authorized.GrantMode {
+	case ResourceAccessGrantModeBotOwner:
+		grantValid = authorized.Source == ResourceAccessSourceBotOwner && authorized.ExpiresAt.IsZero()
+	case ResourceAccessGrantModeOnce:
+		grantValid = (authorized.Source == ResourceAccessSourceExistingGrant || authorized.Source == ResourceAccessSourceNewlyGranted) &&
+			!authorized.ExpiresAt.IsZero() && time.Now().UTC().Before(authorized.ExpiresAt)
+	case ResourceAccessGrantModeAll:
+		grantValid = (authorized.Source == ResourceAccessSourceExistingGrant || authorized.Source == ResourceAccessSourceNewlyGranted) && authorized.ExpiresAt.IsZero()
+	}
+	if authorized.AccountID != accountID || !actorMatches || authorized.ChatID != chat.ChatID ||
+		authorized.ResourceType != requirement.ResourceType || authorized.ResourceToken != requirement.ResourceToken ||
+		!resourcePermissionSatisfies(authorized.EffectivePermission, requirement.Permission) ||
+		!grantValid || authorized.CapabilitySubjectType == "" || authorized.CapabilitySubjectID == "" {
+		return AuthorizedResource{}, fmt.Errorf("feishu resource access guard returned mismatched or incomplete authorization")
+	}
+	return authorized, nil
+}
+
+func resourcePermissionSatisfies(granted, required string) bool {
+	granted = strings.ToLower(strings.TrimSpace(granted))
+	required = strings.ToLower(strings.TrimSpace(required))
+	return granted == required || (granted == ResourcePermissionWrite && required == ResourcePermissionRead)
+}
+
+func authorizedResourcePermits(resource AuthorizedResource, resourceType, resourceToken, permission string) bool {
+	return NormalizeResourceType(resource.ResourceType) == NormalizeResourceType(resourceType) &&
+		strings.TrimSpace(resource.ResourceToken) == strings.TrimSpace(resourceToken) &&
+		resourcePermissionSatisfies(resource.EffectivePermission, permission)
 }
 
 type resourceAccessTool struct {

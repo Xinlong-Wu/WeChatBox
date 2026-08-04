@@ -192,12 +192,15 @@ func (s *Store) DecideToolApproval(id, accountID, decision string, match ToolApp
 		if err := updateWorkflowRequestState(tx, id, accountID, WorkflowRequestStateExpired, now); err != nil {
 			return ToolApproval{}, err
 		}
-		if err := tx.Commit(); err != nil {
-			return ToolApproval{}, fmt.Errorf("commit expired tool approval: %w", err)
-		}
 		approval.State = ToolApprovalStateExpired
 		approval.Payload = ""
 		approval.UpdatedAt = now
+		if err := enqueueToolApprovalTerminalCardDelivery(tx, approval, now); err != nil {
+			return ToolApproval{}, fmt.Errorf("enqueue expired tool approval card: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return ToolApproval{}, fmt.Errorf("commit expired tool approval: %w", err)
+		}
 		return approval, ErrToolApprovalExpired
 	}
 	if !toolApprovalActorMatches(approval, match) {
@@ -227,12 +230,17 @@ func (s *Store) DecideToolApproval(id, accountID, decision string, match ToolApp
 	if err := updateWorkflowRequestState(tx, id, accountID, nextState, now); err != nil {
 		return ToolApproval{}, err
 	}
-	if err := tx.Commit(); err != nil {
-		return ToolApproval{}, fmt.Errorf("commit tool approval decision: %w", err)
-	}
 	approval.State = nextState
 	approval.Payload = payload
 	approval.UpdatedAt = now
+	if nextState == ToolApprovalStateDenied {
+		if err := enqueueToolApprovalTerminalCardDelivery(tx, approval, now); err != nil {
+			return ToolApproval{}, fmt.Errorf("enqueue denied tool approval card: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return ToolApproval{}, fmt.Errorf("commit tool approval decision: %w", err)
+	}
 	return approval, nil
 }
 
@@ -253,6 +261,10 @@ func (s *Store) CompleteToolApproval(id, accountID, state string, now time.Time)
 		return fmt.Errorf("begin complete tool approval: %w", err)
 	}
 	defer tx.Rollback()
+	approval, err := toolApprovalByID(tx, id, accountID)
+	if err != nil {
+		return err
+	}
 	result, err := tx.Exec(
 		`UPDATE tool_approvals SET state=?, payload='', updated_at_ms=?
 		 WHERE id=? AND account_id=? AND state=?`,
@@ -266,6 +278,12 @@ func (s *Store) CompleteToolApproval(id, accountID, state string, now time.Time)
 	}
 	if err := updateWorkflowRequestState(tx, id, accountID, state, now); err != nil {
 		return err
+	}
+	approval.State = state
+	approval.Payload = ""
+	approval.UpdatedAt = now
+	if err := enqueueToolApprovalTerminalCardDelivery(tx, approval, now); err != nil {
+		return fmt.Errorf("enqueue completed tool approval card: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit complete tool approval: %w", err)
@@ -283,6 +301,10 @@ func (s *Store) FailToolApproval(id, accountID string, now time.Time) error {
 		return fmt.Errorf("begin fail tool approval: %w", err)
 	}
 	defer tx.Rollback()
+	approval, err := toolApprovalByID(tx, strings.TrimSpace(id), strings.TrimSpace(accountID))
+	if err != nil {
+		return err
+	}
 	result, err := tx.Exec(
 		`UPDATE tool_approvals SET state=?, payload='', updated_at_ms=?
 		 WHERE id=? AND account_id=? AND state IN (?, ?)`,
@@ -301,6 +323,12 @@ func (s *Store) FailToolApproval(id, accountID string, now time.Time) error {
 	}
 	if err := updateWorkflowRequestState(tx, strings.TrimSpace(id), strings.TrimSpace(accountID), WorkflowRequestStateFailed, now); err != nil {
 		return err
+	}
+	approval.State = ToolApprovalStateFailed
+	approval.Payload = ""
+	approval.UpdatedAt = now
+	if err := enqueueToolApprovalTerminalCardDelivery(tx, approval, now); err != nil {
+		return fmt.Errorf("enqueue failed tool approval card: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit fail tool approval: %w", err)
@@ -322,6 +350,16 @@ func (s *Store) ExpireToolApprovals(accountID string, now time.Time) (int64, err
 		return 0, fmt.Errorf("begin expire tool approvals: %w", err)
 	}
 	defer tx.Rollback()
+	expiring, err := listToolApprovalsForCardDelivery(
+		tx,
+		` WHERE account_id=? AND state=? AND expires_at_ms<=?`,
+		accountID,
+		ToolApprovalStatePending,
+		now.UnixMilli(),
+	)
+	if err != nil {
+		return 0, err
+	}
 	if _, err := tx.Exec(
 		`UPDATE workflow_requests SET state=?, updated_at_ms=?
 		 WHERE account_id=? AND id IN (
@@ -352,6 +390,14 @@ func (s *Store) ExpireToolApprovals(accountID string, now time.Time) (int64, err
 	if err != nil {
 		return 0, fmt.Errorf("count expired tool approvals: %w", err)
 	}
+	for _, approval := range expiring {
+		approval.State = ToolApprovalStateExpired
+		approval.Payload = ""
+		approval.UpdatedAt = now
+		if err := enqueueToolApprovalTerminalCardDelivery(tx, approval, now); err != nil {
+			return 0, fmt.Errorf("enqueue expired tool approval card: %w", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit expire tool approvals: %w", err)
 	}
@@ -373,6 +419,15 @@ func (s *Store) FailExecutingToolApprovals(accountID string, now time.Time) (int
 		return 0, fmt.Errorf("begin fail interrupted tool approvals: %w", err)
 	}
 	defer tx.Rollback()
+	interrupted, err := listToolApprovalsForCardDelivery(
+		tx,
+		` WHERE account_id=? AND state=?`,
+		accountID,
+		ToolApprovalStateExecuting,
+	)
+	if err != nil {
+		return 0, err
+	}
 	if _, err := tx.Exec(
 		`UPDATE workflow_requests SET state=?, updated_at_ms=?
 		 WHERE account_id=? AND id IN (
@@ -401,10 +456,55 @@ func (s *Store) FailExecutingToolApprovals(accountID string, now time.Time) (int
 	if err != nil {
 		return 0, fmt.Errorf("count interrupted tool approvals: %w", err)
 	}
+	for _, approval := range interrupted {
+		approval.State = ToolApprovalStateFailed
+		approval.Payload = ""
+		approval.UpdatedAt = now
+		if err := enqueueToolApprovalTerminalCardDelivery(tx, approval, now); err != nil {
+			return 0, fmt.Errorf("enqueue interrupted tool approval card: %w", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit fail interrupted tool approvals: %w", err)
 	}
 	return count, nil
+}
+
+// ListExecutingToolApprovals returns operations left in-flight by an
+// interrupted runtime. Callers must only resume executors whose policy makes
+// the remote side effect restart-safe; all others should be failed closed.
+func (s *Store) ListExecutingToolApprovals(accountID string) ([]ToolApproval, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return nil, fmt.Errorf("tool approval account_id is required")
+	}
+	rows, err := s.db.Query(
+		`SELECT id, account_id, tool_name, action_key, resource_type, resource_token,
+		 supports_all, actor_open_id, actor_user_id, chat_id,
+		 source_message_id, card_message_id, payload, state,
+		 created_at_ms, expires_at_ms, updated_at_ms
+		 FROM tool_approvals
+		 WHERE account_id=? AND state=?
+		 ORDER BY updated_at_ms ASC, id ASC`,
+		accountID,
+		ToolApprovalStateExecuting,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list executing tool approvals: %w", err)
+	}
+	defer rows.Close()
+	approvals := make([]ToolApproval, 0)
+	for rows.Next() {
+		approval, scanErr := scanToolApproval(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		approvals = append(approvals, approval)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate executing tool approvals: %w", err)
+	}
+	return approvals, nil
 }
 
 // DeleteToolApprovals removes all one-time approvals and reusable grants for an account.
@@ -417,6 +517,17 @@ func (s *Store) DeleteToolApprovals(accountID string) error {
 		return fmt.Errorf("begin delete tool approvals: %w", err)
 	}
 	defer tx.Rollback()
+	if _, err := tx.Exec(
+		`DELETE FROM feishu_card_deliveries
+		 WHERE account_id=? AND request_id IN (
+		  SELECT id FROM workflow_requests WHERE account_id=? AND kind=?
+		 )`,
+		accountID,
+		accountID,
+		WorkflowRequestKindToolApproval,
+	); err != nil {
+		return fmt.Errorf("delete tool approval card deliveries: %w", err)
+	}
 	if _, err := tx.Exec(`DELETE FROM tool_approvals WHERE account_id=?`, accountID); err != nil {
 		return fmt.Errorf("delete tool approvals: %w", err)
 	}
@@ -455,6 +566,33 @@ func toolApprovalByID(queryer interface {
 		 FROM tool_approvals WHERE id=? AND account_id=?`,
 		id, accountID,
 	))
+}
+
+func listToolApprovalsForCardDelivery(tx *sql.Tx, suffix string, args ...any) ([]ToolApproval, error) {
+	rows, err := tx.Query(
+		`SELECT id, account_id, tool_name, action_key, resource_type, resource_token,
+		 supports_all, actor_open_id, actor_user_id, chat_id,
+		 source_message_id, card_message_id, payload, state,
+		 created_at_ms, expires_at_ms, updated_at_ms
+		 FROM tool_approvals`+suffix,
+		args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list tool approvals for card delivery: %w", err)
+	}
+	defer rows.Close()
+	approvals := make([]ToolApproval, 0)
+	for rows.Next() {
+		approval, err := scanToolApproval(rows)
+		if err != nil {
+			return nil, err
+		}
+		approvals = append(approvals, approval)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate tool approvals for card delivery: %w", err)
+	}
+	return approvals, nil
 }
 
 func scanToolApproval(row toolApprovalScanner) (ToolApproval, error) {

@@ -101,10 +101,18 @@ func (s *Store) GetWorkflowRequest(id, accountID string) (WorkflowRequest, error
 // tool approval or a Feishu resource-access workflow without exposing the
 // workflow-specific persistence model to asynchronous workers.
 func (s *Store) GetWorkflowCardReference(id, accountID string) (WorkflowCardReference, error) {
+	return workflowCardReferenceByID(s.db, strings.TrimSpace(id), strings.TrimSpace(accountID))
+}
+
+type workflowCardReferenceQueryer interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+func workflowCardReferenceByID(queryer workflowCardReferenceQueryer, id, accountID string) (WorkflowCardReference, error) {
 	id = strings.TrimSpace(id)
 	accountID = strings.TrimSpace(accountID)
 	var reference WorkflowCardReference
-	err := s.db.QueryRow(
+	err := queryer.QueryRow(
 		`SELECT workflow.id, workflow.account_id, workflow.kind,
 		 COALESCE(approval.card_message_id, access.card_message_id, '')
 		 FROM workflow_requests AS workflow

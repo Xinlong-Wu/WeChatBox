@@ -35,6 +35,7 @@ type bot struct {
 	deduper       *eventDeduper
 	runCtx        context.Context
 	reactionDelay time.Duration
+	tasks         backgroundTaskGroup
 }
 
 type feishuResponder struct {
@@ -121,6 +122,21 @@ func (b *bot) handleMessage(ctx context.Context, event *larkim.P2MessageReceiveV
 		feishuLog.Debug(ctx, "feishu group message ignored because it does not mention the bot chat=%s message=%s event=%s", in.ChatID, in.MessageID, feishuEventID(event))
 		return nil
 	}
+	if b.processingContext().Err() != nil {
+		feishuLog.Debug(ctx, "feishu message ignored because the runtime is shutting down chat=%s message=%s event=%s", in.ChatID, in.MessageID, feishuEventID(event))
+		return nil
+	}
+	releaseTask, accepted := b.tasks.Reserve()
+	if !accepted {
+		feishuLog.Debug(ctx, "feishu message ignored because message admission is closed chat=%s message=%s event=%s", in.ChatID, in.MessageID, feishuEventID(event))
+		return nil
+	}
+	taskHandedOff := false
+	defer func() {
+		if !taskHandedOff {
+			releaseTask()
+		}
+	}()
 	dedupeKey := feishuDedupeKey(event)
 	if dedupeKey == "" {
 		feishuLog.Warn(ctx, "feishu message missing dedupe key; processing without dedupe")
@@ -129,7 +145,11 @@ func (b *bot) handleMessage(ctx context.Context, event *larkim.P2MessageReceiveV
 		return nil
 	}
 
-	go b.processMessage(in)
+	taskHandedOff = true
+	go func() {
+		defer releaseTask()
+		b.processMessage(in)
+	}()
 	return nil
 }
 

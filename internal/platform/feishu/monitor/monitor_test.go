@@ -132,8 +132,22 @@ func (fakeResourceAccessController) RequestAccess(context.Context, feishutools.R
 	return feishutools.ResourceAccessResult{RequestID: "req_access", Status: feishutools.ResourceAccessStatusGranted}, nil
 }
 
-func (fakeResourceAccessController) RequireResourceAccess(context.Context, feishutools.ResourceAccessRequirement) error {
-	return nil
+func (fakeResourceAccessController) Require(ctx context.Context, requirement feishutools.ResourceAccessRequirement) (feishutools.AuthorizedResource, error) {
+	actor, _ := feishutools.ActorFromContext(ctx)
+	chat, _ := feishutools.ChatContextFromContext(ctx)
+	return feishutools.AuthorizedResource{
+		AccountID:             "feishu:cli_test",
+		ActorOpenID:           actor.OpenID,
+		ActorUserID:           actor.UserID,
+		ChatID:                chat.ChatID,
+		ResourceType:          requirement.ResourceType,
+		ResourceToken:         requirement.ResourceToken,
+		EffectivePermission:   requirement.Permission,
+		GrantMode:             feishutools.ResourceAccessGrantModeAll,
+		CapabilitySubjectType: "bot",
+		CapabilitySubjectID:   "ou_bot",
+		Source:                feishutools.ResourceAccessSourceExistingGrant,
+	}, nil
 }
 
 type sentText struct {
@@ -176,6 +190,22 @@ type fakeSender struct {
 	addReactionErr    error
 	deleteReactionErr error
 	updateTextErr     error
+}
+
+type blockingSendTextSender struct {
+	*fakeSender
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingSendTextSender) SendText(ctx context.Context, chatID, text string) error {
+	close(s.started)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.release:
+		return s.fakeSender.SendText(ctx, chatID, text)
+	}
 }
 
 type fakeSenderSnapshot struct {
@@ -427,7 +457,24 @@ func waitForReactionDeletes(t *testing.T, sender *fakeSender, want int) fakeSend
 	}
 }
 
-func captureMonitorLogs(t *testing.T) *bytes.Buffer {
+type synchronizedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *synchronizedBuffer) Write(value []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(value)
+}
+
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func captureMonitorLogs(t *testing.T) *synchronizedBuffer {
 	t.Helper()
 	base := logging.Shared()
 	originalWriter := base.Writer()
@@ -441,11 +488,11 @@ func captureMonitorLogs(t *testing.T) *bytes.Buffer {
 		logging.SetLevel(originalLevel)
 	})
 
-	var buf bytes.Buffer
-	base.SetOutput(&buf)
+	buf := &synchronizedBuffer{}
+	base.SetOutput(buf)
 	base.SetFlags(0)
 	base.SetPrefix("")
-	return &buf
+	return buf
 }
 
 func TestNormalizeP2PTextMessage(t *testing.T) {
@@ -1720,6 +1767,68 @@ func TestConfigureP2PChatCreatedSendsCommandOutput(t *testing.T) {
 	}
 }
 
+func TestFeishuAccountRuntimeShutdownWaitsForInFlightCustomEvent(t *testing.T) {
+	runtimeCtx, cancelRuntime := context.WithCancel(context.Background())
+	sender := &blockingSendTextSender{
+		fakeSender: &fakeSender{},
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	b := &bot{
+		sender: sender,
+		eventCommands: map[string][]string{
+			"p2p_chat_create": {"printf 'hello'"},
+		},
+		runCtx: runtimeCtx,
+	}
+	eventDone := make(chan error, 1)
+	go func() {
+		eventDone <- b.handleCustomizedEvent(context.Background(), "p2p_chat_create", &larkevent.EventReq{
+			Body: []byte(`{"event":{"chat_id":"oc_chat"}}`),
+		})
+	}()
+	select {
+	case <-sender.started:
+	case <-time.After(time.Second):
+		t.Fatal("custom event did not reach its outbound send")
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		_, _ = shutdownFeishuAccountRuntime(
+			cancelRuntime,
+			nil,
+			nil,
+			b,
+			nil,
+			nil,
+			nil,
+			nil,
+		)
+		close(shutdownDone)
+	}()
+	select {
+	case <-shutdownDone:
+		close(sender.release)
+		t.Fatal("runtime shutdown completed while an admitted custom event was still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(sender.release)
+	select {
+	case err := <-eventDone:
+		if err != nil {
+			t.Fatalf("handleCustomizedEvent returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("custom event did not finish after release")
+	}
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("runtime shutdown did not finish after the custom event returned")
+	}
+}
+
 func TestConfigureBotP2PChatEnteredV2SendsCommandOutput(t *testing.T) {
 	sender := &fakeSender{}
 	b := &bot{handler: &fakeProcessor{}, sender: sender, eventCommands: map[string][]string{}}
@@ -2029,11 +2138,93 @@ func TestPlatformRunRequiresStoreForDocumentResources(t *testing.T) {
 			Docs: feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true},
 		},
 	}, logging.Info).Run(context.Background(), &fakeProcessor{})
-	if err == nil || !strings.Contains(err.Error(), "resource access requires a Feishu store") {
-		t.Fatalf("Run error = %v, want missing Feishu resource store", err)
+	if err == nil || !strings.Contains(err.Error(), "runtime lease requires a Feishu store") {
+		t.Fatalf("Run error = %v, want missing Feishu runtime store", err)
 	}
 }
 
+func TestPlatformRunHeldAccountLeaseSkipsStartupRecovery(t *testing.T) {
+	activeStore, recoveringStore := openSharedFeishuApprovalTestStores(t)
+	now := time.Now().UTC()
+	if _, err := activeStore.AcquireFeishuAccountRuntimeLease("feishu:cli_xxx", "runtime_active", now, time.Minute); err != nil {
+		t.Fatalf("acquire active runtime lease: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := activeStore.ReleaseFeishuAccountRuntimeLease("feishu:cli_xxx", "runtime_active"); err != nil {
+			t.Errorf("release active runtime lease: %v", err)
+		}
+	})
+	activeApproval, err := activeStore.CreateToolApproval(store.ToolApproval{
+		AccountID:       "feishu:cli_xxx",
+		ToolName:        "feishu_docs_create",
+		ActionKey:       "create",
+		ResourceType:    "folder",
+		ResourceToken:   "fld_token",
+		SupportsAll:     true,
+		ActorOpenID:     "ou_requester",
+		ActorUserID:     "u_requester",
+		ChatID:          "oc_chat",
+		SourceMessageID: "om_source",
+		Payload:         `{"title":"Quarterly plan"}`,
+		CreatedAt:       now,
+		ExpiresAt:       now.Add(10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("CreateToolApproval returned error: %v", err)
+	}
+	if err := activeStore.SetToolApprovalCardMessageID(activeApproval.ID, activeApproval.AccountID, "om_card", now); err != nil {
+		t.Fatalf("SetToolApprovalCardMessageID returned error: %v", err)
+	}
+	if _, err := activeStore.DecideToolApproval(
+		activeApproval.ID,
+		"feishu:cli_xxx",
+		store.ToolApprovalDecisionApprove,
+		store.ToolApprovalMatch{
+			ActorOpenID:   "ou_requester",
+			ActorUserID:   "u_requester",
+			ChatID:        "oc_chat",
+			CardMessageID: "om_card",
+		},
+		now.Add(time.Second),
+	); err != nil {
+		t.Fatalf("DecideToolApproval returned error: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/v3/token", "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "ok",
+				"tenant_access_token": "tenant-token",
+				"expire":              7200,
+			})
+		case "/open-apis/bot/v3/info":
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"bot":  map[string]any{"open_id": "ou_bot"},
+			})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	acc := store.Account{ID: "feishu:cli_xxx", Name: "fsbot", Platform: store.PlatformFeishu}
+	err = NewPlatform(recoveringStore, acc, feishu.Config{
+		Accounts: map[string]feishu.AccountConfig{
+			"fsbot": {AppID: "cli_xxx", AppSecret: "secret", BaseURL: server.URL},
+		},
+		Tools: feishutools.Config{Docs: feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true}},
+	}, logging.Info).Run(t.Context(), &fakeProcessor{})
+	if !errors.Is(err, store.ErrFeishuAccountRuntimeLeaseHeld) {
+		t.Fatalf("Run error = %v, want ErrFeishuAccountRuntimeLeaseHeld", err)
+	}
+	approval, loadErr := activeStore.GetToolApproval(activeApproval.ID, "feishu:cli_xxx")
+	if loadErr != nil || approval.State != store.ToolApprovalStateExecuting {
+		t.Fatalf("active approval after rejected second runtime = %#v err=%v, want executing", approval, loadErr)
+	}
+}
 func TestFeishuSDKLogLevel(t *testing.T) {
 	tests := []struct {
 		level logging.Level

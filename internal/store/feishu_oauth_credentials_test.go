@@ -39,7 +39,7 @@ func TestFeishuUserOAuthCredentialLifecycleAndVersionCAS(t *testing.T) {
 		t.Fatalf("credential by user_id = %#v err=%v", byUserID, err)
 	}
 
-	reauthorized, err := st.SaveFeishuUserOAuthCredential(FeishuUserOAuthCredential{
+	canonical, err := st.SaveFeishuUserOAuthCredential(FeishuUserOAuthCredential{
 		AccountID:              credential.AccountID,
 		ActorUserID:            credential.ActorUserID,
 		AccessTokenCiphertext:  "v1.new-access-ciphertext",
@@ -53,8 +53,26 @@ func TestFeishuUserOAuthCredentialLifecycleAndVersionCAS(t *testing.T) {
 		CreatedAt:              now.Add(time.Hour),
 		UpdatedAt:              now.Add(time.Hour),
 	})
+	if !errors.Is(err, ErrFeishuUserOAuthIdentityChanged) || canonical.ID != credential.ID || canonical.ActorOpenID != credential.ActorOpenID {
+		t.Fatalf("partial identity replacement = %#v err=%v", canonical, err)
+	}
+	reauthorized, err := st.SaveFeishuUserOAuthCredential(FeishuUserOAuthCredential{
+		AccountID:              credential.AccountID,
+		ActorOpenID:            credential.ActorOpenID,
+		ActorUserID:            credential.ActorUserID,
+		AccessTokenCiphertext:  "v1.new-access-ciphertext",
+		AccessTokenExpiresAt:   now.Add(3 * time.Hour),
+		RefreshTokenCiphertext: "v1.new-refresh-ciphertext",
+		RefreshTokenExpiresAt:  now.Add(60 * 24 * time.Hour),
+		Scopes:                 "auth:user.id:read offline_access",
+		AuthorizedAt:           now.Add(time.Hour),
+		ReauthorizeAt:          now.Add(366 * 24 * time.Hour),
+		Status:                 FeishuUserOAuthCredentialStatusActive,
+		CreatedAt:              now.Add(time.Hour),
+		UpdatedAt:              now.Add(time.Hour),
+	})
 	if err != nil {
-		t.Fatalf("replace OAuth credential returned error: %v", err)
+		t.Fatalf("replace OAuth credential with canonical identity returned error: %v", err)
 	}
 	if reauthorized.ID != credential.ID || reauthorized.Version != 2 || reauthorized.ActorOpenID != credential.ActorOpenID || !reauthorized.CreatedAt.Equal(now) {
 		t.Fatalf("reauthorized credential = %#v", reauthorized)

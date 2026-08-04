@@ -70,36 +70,40 @@ type FeishuBotResource struct {
 }
 
 // FeishuResourceAccessRequest is one globally identified access verification workflow.
-// OAuth state is stored only as a hash and cleared as soon as the callback atomically
-// claims the request. PKCEVerifier is retained only to identify requests created by
-// older versions and is cleared by the same claim.
+// OAuth state is authenticated by its hash. Its encrypted ciphertext is retained only
+// until the exact handoff card is confirmed delivered, allowing an interrupted delivery
+// to resend the same state and URL. A successful delivery clears the ciphertext while
+// retaining the hash until the callback atomically claims it. PKCEVerifier is retained
+// only to identify requests created by older versions and is cleared by the same claim.
 type FeishuResourceAccessRequest struct {
-	ID                  string
-	AccountID           string
-	ActorOpenID         string
-	ActorUserID         string
-	ChatID              string
-	SourceMessageID     string
-	ResourceType        string
-	ResourceToken       string
-	ResourceURL         string
-	ResourceDisplayName string
-	Permission          string
-	Reason              string
-	OnceDurationMinutes int
-	GrantMode           string
-	DecisionAt          time.Time
-	SubjectType         string
-	SubjectID           string
-	GrantSource         string
-	VerifiedPermission  string
-	CardMessageID       string
-	OAuthStateHash      string
-	PKCEVerifier        string
-	State               string
-	CreatedAt           time.Time
-	ExpiresAt           time.Time
-	UpdatedAt           time.Time
+	ID                      string
+	AccountID               string
+	ActorOpenID             string
+	ActorUserID             string
+	ChatID                  string
+	SourceMessageID         string
+	ResourceType            string
+	ResourceToken           string
+	ResourceURL             string
+	ResourceDisplayName     string
+	Permission              string
+	Reason                  string
+	OnceDurationMinutes     int
+	GrantMode               string
+	DecisionAt              time.Time
+	SubjectType             string
+	SubjectID               string
+	GrantSource             string
+	VerifiedPermission      string
+	CardMessageID           string
+	OAuthStateHash          string
+	OAuthStateCiphertext    string
+	OAuthHandoffDeliveredAt time.Time
+	PKCEVerifier            string
+	State                   string
+	CreatedAt               time.Time
+	ExpiresAt               time.Time
+	UpdatedAt               time.Time
 }
 
 // FeishuResourceAccessMatch contains trusted callback identity and card context.
@@ -223,9 +227,9 @@ func (s *Store) CreateFeishuResourceAccessRequest(request FeishuResourceAccessRe
 			resource_type, resource_token, resource_url, resource_display_name, permission, reason,
 			once_duration_minutes, grant_mode, decision_at_ms,
 			subject_type, subject_id, grant_source, verified_permission,
-			card_message_id, oauth_state_hash, pkce_verifier, state,
+			card_message_id, oauth_state_hash, oauth_state_ciphertext, oauth_handoff_delivered_at_ms, pkce_verifier, state,
 			created_at_ms, expires_at_ms, updated_at_ms
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, ?, ?, '', '', '', '', '', ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, ?, ?, '', '', '', '', '', 0, '', ?, ?, ?, ?)`,
 		request.ID,
 		request.AccountID,
 		request.ActorOpenID,
@@ -255,36 +259,144 @@ func (s *Store) CreateFeishuResourceAccessRequest(request FeishuResourceAccessRe
 	return request, nil
 }
 
-// PrepareFeishuResourceAccessOAuth binds the one-time OAuth state. verifier is kept
-// for compatibility with requests created by older PKCE-enabled versions.
-func (s *Store) PrepareFeishuResourceAccessOAuth(id, accountID, stateHash, verifier, subjectType, subjectID string, now time.Time) error {
+// PrepareFeishuResourceAccessOAuth binds the one-time OAuth state. stateCiphertext
+// contains only authenticated ciphertext for delivery recovery. verifier is kept for
+// compatibility with requests created by older PKCE-enabled versions.
+func (s *Store) PrepareFeishuResourceAccessOAuth(id, accountID, stateHash, stateCiphertext, verifier, subjectType, subjectID string, now time.Time) error {
 	if err := s.requireFeishuDocsStore(); err != nil {
 		return err
 	}
 	id = strings.TrimSpace(id)
 	accountID = strings.TrimSpace(accountID)
 	stateHash = strings.TrimSpace(stateHash)
+	stateCiphertext = strings.TrimSpace(stateCiphertext)
 	verifier = strings.TrimSpace(verifier)
 	subjectType = strings.TrimSpace(subjectType)
 	subjectID = strings.TrimSpace(subjectID)
-	if id == "" || accountID == "" || stateHash == "" || subjectType == "" || subjectID == "" {
-		return fmt.Errorf("feishu resource access id, account, oauth state, and subject are required")
+	if id == "" || accountID == "" || stateHash == "" || stateCiphertext == "" || subjectType == "" || subjectID == "" {
+		return fmt.Errorf("feishu resource access id, account, encrypted oauth state, and subject are required")
 	}
 	now = normalizedWorkflowTime(now)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	result, err := s.db.Exec(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin prepare feishu resource access oauth: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(
 		`UPDATE feishu_resource_access_requests
-		 SET oauth_state_hash=?, pkce_verifier=?, subject_type=?, subject_id=?, updated_at_ms=?
+		 SET oauth_state_hash=?, oauth_state_ciphertext=?, oauth_handoff_delivered_at_ms=0,
+		 pkce_verifier=?, subject_type=?, subject_id=?, updated_at_ms=?
 		 WHERE id=? AND account_id=? AND state=? AND grant_mode<>''
-		 AND oauth_state_hash='' AND pkce_verifier=''`,
-		stateHash, verifier, subjectType, subjectID, now.UnixMilli(),
+		 AND oauth_state_hash='' AND oauth_state_ciphertext='' AND pkce_verifier=''`,
+		stateHash, stateCiphertext, verifier, subjectType, subjectID, now.UnixMilli(),
 		id, accountID, FeishuResourceAccessStatePending,
 	)
 	if err != nil {
 		return fmt.Errorf("prepare feishu resource access oauth: %w", err)
 	}
-	return requireOneFeishuResourceAccessRow(result)
+	if err := requireOneFeishuResourceAccessRow(result); err != nil {
+		return err
+	}
+	request, err := feishuResourceAccessByID(tx, id, accountID)
+	if err != nil {
+		return err
+	}
+	if err := enqueueResourceAccessCardDelivery(
+		tx,
+		request,
+		FeishuCardDeliveryPurposeResourceOAuthHandoff,
+		FeishuCardDeliveryRevisionOAuthHandoff,
+		request.ExpiresAt,
+		now,
+	); err != nil {
+		return fmt.Errorf("enqueue feishu resource oauth handoff card: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit prepared feishu resource access oauth: %w", err)
+	}
+	return nil
+}
+
+// MarkFeishuResourceAccessOAuthHandoffDelivered records that the exact
+// persisted state was rendered into the bound card and clears the recoverable
+// ciphertext, which is no longer needed after successful delivery. Repeating
+// the mark for the same state is idempotent.
+func (s *Store) MarkFeishuResourceAccessOAuthHandoffDelivered(id, accountID, stateHash string, now time.Time) error {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return err
+	}
+	id = strings.TrimSpace(id)
+	accountID = strings.TrimSpace(accountID)
+	stateHash = strings.TrimSpace(stateHash)
+	now = normalizedWorkflowTime(now)
+	if id == "" || accountID == "" || stateHash == "" {
+		return fmt.Errorf("feishu resource oauth request, account, and state are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin mark feishu resource oauth handoff delivered: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(
+		`UPDATE feishu_card_deliveries
+		 SET state=?, delivered_at_ms=?, updated_at_ms=?
+		 WHERE account_id=? AND request_id=? AND purpose=? AND revision=? AND state=?`,
+		FeishuCardDeliveryStateDelivered,
+		now.UnixMilli(),
+		now.UnixMilli(),
+		accountID,
+		id,
+		FeishuCardDeliveryPurposeResourceOAuthHandoff,
+		FeishuCardDeliveryRevisionOAuthHandoff,
+		FeishuCardDeliveryStatePending,
+	)
+	if err != nil {
+		return fmt.Errorf("complete feishu resource oauth handoff delivery: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("inspect feishu resource oauth handoff delivery: %w", err)
+	}
+	if count != 1 {
+		delivery, loadErr := scanFeishuCardDelivery(tx.QueryRow(
+			feishuCardDeliverySelect+` WHERE account_id=? AND request_id=? AND purpose=? AND revision=?`,
+			accountID,
+			id,
+			FeishuCardDeliveryPurposeResourceOAuthHandoff,
+			FeishuCardDeliveryRevisionOAuthHandoff,
+		))
+		if loadErr != nil {
+			return loadErr
+		}
+		if delivery.State != FeishuCardDeliveryStateDelivered {
+			if feishuCardDeliveryTerminal(delivery.State) {
+				return ErrFeishuCardDeliveryResolved
+			}
+			return ErrFeishuCardDeliveryNotReady
+		}
+	}
+	result, err = tx.Exec(
+		`UPDATE feishu_resource_access_requests
+		 SET oauth_state_ciphertext='',
+		 oauth_handoff_delivered_at_ms=CASE WHEN oauth_handoff_delivered_at_ms=0 THEN ? ELSE oauth_handoff_delivered_at_ms END,
+		 updated_at_ms=?
+		 WHERE id=? AND account_id=? AND state=? AND oauth_state_hash=?`,
+		now.UnixMilli(), now.UnixMilli(), id, accountID, FeishuResourceAccessStatePending, stateHash,
+	)
+	if err != nil {
+		return fmt.Errorf("mark feishu resource oauth handoff delivered: %w", err)
+	}
+	if err := requireOneFeishuResourceAccessRow(result); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit delivered feishu resource oauth handoff: %w", err)
+	}
+	return nil
 }
 
 // SetFeishuResourceAccessCardMessageID binds the pending request to the exact card message.
@@ -382,8 +494,86 @@ func (s *Store) ApproveFeishuResourceAccessRequest(id, accountID, grantMode stri
 	return request, nil
 }
 
+// ClaimFeishuResourceAccessExecution atomically moves one approved request
+// into executing before a collaborator mutation without an idempotency token
+// is attempted. An interrupted executing request is failed during startup
+// recovery instead of replaying the remote mutation.
+func (s *Store) ClaimFeishuResourceAccessExecution(id, accountID string, now time.Time) (FeishuResourceAccessRequest, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return FeishuResourceAccessRequest{}, err
+	}
+	id = strings.TrimSpace(id)
+	accountID = strings.TrimSpace(accountID)
+	if id == "" || accountID == "" {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("feishu resource access execution id and account are required")
+	}
+	now = normalizedWorkflowTime(now)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("begin claim feishu resource access execution: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(
+		`UPDATE feishu_resource_access_requests
+		 SET state=?, updated_at_ms=?
+		 WHERE id=? AND account_id=? AND state=? AND grant_mode IN (?, ?)
+		 AND decision_at_ms>0 AND oauth_state_hash='' AND expires_at_ms>?`,
+		FeishuResourceAccessStateExecuting,
+		now.UnixMilli(),
+		id,
+		accountID,
+		FeishuResourceAccessStatePending,
+		FeishuResourceGrantModeOnce,
+		FeishuResourceGrantModeAll,
+		now.UnixMilli(),
+	)
+	if err != nil {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("claim feishu resource access execution: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("inspect feishu resource access execution claim: %w", err)
+	}
+	if count != 1 {
+		request, loadErr := feishuResourceAccessByID(tx, id, accountID)
+		if loadErr != nil {
+			return FeishuResourceAccessRequest{}, loadErr
+		}
+		if request.State == FeishuResourceAccessStatePending && validFeishuResourceGrantMode(request.GrantMode) &&
+			!request.DecisionAt.IsZero() && request.OAuthStateHash == "" && !now.Before(request.ExpiresAt) {
+			if err := updateFeishuResourceAccessTerminal(tx, request.ID, request.AccountID, FeishuResourceAccessStateExpired, "", "", now); err != nil {
+				return FeishuResourceAccessRequest{}, err
+			}
+			if err := tx.Commit(); err != nil {
+				return FeishuResourceAccessRequest{}, fmt.Errorf("commit expired feishu resource access execution claim: %w", err)
+			}
+			request.State = FeishuResourceAccessStateExpired
+			request.OAuthStateHash = ""
+			request.OAuthStateCiphertext = ""
+			request.OAuthHandoffDeliveredAt = time.Time{}
+			request.PKCEVerifier = ""
+			request.UpdatedAt = now
+			return request, ErrFeishuResourceAccessExpired
+		}
+		return request, ErrFeishuResourceAccessResolved
+	}
+	if err := updateWorkflowRequestState(tx, id, accountID, WorkflowRequestStateExecuting, now); err != nil {
+		return FeishuResourceAccessRequest{}, err
+	}
+	request, err := feishuResourceAccessByID(tx, id, accountID)
+	if err != nil {
+		return FeishuResourceAccessRequest{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return FeishuResourceAccessRequest{}, fmt.Errorf("commit claimed feishu resource access execution: %w", err)
+	}
+	return request, nil
+}
+
 // ListApprovedPendingFeishuResourceAccessRequests returns approved requests
-// that have not yet transitioned to OAuth or a terminal result.
+// that still need capability processing or an interrupted OAuth card delivery.
 func (s *Store) ListApprovedPendingFeishuResourceAccessRequests(accountID string, now time.Time, limit int) ([]FeishuResourceAccessRequest, error) {
 	if err := s.requireFeishuDocsStore(); err != nil {
 		return nil, err
@@ -399,7 +589,8 @@ func (s *Store) ListApprovedPendingFeishuResourceAccessRequests(accountID string
 	rows, err := s.db.Query(
 		feishuResourceAccessSelect+`
 		 WHERE account_id=? AND state=? AND grant_mode IN (?, ?) AND decision_at_ms>0
-		 AND oauth_state_hash='' AND expires_at_ms>?
+		 AND oauth_state_hash=''
+		 AND expires_at_ms>?
 		 ORDER BY decision_at_ms, created_at_ms LIMIT ?`,
 		accountID, FeishuResourceAccessStatePending,
 		FeishuResourceGrantModeOnce, FeishuResourceGrantModeAll,
@@ -516,6 +707,8 @@ func (s *Store) claimFeishuResourceAccessOAuthRequest(
 		}
 		request.State = FeishuResourceAccessStateExpired
 		request.OAuthStateHash = ""
+		request.OAuthStateCiphertext = ""
+		request.OAuthHandoffDeliveredAt = time.Time{}
 		request.PKCEVerifier = ""
 		request.UpdatedAt = now
 		return request, ErrFeishuResourceAccessExpired
@@ -530,7 +723,8 @@ func (s *Store) claimFeishuResourceAccessOAuthRequest(
 	}
 	result, err := tx.Exec(
 		`UPDATE feishu_resource_access_requests
-		 SET state=?, oauth_state_hash='', pkce_verifier='', updated_at_ms=?
+		 SET state=?, oauth_state_hash='', oauth_state_ciphertext='', oauth_handoff_delivered_at_ms=0,
+		 pkce_verifier='', updated_at_ms=?
 		 WHERE id=? AND account_id=? AND state=? AND oauth_state_hash<>''`,
 		FeishuResourceAccessStateExecuting, now.UnixMilli(), request.ID, request.AccountID, FeishuResourceAccessStatePending,
 	)
@@ -548,6 +742,8 @@ func (s *Store) claimFeishuResourceAccessOAuthRequest(
 	}
 	request.State = FeishuResourceAccessStateExecuting
 	request.OAuthStateHash = ""
+	request.OAuthStateCiphertext = ""
+	request.OAuthHandoffDeliveredAt = time.Time{}
 	request.UpdatedAt = now
 	return request, nil
 }
@@ -588,6 +784,8 @@ func (s *Store) DenyFeishuResourceAccessRequest(id, accountID string, match Feis
 		request.State = FeishuResourceAccessStateExpired
 		request.PKCEVerifier = ""
 		request.OAuthStateHash = ""
+		request.OAuthStateCiphertext = ""
+		request.OAuthHandoffDeliveredAt = time.Time{}
 		request.UpdatedAt = now
 		return request, ErrFeishuResourceAccessExpired
 	}
@@ -606,6 +804,8 @@ func (s *Store) DenyFeishuResourceAccessRequest(id, accountID string, match Feis
 	request.State = FeishuResourceAccessStateDenied
 	request.PKCEVerifier = ""
 	request.OAuthStateHash = ""
+	request.OAuthStateCiphertext = ""
+	request.OAuthHandoffDeliveredAt = time.Time{}
 	request.UpdatedAt = now
 	return request, nil
 }
@@ -724,7 +924,8 @@ func (s *Store) CompleteFeishuResourceAccessRequest(
 		 SET state=?, grant_source=?, verified_permission=?,
 		 subject_type=CASE WHEN ?='' THEN subject_type ELSE ? END,
 		 subject_id=CASE WHEN ?='' THEN subject_id ELSE ? END,
-		 oauth_state_hash='', pkce_verifier='', updated_at_ms=?
+		 oauth_state_hash='', oauth_state_ciphertext='', oauth_handoff_delivered_at_ms=0,
+		 pkce_verifier='', updated_at_ms=?
 		 WHERE id=? AND account_id=? AND state IN (?, ?)`,
 		FeishuResourceAccessStateSucceeded, source, verifiedPermission,
 		subjectType, subjectType, subjectID, subjectID, now.UnixMilli(),
@@ -748,6 +949,23 @@ func (s *Store) CompleteFeishuResourceAccessRequest(
 	}
 	if err := updateWorkflowRequestState(tx, id, accountID, WorkflowRequestStateSucceeded, now); err != nil {
 		return err
+	}
+	request.State = FeishuResourceAccessStateSucceeded
+	request.GrantSource = source
+	request.VerifiedPermission = verifiedPermission
+	if subjectType != "" {
+		request.SubjectType = subjectType
+	}
+	if subjectID != "" {
+		request.SubjectID = subjectID
+	}
+	request.OAuthStateHash = ""
+	request.OAuthStateCiphertext = ""
+	request.OAuthHandoffDeliveredAt = time.Time{}
+	request.PKCEVerifier = ""
+	request.UpdatedAt = now
+	if err := enqueueResourceAccessTerminalCardDelivery(tx, request, now); err != nil {
+		return fmt.Errorf("enqueue completed feishu resource access card: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit completed feishu resource access: %w", err)
@@ -773,9 +991,14 @@ func (s *Store) FailFeishuResourceAccessRequest(id, accountID string, now time.T
 		return fmt.Errorf("begin fail feishu resource access: %w", err)
 	}
 	defer tx.Rollback()
+	request, err := feishuResourceAccessByID(tx, id, accountID)
+	if err != nil {
+		return err
+	}
 	result, err := tx.Exec(
 		`UPDATE feishu_resource_access_requests
-		 SET state=?, oauth_state_hash='', pkce_verifier='', updated_at_ms=?
+		 SET state=?, oauth_state_hash='', oauth_state_ciphertext='', oauth_handoff_delivered_at_ms=0,
+		 pkce_verifier='', updated_at_ms=?
 		 WHERE id=? AND account_id=? AND state IN (?, ?)`,
 		FeishuResourceAccessStateFailed, now.UnixMilli(), id, accountID,
 		FeishuResourceAccessStatePending, FeishuResourceAccessStateExecuting,
@@ -788,6 +1011,15 @@ func (s *Store) FailFeishuResourceAccessRequest(id, accountID string, now time.T
 	}
 	if err := updateWorkflowRequestState(tx, id, accountID, WorkflowRequestStateFailed, now); err != nil {
 		return err
+	}
+	request.State = FeishuResourceAccessStateFailed
+	request.OAuthStateHash = ""
+	request.OAuthStateCiphertext = ""
+	request.OAuthHandoffDeliveredAt = time.Time{}
+	request.PKCEVerifier = ""
+	request.UpdatedAt = now
+	if err := enqueueResourceAccessTerminalCardDelivery(tx, request, now); err != nil {
+		return fmt.Errorf("enqueue failed feishu resource access card: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit failed feishu resource access: %w", err)
@@ -809,9 +1041,20 @@ func (s *Store) ExpireFeishuResourceAccessRequests(accountID string, now time.Ti
 		return 0, fmt.Errorf("begin expire feishu resource access requests: %w", err)
 	}
 	defer tx.Rollback()
+	expiring, err := listFeishuResourceAccessForCardDelivery(
+		tx,
+		` WHERE account_id=? AND state=? AND expires_at_ms<=?`,
+		accountID,
+		FeishuResourceAccessStatePending,
+		now.UnixMilli(),
+	)
+	if err != nil {
+		return 0, err
+	}
 	result, err := tx.Exec(
 		`UPDATE feishu_resource_access_requests
-		 SET state=?, oauth_state_hash='', pkce_verifier='', updated_at_ms=?
+		 SET state=?, oauth_state_hash='', oauth_state_ciphertext='', oauth_handoff_delivered_at_ms=0,
+		 pkce_verifier='', updated_at_ms=?
 		 WHERE account_id=? AND state=? AND expires_at_ms<=?`,
 		FeishuResourceAccessStateExpired, now.UnixMilli(), accountID,
 		FeishuResourceAccessStatePending, now.UnixMilli(),
@@ -832,51 +1075,56 @@ func (s *Store) ExpireFeishuResourceAccessRequests(accountID string, now time.Ti
 	); err != nil {
 		return 0, fmt.Errorf("expire feishu resource access workflows: %w", err)
 	}
+	for _, request := range expiring {
+		request.State = FeishuResourceAccessStateExpired
+		request.OAuthStateHash = ""
+		request.OAuthStateCiphertext = ""
+		request.OAuthHandoffDeliveredAt = time.Time{}
+		request.PKCEVerifier = ""
+		request.UpdatedAt = now
+		if err := enqueueResourceAccessTerminalCardDelivery(tx, request, now); err != nil {
+			return 0, fmt.Errorf("enqueue expired feishu resource access card: %w", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit expired feishu resource access requests: %w", err)
 	}
 	return count, nil
 }
 
-// FailExecutingFeishuResourceAccessRequests closes callbacks interrupted by a restart.
-func (s *Store) FailExecutingFeishuResourceAccessRequests(accountID string, now time.Time) (int64, error) {
+// ListExecutingFeishuResourceAccessRequests returns collaborator mutations that
+// may have reached Feishu before a process stopped. Startup recovery must
+// reconcile these rows with a read-only live permission check before deciding
+// whether the request succeeded or failed.
+func (s *Store) ListExecutingFeishuResourceAccessRequests(accountID string) ([]FeishuResourceAccessRequest, error) {
 	if err := s.requireFeishuDocsStore(); err != nil {
-		return 0, err
+		return nil, err
 	}
 	accountID = strings.TrimSpace(accountID)
-	now = normalizedWorkflowTime(now)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	tx, err := s.db.Begin()
-	if err != nil {
-		return 0, fmt.Errorf("begin fail executing feishu resource access requests: %w", err)
+	if accountID == "" {
+		return nil, fmt.Errorf("feishu resource access account is required")
 	}
-	defer tx.Rollback()
-	result, err := tx.Exec(
-		`UPDATE feishu_resource_access_requests
-		 SET state=?, oauth_state_hash='', pkce_verifier='', updated_at_ms=?
-		 WHERE account_id=? AND state=?`,
-		FeishuResourceAccessStateFailed, now.UnixMilli(), accountID, FeishuResourceAccessStateExecuting,
+	rows, err := s.db.Query(
+		feishuResourceAccessSelect+` WHERE account_id=? AND state=? ORDER BY updated_at_ms, id`,
+		accountID,
+		FeishuResourceAccessStateExecuting,
 	)
 	if err != nil {
-		return 0, fmt.Errorf("fail executing feishu resource access requests: %w", err)
+		return nil, fmt.Errorf("list executing feishu resource access requests: %w", err)
 	}
-	count, err := result.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("inspect failed feishu resource access requests: %w", err)
+	defer rows.Close()
+	requests := make([]FeishuResourceAccessRequest, 0)
+	for rows.Next() {
+		request, scanErr := scanFeishuResourceAccessRequest(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		requests = append(requests, request)
 	}
-	if _, err := tx.Exec(
-		`UPDATE workflow_requests SET state=?, updated_at_ms=?
-		 WHERE account_id=? AND kind=? AND state=?`,
-		WorkflowRequestStateFailed, now.UnixMilli(), accountID,
-		WorkflowRequestKindFeishuResourceAccess, WorkflowRequestStateExecuting,
-	); err != nil {
-		return 0, fmt.Errorf("fail executing feishu resource access workflows: %w", err)
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate executing feishu resource access requests: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("commit failed executing feishu resource access requests: %w", err)
-	}
-	return count, nil
+	return requests, nil
 }
 
 // UpsertFeishuResourceGrant creates, renews, or upgrades one exact chat-scoped grant.
@@ -1015,7 +1263,7 @@ const feishuResourceAccessSelect = `SELECT id, account_id, actor_open_id, actor_
  chat_id, source_message_id, resource_type, resource_token, resource_url, resource_display_name,
  permission, reason, once_duration_minutes, grant_mode, decision_at_ms,
  subject_type, subject_id, grant_source, verified_permission,
- card_message_id, oauth_state_hash, pkce_verifier, state,
+ card_message_id, oauth_state_hash, oauth_state_ciphertext, oauth_handoff_delivered_at_ms, pkce_verifier, state,
  created_at_ms, expires_at_ms, updated_at_ms
  FROM feishu_resource_access_requests`
 
@@ -1049,7 +1297,7 @@ func scanFeishuBotResource(row feishuResourceAccessScanner) (FeishuBotResource, 
 
 func scanFeishuResourceAccessRequest(row feishuResourceAccessScanner) (FeishuResourceAccessRequest, error) {
 	var request FeishuResourceAccessRequest
-	var decisionAtMS, createdAtMS, expiresAtMS, updatedAtMS int64
+	var decisionAtMS, oauthHandoffDeliveredAtMS, createdAtMS, expiresAtMS, updatedAtMS int64
 	if err := row.Scan(
 		&request.ID,
 		&request.AccountID,
@@ -1072,6 +1320,8 @@ func scanFeishuResourceAccessRequest(row feishuResourceAccessScanner) (FeishuRes
 		&request.VerifiedPermission,
 		&request.CardMessageID,
 		&request.OAuthStateHash,
+		&request.OAuthStateCiphertext,
+		&oauthHandoffDeliveredAtMS,
 		&request.PKCEVerifier,
 		&request.State,
 		&createdAtMS,
@@ -1087,6 +1337,7 @@ func scanFeishuResourceAccessRequest(row feishuResourceAccessScanner) (FeishuRes
 	request.ExpiresAt = time.UnixMilli(expiresAtMS).UTC()
 	request.UpdatedAt = time.UnixMilli(updatedAtMS).UTC()
 	request.DecisionAt = timeFromOptionalMillis(decisionAtMS)
+	request.OAuthHandoffDeliveredAt = timeFromOptionalMillis(oauthHandoffDeliveredAtMS)
 	return request, nil
 }
 
@@ -1156,6 +1407,10 @@ func normalizeFeishuResourceAccessRequest(request FeishuResourceAccessRequest) F
 	request.DecisionAt = optionalUTC(request.DecisionAt)
 	request.SubjectType = strings.TrimSpace(request.SubjectType)
 	request.SubjectID = strings.TrimSpace(request.SubjectID)
+	request.OAuthStateHash = strings.TrimSpace(request.OAuthStateHash)
+	request.OAuthStateCiphertext = strings.TrimSpace(request.OAuthStateCiphertext)
+	request.OAuthHandoffDeliveredAt = optionalUTC(request.OAuthHandoffDeliveredAt)
+	request.PKCEVerifier = strings.TrimSpace(request.PKCEVerifier)
 	request.CreatedAt = normalizedWorkflowTime(request.CreatedAt)
 	request.ExpiresAt = request.ExpiresAt.UTC()
 	return request
@@ -1171,7 +1426,8 @@ func validateNewFeishuResourceAccessRequest(request FeishuResourceAccessRequest)
 	if request.OnceDurationMinutes < FeishuResourceAccessMinOnceDurationMinutes || request.OnceDurationMinutes > FeishuResourceAccessMaxOnceDurationMinutes {
 		return fmt.Errorf("feishu resource access once duration must be between %d and %d minutes", FeishuResourceAccessMinOnceDurationMinutes, FeishuResourceAccessMaxOnceDurationMinutes)
 	}
-	if request.GrantMode != "" || !request.DecisionAt.IsZero() || request.CardMessageID != "" || request.OAuthStateHash != "" || request.PKCEVerifier != "" {
+	if request.GrantMode != "" || !request.DecisionAt.IsZero() || request.CardMessageID != "" ||
+		request.OAuthStateHash != "" || request.OAuthStateCiphertext != "" || !request.OAuthHandoffDeliveredAt.IsZero() || request.PKCEVerifier != "" {
 		return fmt.Errorf("new feishu resource access request must not contain a decision, card binding, or oauth state")
 	}
 	if !request.ExpiresAt.After(request.CreatedAt) {
@@ -1289,7 +1545,8 @@ func updateFeishuResourceAccessTerminal(tx *sql.Tx, id, accountID, state, source
 	}
 	result, err := tx.Exec(
 		`UPDATE feishu_resource_access_requests
-		 SET state=?, grant_source=?, verified_permission=?, oauth_state_hash='', pkce_verifier='', updated_at_ms=?
+		 SET state=?, grant_source=?, verified_permission=?, oauth_state_hash='', oauth_state_ciphertext='',
+		 oauth_handoff_delivered_at_ms=0, pkce_verifier='', updated_at_ms=?
 		 WHERE id=? AND account_id=? AND state=?`,
 		state, source, permission, now.UnixMilli(), id, accountID, FeishuResourceAccessStatePending,
 	)
@@ -1299,7 +1556,34 @@ func updateFeishuResourceAccessTerminal(tx *sql.Tx, id, accountID, state, source
 	if err := requireOneFeishuResourceAccessRow(result); err != nil {
 		return err
 	}
-	return updateWorkflowRequestState(tx, id, accountID, state, now)
+	if err := updateWorkflowRequestState(tx, id, accountID, state, now); err != nil {
+		return err
+	}
+	request, err := feishuResourceAccessByID(tx, id, accountID)
+	if err != nil {
+		return err
+	}
+	return enqueueResourceAccessTerminalCardDelivery(tx, request, now)
+}
+
+func listFeishuResourceAccessForCardDelivery(tx *sql.Tx, suffix string, args ...any) ([]FeishuResourceAccessRequest, error) {
+	rows, err := tx.Query(feishuResourceAccessSelect+suffix, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list feishu resource access for card delivery: %w", err)
+	}
+	defer rows.Close()
+	requests := make([]FeishuResourceAccessRequest, 0)
+	for rows.Next() {
+		request, err := scanFeishuResourceAccessRequest(rows)
+		if err != nil {
+			return nil, err
+		}
+		requests = append(requests, request)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate feishu resource access for card delivery: %w", err)
+	}
+	return requests, nil
 }
 
 type feishuResourceGrantExecer interface {

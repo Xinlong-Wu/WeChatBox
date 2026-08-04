@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 )
+
+const defaultFeishuCardUpdateTimeout = 10 * time.Second
 
 // Card is one concrete Feishu Card V2 instance.
 type Card interface {
@@ -26,6 +29,29 @@ type CardService interface {
 	UpdateByCallbackToken(context.Context, string, Card) error
 	RegisterAction(string, CardActionHandler) error
 	HandleAction(context.Context, *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error)
+}
+
+type cardMessageUpdater interface {
+	UpdateByMessageID(context.Context, string, Card) error
+}
+
+func updateFeishuCardByMessageIDWithTimeout(baseCtx context.Context, updater cardMessageUpdater, messageID string, card Card, timeout time.Duration) error {
+	if updater == nil {
+		return fmt.Errorf("feishu card message updater is required")
+	}
+	messageID = strings.TrimSpace(messageID)
+	if messageID == "" || card == nil {
+		return nil
+	}
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	if timeout <= 0 {
+		timeout = defaultFeishuCardUpdateTimeout
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, timeout)
+	defer cancel()
+	return updater.UpdateByMessageID(ctx, messageID, card)
 }
 
 type cardTransport interface {

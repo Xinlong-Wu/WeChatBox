@@ -27,6 +27,12 @@ func (s *Store) migrate() error {
 			archived INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL DEFAULT (datetime('now'))
 		)`,
+		`CREATE TABLE IF NOT EXISTS conversation_file_locks (
+			user_id TEXT NOT NULL,
+			session_id TEXT NOT NULL,
+			generation INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (user_id, session_id)
+		)`,
 		`CREATE TABLE IF NOT EXISTS user_preferences (
 			user_id TEXT PRIMARY KEY,
 			current_session_id TEXT NOT NULL DEFAULT '',
@@ -172,6 +178,8 @@ func (s *Store) migrate() error {
 			verified_permission TEXT NOT NULL DEFAULT '',
 			card_message_id TEXT NOT NULL DEFAULT '',
 			oauth_state_hash TEXT NOT NULL DEFAULT '',
+			oauth_state_ciphertext TEXT NOT NULL DEFAULT '',
+			oauth_handoff_delivered_at_ms INTEGER NOT NULL DEFAULT 0,
 			pkce_verifier TEXT NOT NULL DEFAULT '',
 			state TEXT NOT NULL,
 			created_at_ms INTEGER NOT NULL,
@@ -247,6 +255,64 @@ func (s *Store) migrate() error {
 			created_at_ms INTEGER NOT NULL,
 			updated_at_ms INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS feishu_account_runtime_leases (
+			account_id TEXT PRIMARY KEY,
+			owner_id TEXT NOT NULL,
+			acquired_at_ms INTEGER NOT NULL,
+			heartbeat_at_ms INTEGER NOT NULL,
+			lease_expires_at_ms INTEGER NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS feishu_card_deliveries (
+			id TEXT PRIMARY KEY,
+			account_id TEXT NOT NULL,
+			request_id TEXT NOT NULL,
+			purpose TEXT NOT NULL,
+			revision INTEGER NOT NULL,
+			card_message_id TEXT NOT NULL,
+			state TEXT NOT NULL,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			available_at_ms INTEGER NOT NULL,
+			lease_token TEXT NOT NULL DEFAULT '',
+			lease_expires_at_ms INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			expires_at_ms INTEGER NOT NULL,
+			created_at_ms INTEGER NOT NULL,
+			updated_at_ms INTEGER NOT NULL,
+			delivered_at_ms INTEGER NOT NULL DEFAULT 0,
+			UNIQUE (account_id, request_id, purpose, revision)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_feishu_card_deliveries_available
+		 ON feishu_card_deliveries(account_id, state, available_at_ms, lease_expires_at_ms)`,
+		`CREATE INDEX IF NOT EXISTS idx_feishu_card_deliveries_request_revision
+		 ON feishu_card_deliveries(account_id, request_id, revision)`,
+		`CREATE TABLE IF NOT EXISTS feishu_remote_operations (
+			request_id TEXT PRIMARY KEY,
+			account_id TEXT NOT NULL,
+			operation_kind TEXT NOT NULL,
+			chat_id TEXT NOT NULL,
+			actor_open_id TEXT NOT NULL DEFAULT '',
+			actor_user_id TEXT NOT NULL DEFAULT '',
+			parent_resource_type TEXT NOT NULL,
+			parent_resource_token TEXT NOT NULL,
+			binding_parent_token TEXT NOT NULL DEFAULT '',
+			requested_name TEXT NOT NULL,
+			payload_hash TEXT NOT NULL,
+			set_default INTEGER NOT NULL DEFAULT 0,
+			share_member_type TEXT NOT NULL DEFAULT '',
+			share_member_id TEXT NOT NULL DEFAULT '',
+			initial_content_requested INTEGER NOT NULL DEFAULT 0,
+			state TEXT NOT NULL,
+			remote_resource_type TEXT NOT NULL,
+			remote_resource_token TEXT NOT NULL DEFAULT '',
+			remote_url TEXT NOT NULL DEFAULT '',
+			remote_call_started_at_ms INTEGER NOT NULL DEFAULT 0,
+			remote_result_at_ms INTEGER NOT NULL DEFAULT 0,
+			last_error_category TEXT NOT NULL DEFAULT '',
+			created_at_ms INTEGER NOT NULL,
+			updated_at_ms INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_feishu_remote_operations_account_state
+		 ON feishu_remote_operations(account_id, state, updated_at_ms)`,
 	}
 
 	for _, q := range queries {
@@ -273,6 +339,9 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if err := s.ensureFeishuResourceAccessDisplayColumns(); err != nil {
+		return err
+	}
+	if err := s.ensureFeishuResourceAccessOAuthDeliveryColumns(); err != nil {
 		return err
 	}
 	if err := s.ensureWorkflowContinuationContextColumns(); err != nil {
@@ -341,6 +410,8 @@ func (s *Store) migrate() error {
 			 WHERE state IN ('prepared', 'response_staged')`,
 		`CREATE INDEX IF NOT EXISTS idx_feishu_oauth_refresh_account_state_lease
 			 ON feishu_oauth_refresh_attempts(account_id, state, lease_expires_at_ms, updated_at_ms)`,
+		`CREATE INDEX IF NOT EXISTS idx_feishu_oauth_refresh_account_state_updated
+			 ON feishu_oauth_refresh_attempts(account_id, state, updated_at_ms)`,
 	}
 	for _, q := range indexes {
 		if _, err := s.db.Exec(q); err != nil {
@@ -616,6 +687,29 @@ func (s *Store) ensureFeishuResourceAccessDisplayColumns() error {
 	}
 	if _, err := s.db.Exec(`ALTER TABLE feishu_resource_access_requests ADD COLUMN resource_display_name TEXT NOT NULL DEFAULT ''`); err != nil {
 		return fmt.Errorf("add feishu resource access display-name column: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ensureFeishuResourceAccessOAuthDeliveryColumns() error {
+	columns := []struct {
+		name       string
+		definition string
+	}{
+		{name: "oauth_state_ciphertext", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "oauth_handoff_delivered_at_ms", definition: "INTEGER NOT NULL DEFAULT 0"},
+	}
+	for _, column := range columns {
+		hasColumn, err := s.tableHasColumn("feishu_resource_access_requests", column.name)
+		if err != nil {
+			return fmt.Errorf("inspect feishu resource access %s schema: %w", column.name, err)
+		}
+		if hasColumn {
+			continue
+		}
+		if _, err := s.db.Exec(`ALTER TABLE feishu_resource_access_requests ADD COLUMN ` + column.name + ` ` + column.definition); err != nil {
+			return fmt.Errorf("add feishu resource access %s column: %w", column.name, err)
+		}
 	}
 	return nil
 }

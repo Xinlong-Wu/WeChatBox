@@ -259,6 +259,20 @@ func (s *Store) GetFeishuChatDocument(accountID, chatID, documentToken string) (
 	))
 }
 
+// GetFeishuChatDocumentByRequest returns the document created by one durable
+// remote-operation request in the exact chat.
+func (s *Store) GetFeishuChatDocumentByRequest(accountID, chatID, requestID string) (FeishuChatDocument, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return FeishuChatDocument{}, err
+	}
+	return scanFeishuChatDocument(s.db.QueryRow(
+		`SELECT account_id, chat_id, document_token, folder_token, title, url,
+		 source_request_id, created_at_ms, updated_at_ms
+		 FROM feishu_chat_documents WHERE account_id=? AND chat_id=? AND source_request_id=?`,
+		strings.TrimSpace(accountID), strings.TrimSpace(chatID), strings.TrimSpace(requestID),
+	))
+}
+
 // DeleteFeishuDocsData removes all Feishu document/resource metadata and
 // document-related workflow requests for one bot account.
 func (s *Store) DeleteFeishuDocsData(accountID string) error {
@@ -273,6 +287,12 @@ func (s *Store) DeleteFeishuDocsData(accountID string) error {
 		return fmt.Errorf("begin delete feishu docs data: %w", err)
 	}
 	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM feishu_card_deliveries WHERE account_id=?`, accountID); err != nil {
+		return fmt.Errorf("delete feishu card deliveries: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM feishu_remote_operations WHERE account_id=?`, accountID); err != nil {
+		return fmt.Errorf("delete feishu remote operations: %w", err)
+	}
 	if _, err := tx.Exec(`DELETE FROM feishu_chat_documents WHERE account_id=?`, accountID); err != nil {
 		return fmt.Errorf("delete feishu chat documents: %w", err)
 	}
@@ -290,6 +310,9 @@ func (s *Store) DeleteFeishuDocsData(accountID string) error {
 	}
 	if _, err := tx.Exec(`DELETE FROM feishu_user_oauth_credentials WHERE account_id=?`, accountID); err != nil {
 		return fmt.Errorf("delete feishu user oauth credentials: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM feishu_account_runtime_leases WHERE account_id=?`, accountID); err != nil {
+		return fmt.Errorf("delete feishu account runtime lease: %w", err)
 	}
 	if _, err := tx.Exec(`DELETE FROM feishu_resource_access_requests WHERE account_id=?`, accountID); err != nil {
 		return fmt.Errorf("delete feishu resource access requests: %w", err)

@@ -19,7 +19,6 @@ import (
 const (
 	defaultToolApprovalTTL              = 10 * time.Minute
 	defaultApprovedToolExecutionTimeout = 30 * time.Second
-	approvalCardUpdateTimeout           = 10 * time.Second
 )
 
 type toolApprovalStore interface {
@@ -35,9 +34,10 @@ type toolApprovalStore interface {
 	FailToolApproval(id, accountID string, now time.Time) error
 	GetToolApproval(id, accountID string) (store.ToolApproval, error)
 	ExpireToolApprovals(accountID string, now time.Time) (int64, error)
-	FailExecutingToolApprovals(accountID string, now time.Time) (int64, error)
+	ListExecutingToolApprovals(accountID string) ([]store.ToolApproval, error)
 	UpsertToolApprovalGrant(grant store.ToolApprovalGrant) (store.ToolApprovalGrant, error)
 	FindToolApprovalGrant(scope store.ToolApprovalGrantScope) (store.ToolApprovalGrant, bool, error)
+	MarkFeishuCardDeliveryDelivered(accountID, requestID, purpose string, revision int64, now time.Time) error
 }
 
 func (m *operationApprovalService) recoverPersistedApprovals(ctx context.Context) error {
@@ -46,15 +46,46 @@ func (m *operationApprovalService) recoverPersistedApprovals(ctx context.Context
 	if err != nil {
 		return fmt.Errorf("expire persisted feishu tool approvals: %w", err)
 	}
-	interrupted, err := m.store.FailExecutingToolApprovals(m.account.ID, now)
+	interrupted, err := m.store.ListExecutingToolApprovals(m.account.ID)
 	if err != nil {
-		return fmt.Errorf("close interrupted feishu tool approvals: %w", err)
+		return fmt.Errorf("list interrupted feishu tool approvals: %w", err)
+	}
+	resumed := 0
+	failed := 0
+	for _, approval := range interrupted {
+		executor := m.executor(approval.ToolName, approval.ActionKey)
+		policy, policyErr := feishutools.OperationApprovalPolicy{}, error(nil)
+		if executor != nil {
+			policy, policyErr = normalizeOperationApprovalPolicy(executor.OperationApprovalPolicy())
+		}
+		if policyErr == nil && policy.RecoverInterrupted && policy.ToolName == approval.ToolName && policy.ActionKey == approval.ActionKey {
+			releaseTask, accepted := m.tasks.Reserve()
+			if !accepted {
+				return fmt.Errorf("resume interrupted feishu tool approval %s: runtime is shutting down", shortRequestID(approval.ID))
+			}
+			resumed++
+			go func(approval store.ToolApproval, executor feishutools.OperationApprovalExecutor) {
+				defer releaseTask()
+				m.executeApproved(approval, executor, "")
+			}(approval, executor)
+			continue
+		}
+		if err := m.store.FailToolApproval(approval.ID, approval.AccountID, now); err != nil {
+			if errors.Is(err, store.ErrToolApprovalResolved) {
+				continue
+			}
+			return fmt.Errorf("close interrupted feishu tool approval %s: %w", shortRequestID(approval.ID), err)
+		}
+		failed++
 	}
 	if expired > 0 {
 		feishuLog.Info(ctx, "expired persisted feishu tool approvals account=%s count=%d", m.account.ID, expired)
 	}
-	if interrupted > 0 {
-		feishuLog.Warn(ctx, "closed interrupted feishu tool approvals account=%s count=%d", m.account.ID, interrupted)
+	if resumed > 0 {
+		feishuLog.Info(ctx, "resumed restart-safe interrupted feishu tool approvals account=%s count=%d", m.account.ID, resumed)
+	}
+	if failed > 0 {
+		feishuLog.Warn(ctx, "closed non-recoverable interrupted feishu tool approvals account=%s count=%d", m.account.ID, failed)
 	}
 	reconciled, err := m.reconcileTerminalApprovalResults(ctx, now)
 	if err != nil {
@@ -67,16 +98,18 @@ func (m *operationApprovalService) recoverPersistedApprovals(ctx context.Context
 }
 
 type operationApprovalService struct {
-	store            toolApprovalStore
-	cards            CardService
-	account          store.Account
-	runCtx           context.Context
-	ttl              time.Duration
-	executionTimeout time.Duration
-	now              func() time.Time
+	store             toolApprovalStore
+	cards             CardService
+	account           store.Account
+	runCtx            context.Context
+	ttl               time.Duration
+	executionTimeout  time.Duration
+	cardUpdateTimeout time.Duration
+	now               func() time.Time
 
 	mu        sync.RWMutex
 	executors map[string]feishutools.OperationApprovalExecutor
+	tasks     backgroundTaskGroup
 }
 
 func newOperationApprovalService(runCtx context.Context, st *store.Store, account store.Account, cards CardService) (*operationApprovalService, error) {
@@ -96,14 +129,15 @@ func newOperationApprovalService(runCtx context.Context, st *store.Store, accoun
 		runCtx = context.Background()
 	}
 	manager := &operationApprovalService{
-		store:            st,
-		cards:            cards,
-		account:          account,
-		runCtx:           runCtx,
-		ttl:              defaultToolApprovalTTL,
-		executionTimeout: defaultApprovedToolExecutionTimeout,
-		now:              time.Now,
-		executors:        map[string]feishutools.OperationApprovalExecutor{},
+		store:             st,
+		cards:             cards,
+		account:           account,
+		runCtx:            runCtx,
+		ttl:               defaultToolApprovalTTL,
+		executionTimeout:  defaultApprovedToolExecutionTimeout,
+		cardUpdateTimeout: defaultFeishuCardUpdateTimeout,
+		now:               time.Now,
+		executors:         map[string]feishutools.OperationApprovalExecutor{},
 	}
 	if err := cards.RegisterAction(approvalCardActionKind, manager.HandleCardAction); err != nil {
 		return nil, fmt.Errorf("register feishu tool approval card action: %w", err)
@@ -293,6 +327,23 @@ func (m *operationApprovalService) HandleCardAction(ctx context.Context, event *
 		ChatID:        event.Event.Context.OpenChatID,
 		CardMessageID: event.Event.Context.OpenMessageID,
 	}
+	if m.baseContext().Err() != nil {
+		feishuLog.Warn(ctx, "rejected feishu tool approval callback after runtime cancellation request=%s account=%s action=%s",
+			shortRequestID(requestID), m.account.ID, action)
+		return cardToast("error", "LingoBridge 正在关闭，请服务恢复后重新点击本卡片。"), nil
+	}
+	releaseTask, accepted := m.tasks.Reserve()
+	if !accepted {
+		feishuLog.Warn(ctx, "rejected feishu tool approval callback while runtime is shutting down request=%s account=%s action=%s",
+			shortRequestID(requestID), m.account.ID, action)
+		return cardToast("error", "LingoBridge 正在关闭，请服务恢复后重新点击本卡片。"), nil
+	}
+	taskHandedOff := false
+	defer func() {
+		if !taskHandedOff {
+			releaseTask()
+		}
+	}()
 	if action == approvalCardActionApproveAll {
 		pending, err := m.store.GetToolApproval(requestID, m.account.ID)
 		if err != nil {
@@ -348,7 +399,11 @@ func (m *operationApprovalService) HandleCardAction(ctx context.Context, event *
 		// The official delayed-update flow requires the callback to return before
 		// using its token, so approval returns only a Toast and updates the final
 		// card state after the asynchronous operation completes.
-		go m.executeApproved(approval, executor, event.Event.Token)
+		taskHandedOff = true
+		go func() {
+			defer releaseTask()
+			m.executeApproved(approval, executor, event.Event.Token)
+		}()
 		return cardToast("success", toast), nil
 	default:
 		return cardToast("error", "不支持的授权操作。"), nil
@@ -418,20 +473,33 @@ func (m *operationApprovalService) handleApprovalDecisionError(ctx context.Conte
 }
 
 func (m *operationApprovalService) executeApproved(approval store.ToolApproval, executor feishutools.OperationApprovalExecutor, callbackToken string) {
-	ctx, cancel := context.WithTimeout(m.baseContext(), m.approvedExecutionTimeout())
+	// An admitted approval task is tracked by the runtime task group and the
+	// account lease is held until it drains. Do not turn lifecycle cancellation
+	// into a false operation failure during orderly shutdown. Lease ownership
+	// loss is different and must cancel the side effect immediately.
+	drainCtx, cancelDrain := feishuRuntimeDrainContext(m.baseContext())
+	ctx, cancel := context.WithTimeout(drainCtx, m.approvedExecutionTimeout())
 	result, err := executor.ExecuteApproved(ctx, approval.ID, json.RawMessage(approval.Payload))
 	cancel()
+	cancelDrain()
 	completedAt := m.currentTime()
+	if feishuRuntimeOwnershipLost(m.baseContext()) {
+		feishuLog.Warn(m.baseContext(), "preserving executing feishu tool approval after account lease ownership loss request=%s account=%s tool=%s user=%s chat=%s error_type=%T",
+			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID, err)
+		return
+	}
 	if err != nil {
 		completeErr := m.store.CompleteToolApproval(approval.ID, approval.AccountID, store.ToolApprovalStateFailed, completedAt)
 		if completeErr != nil {
 			feishuLog.Error(m.baseContext(), "mark feishu tool approval failed request=%s account=%s: %v", shortRequestID(approval.ID), approval.AccountID, completeErr)
-		} else {
-			m.persistApprovalWorkflowResult(m.baseContext(), approval, store.WorkflowResultStateFailed, "failed", "授权已确认，但操作执行失败。", false, "", completedAt)
 		}
 		feishuLog.Error(m.baseContext(), "execute approved feishu tool failed request=%s account=%s tool=%s user=%s chat=%s: %v",
 			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID, err)
+		if completeErr != nil {
+			return
+		}
 		m.updateApprovalResultCard(approval, callbackToken, statusCard{title: "执行失败", template: "red", message: "授权已确认，但操作执行失败。请稍后重新发起。"})
+		m.persistApprovalWorkflowResult(m.baseContext(), approval, store.WorkflowResultStateFailed, "failed", "授权已确认，但操作执行失败。", false, "", completedAt)
 		return
 	}
 	completedState := store.ToolApprovalStateSucceeded
@@ -442,31 +510,91 @@ func (m *operationApprovalService) executeApproved(approval store.ToolApproval, 
 	if message == "" {
 		message = "✅ 已完成授权操作。"
 	}
-	if err := m.store.CompleteToolApproval(approval.ID, approval.AccountID, completedState, completedAt); err != nil {
-		feishuLog.Error(m.baseContext(), "mark feishu tool approval completed request=%s account=%s state=%s: %v", shortRequestID(approval.ID), approval.AccountID, completedState, err)
-	} else {
-		status := "succeeded"
-		if result.Warning {
-			status = "succeeded_with_warning"
-		}
-		m.persistApprovalWorkflowResult(m.baseContext(), approval, store.WorkflowResultStateSucceeded, status, message, result.Warning, result.WarningReason, completedAt)
+	completeErr := m.store.CompleteToolApproval(approval.ID, approval.AccountID, completedState, completedAt)
+	if completeErr != nil {
+		feishuLog.Error(m.baseContext(), "mark feishu tool approval completed request=%s account=%s state=%s: %v", shortRequestID(approval.ID), approval.AccountID, completedState, completeErr)
+		return
+	}
+	if feishuRuntimeOwnershipLost(m.baseContext()) {
+		feishuLog.Warn(m.baseContext(), "deferred feishu tool approval terminal publication after account lease ownership loss request=%s account=%s tool=%s state=%s",
+			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, completedState)
+		return
 	}
 	if result.Warning {
 		feishuLog.Warn(m.baseContext(), "completed approved feishu tool with warning request=%s account=%s tool=%s user=%s chat=%s warning=%s",
 			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID,
 			truncateApprovalRunes(strings.TrimSpace(result.WarningReason), approvalCardMaxValueRunes))
 		m.updateApprovalResultCard(approval, callbackToken, statusCard{title: "执行完成（有警告）", template: "orange", message: message})
-		return
+	} else {
+		feishuLog.Info(m.baseContext(), "completed approved feishu tool request=%s account=%s tool=%s user=%s chat=%s",
+			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID)
+		m.updateApprovalResultCard(approval, callbackToken, statusCard{title: "执行完成", template: "green", message: message})
 	}
-	feishuLog.Info(m.baseContext(), "completed approved feishu tool request=%s account=%s tool=%s user=%s chat=%s",
-		shortRequestID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID)
-	m.updateApprovalResultCard(approval, callbackToken, statusCard{title: "执行完成", template: "green", message: message})
+	status := "succeeded"
+	if result.Warning {
+		status = "succeeded_with_warning"
+	}
+	m.persistApprovalWorkflowResult(m.baseContext(), approval, store.WorkflowResultStateSucceeded, status, message, result.Warning, result.WarningReason, completedAt)
 }
 
 func (m *operationApprovalService) updateApprovalResultCard(approval store.ToolApproval, callbackToken string, card Card) {
-	ctx, cancel := context.WithTimeout(m.baseContext(), approvalCardUpdateTimeout)
+	drainCtx, cancel := feishuRuntimeDrainContext(m.baseContext())
 	defer cancel()
-	m.updateCardAfterInteractionBestEffort(ctx, approval, callbackToken, card)
+	m.updateApprovalResultCardWithContext(drainCtx, approval, callbackToken, card)
+}
+
+func (m *operationApprovalService) updateApprovalResultCardWithContext(cardBaseCtx context.Context, approval store.ToolApproval, callbackToken string, card Card) {
+	if card == nil {
+		return
+	}
+	// The admitted approval task owns a task-group lease, so final card delivery
+	// may use its own bounded context even after the platform run context is
+	// canceled during shutdown. Recovery passes its shared bounded context here
+	// so a large terminal batch cannot consume one timeout per card.
+	if cardBaseCtx == nil {
+		cardBaseCtx = context.Background()
+	}
+	callbackToken = strings.TrimSpace(callbackToken)
+	if callbackToken != "" {
+		ctx, cancel := context.WithTimeout(cardBaseCtx, m.approvalCardUpdateTimeout())
+		err := m.cards.UpdateByCallbackToken(ctx, callbackToken, card)
+		cancel()
+		if err == nil {
+			m.markApprovalCardDeliveryDelivered(approval)
+			return
+		}
+		feishuLog.Warn(m.baseContext(), "delay-update feishu tool approval card failed; falling back to message id request=%s account=%s: %v",
+			shortRequestID(approval.ID), approval.AccountID, err)
+	}
+	messageID := strings.TrimSpace(approval.CardMessageID)
+	if messageID == "" {
+		feishuLog.Warn(m.baseContext(), "skip feishu tool approval card fallback without original message request=%s account=%s callback_token_present=%t",
+			shortRequestID(approval.ID), approval.AccountID, callbackToken != "")
+		return
+	}
+	err := updateFeishuCardByMessageIDWithTimeout(cardBaseCtx, m.cards, messageID, card, m.approvalCardUpdateTimeout())
+	if err != nil {
+		feishuLog.Warn(m.baseContext(), "delay-update feishu tool approval card failed request=%s account=%s: %v", shortRequestID(approval.ID), approval.AccountID, err)
+		return
+	}
+	m.markApprovalCardDeliveryDelivered(approval)
+	feishuLog.Debug(m.baseContext(), "updated feishu tool approval card by message id request=%s account=%s callback_token_present=%t",
+		shortRequestID(approval.ID), approval.AccountID, callbackToken != "")
+}
+
+func (m *operationApprovalService) markApprovalCardDeliveryDelivered(approval store.ToolApproval) {
+	err := m.store.MarkFeishuCardDeliveryDelivered(
+		approval.AccountID,
+		approval.ID,
+		store.FeishuCardDeliveryPurposeToolApprovalTerminal,
+		store.FeishuCardDeliveryRevisionTerminal,
+		m.currentTime(),
+	)
+	if err == nil || errors.Is(err, store.ErrFeishuCardDeliveryNotFound) || errors.Is(err, store.ErrFeishuCardDeliveryNotReady) || errors.Is(err, store.ErrFeishuCardDeliveryResolved) {
+		return
+	}
+	feishuLog.Warn(m.baseContext(), "mark feishu tool approval card delivery failed request=%s account=%s: %v",
+		shortRequestID(approval.ID), approval.AccountID, err)
 }
 
 func (m *operationApprovalService) persistApprovalWorkflowResult(ctx context.Context, approval store.ToolApproval, state, status, message string, warning bool, warningReason string, now time.Time) {
@@ -489,6 +617,8 @@ func approvalWorkflowResultPayload(approval store.ToolApproval, status, message 
 func (m *operationApprovalService) reconcileTerminalApprovalResults(ctx context.Context, updatedBefore time.Time) (int, error) {
 	const batchSize = 100
 	total := 0
+	recoveryCardCtx, cancelCardUpdates := context.WithTimeout(m.baseContext(), m.approvalCardUpdateTimeout())
+	defer cancelCardUpdates()
 	for {
 		gaps, err := m.store.ListTerminalWorkflowResultGaps(
 			m.account.ID,
@@ -508,6 +638,9 @@ func (m *operationApprovalService) reconcileTerminalApprovalResults(ctx context.
 			if err != nil {
 				return total, err
 			}
+			if recoveryCardCtx.Err() == nil {
+				m.updateApprovalResultCardWithContext(recoveryCardCtx, approval, "", recoveredApprovalStatusCard(gap.State, message))
+			}
 			_, ready, err := persistWorkflowResult(
 				m.store,
 				approval.ID,
@@ -526,6 +659,23 @@ func (m *operationApprovalService) reconcileTerminalApprovalResults(ctx context.
 		if len(gaps) < batchSize {
 			return total, nil
 		}
+	}
+}
+
+func recoveredApprovalStatusCard(workflowState, message string) statusCard {
+	switch workflowState {
+	case store.WorkflowRequestStateDenied:
+		return statusCard{title: "已拒绝授权", template: "grey", message: message}
+	case store.WorkflowRequestStateExpired:
+		return statusCard{title: "授权已过期", template: "grey", message: message}
+	case store.WorkflowRequestStateFailed:
+		return statusCard{title: "执行未可靠完成", template: "red", message: message}
+	case store.WorkflowRequestStateSucceeded:
+		return statusCard{title: "执行已完成（结果待确认）", template: "orange", message: message}
+	case store.WorkflowRequestStatePartial:
+		return statusCard{title: "执行完成（有警告）", template: "orange", message: message}
+	default:
+		return statusCard{title: "操作结果", template: "orange", message: message}
 	}
 }
 
@@ -552,16 +702,6 @@ func (m *operationApprovalService) updateCardBestEffort(ctx context.Context, mes
 	}
 	if err := m.cards.UpdateByMessageID(ctx, messageID, card); err != nil {
 		feishuLog.Warn(ctx, "update feishu tool approval card failed message=%s: %v", messageID, err)
-	}
-}
-
-func (m *operationApprovalService) updateCardAfterInteractionBestEffort(ctx context.Context, approval store.ToolApproval, callbackToken string, card Card) {
-	if strings.TrimSpace(callbackToken) == "" || card == nil {
-		feishuLog.Warn(ctx, "skip delayed feishu tool approval card update request=%s account=%s: callback token unavailable", shortRequestID(approval.ID), approval.AccountID)
-		return
-	}
-	if err := m.cards.UpdateByCallbackToken(ctx, callbackToken, card); err != nil {
-		feishuLog.Warn(ctx, "delay-update feishu tool approval card failed request=%s account=%s: %v", shortRequestID(approval.ID), approval.AccountID, err)
 	}
 }
 
@@ -596,6 +736,13 @@ func (m *operationApprovalService) approvedExecutionTimeout() time.Duration {
 		return defaultApprovedToolExecutionTimeout
 	}
 	return m.executionTimeout
+}
+
+func (m *operationApprovalService) approvalCardUpdateTimeout() time.Duration {
+	if m.cardUpdateTimeout <= 0 {
+		return defaultFeishuCardUpdateTimeout
+	}
+	return m.cardUpdateTimeout
 }
 
 func (m *operationApprovalService) baseContext() context.Context {

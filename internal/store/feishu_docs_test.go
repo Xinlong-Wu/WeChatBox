@@ -135,7 +135,22 @@ func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
 	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
 	accessIDs := map[string]string{}
 	refreshAttemptIDs := map[string]string{}
+	remoteOperationIDs := map[string]string{}
 	for _, accountID := range []string{"feishu:first", "feishu:second"} {
+		if _, err := st.AcquireFeishuAccountRuntimeLease(accountID, "runtime-"+accountID, now, time.Minute); err != nil {
+			t.Fatalf("AcquireFeishuAccountRuntimeLease returned error: %v", err)
+		}
+		if _, err := st.EnqueueFeishuCardDelivery(FeishuCardDelivery{
+			AccountID:     accountID,
+			RequestID:     "req-card-" + accountID,
+			Purpose:       FeishuCardDeliveryPurposeResourceTerminal,
+			Revision:      FeishuCardDeliveryRevisionTerminal,
+			CardMessageID: "om-card-" + accountID,
+			CreatedAt:     now,
+			ExpiresAt:     now.Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("EnqueueFeishuCardDelivery returned error: %v", err)
+		}
 		request, err := st.CreateWorkflowRequest(WorkflowRequest{
 			AccountID: accountID,
 			Kind:      WorkflowRequestKindFeishuFolderCreate,
@@ -159,6 +174,24 @@ func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SaveFeishuChatFolder returned error: %v", err)
 		}
+		if _, err := st.PrepareFeishuRemoteOperation(FeishuRemoteOperation{
+			RequestID:           request.ID,
+			AccountID:           accountID,
+			OperationKind:       FeishuRemoteOperationKindFolderCreate,
+			ChatID:              folder.ChatID,
+			ActorOpenID:         "ou_requester",
+			ParentResourceType:  "folder",
+			ParentResourceToken: "fld_root_" + accountID,
+			RequestedName:       folder.Name,
+			PayloadHash:         "payload_" + accountID,
+			ShareMemberType:     folder.ShareMemberType,
+			ShareMemberID:       folder.ShareMemberID,
+			RemoteResourceType:  "folder",
+			CreatedAt:           now,
+		}); err != nil {
+			t.Fatalf("PrepareFeishuRemoteOperation returned error: %v", err)
+		}
+		remoteOperationIDs[accountID] = request.ID
 		if _, err := st.SaveFeishuChatDocument(FeishuChatDocument{
 			AccountID:     accountID,
 			ChatID:        folder.ChatID,
@@ -288,6 +321,28 @@ func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
 	}
 	if _, err := st.GetFeishuOAuthRefreshAttempt(refreshAttemptIDs["feishu:second"], "feishu:second"); err != nil {
 		t.Fatalf("other account OAuth refresh attempt was deleted: %v", err)
+	}
+	if _, err := st.GetFeishuAccountRuntimeLease("feishu:first"); !errors.Is(err, ErrFeishuAccountRuntimeLeaseNotFound) {
+		t.Fatalf("deleted account runtime lease error = %v, want ErrFeishuAccountRuntimeLeaseNotFound", err)
+	}
+	if lease, err := st.GetFeishuAccountRuntimeLease("feishu:second"); err != nil || lease.OwnerID != "runtime-feishu:second" {
+		t.Fatalf("other account runtime lease = %#v err=%v", lease, err)
+	}
+	if _, err := st.GetFeishuCardDeliveryByKey(
+		"feishu:first", "req-card-feishu:first", FeishuCardDeliveryPurposeResourceTerminal, FeishuCardDeliveryRevisionTerminal,
+	); !errors.Is(err, ErrFeishuCardDeliveryNotFound) {
+		t.Fatalf("deleted account card delivery error = %v, want ErrFeishuCardDeliveryNotFound", err)
+	}
+	if _, err := st.GetFeishuCardDeliveryByKey(
+		"feishu:second", "req-card-feishu:second", FeishuCardDeliveryPurposeResourceTerminal, FeishuCardDeliveryRevisionTerminal,
+	); err != nil {
+		t.Fatalf("other account card delivery was deleted: %v", err)
+	}
+	if _, err := st.GetFeishuRemoteOperation(remoteOperationIDs["feishu:first"], "feishu:first"); !errors.Is(err, ErrFeishuRemoteOperationNotFound) {
+		t.Fatalf("deleted account remote operation error = %v, want ErrFeishuRemoteOperationNotFound", err)
+	}
+	if _, err := st.GetFeishuRemoteOperation(remoteOperationIDs["feishu:second"], "feishu:second"); err != nil {
+		t.Fatalf("other account remote operation was deleted: %v", err)
 	}
 	if _, active, err := st.ActiveFeishuResourceCapability(
 		"feishu:first", "folder", "fld_feishu:first", "openchat", "oc_chat", FeishuResourcePermissionRead,

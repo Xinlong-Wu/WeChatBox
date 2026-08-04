@@ -4,18 +4,88 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	"github.com/larksuite/oapi-sdk-go/v3/core/accesstoken"
 
 	"lingobridge/internal/logging"
 	"lingobridge/internal/store"
 )
+
+type observedRefreshAttemptStore struct {
+	*store.Store
+	preparedRead chan struct{}
+	once         sync.Once
+}
+
+func (s *observedRefreshAttemptStore) GetFeishuOAuthRefreshAttempt(attemptID, accountID string) (store.FeishuOAuthRefreshAttempt, error) {
+	attempt, err := s.Store.GetFeishuOAuthRefreshAttempt(attemptID, accountID)
+	if err == nil && attempt.State == store.FeishuOAuthRefreshAttemptStatePrepared {
+		s.once.Do(func() { close(s.preparedRead) })
+	}
+	return attempt, err
+}
+
+type stageOnAmbiguousRefreshStore struct {
+	*store.Store
+	stage func() error
+	once  sync.Once
+	err   error
+}
+
+func (s *stageOnAmbiguousRefreshStore) MarkFeishuOAuthRefreshAttemptAmbiguous(attemptID, accountID string, now time.Time) (store.FeishuUserOAuthCredential, store.FeishuOAuthRefreshAttempt, error) {
+	s.once.Do(func() {
+		if s.stage != nil {
+			s.err = s.stage()
+		}
+	})
+	if s.err != nil {
+		return store.FeishuUserOAuthCredential{}, store.FeishuOAuthRefreshAttempt{}, s.err
+	}
+	return s.Store.MarkFeishuOAuthRefreshAttemptAmbiguous(attemptID, accountID, now)
+}
+
+type authorizeOnRefreshInvalidationStore struct {
+	*store.Store
+	authorize func() error
+	once      sync.Once
+	err       error
+}
+
+type blockFirstOAuthCredentialSaveStore struct {
+	*store.Store
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockFirstOAuthCredentialSaveStore) SaveFeishuUserOAuthCredential(credential store.FeishuUserOAuthCredential) (store.FeishuUserOAuthCredential, error) {
+	s.once.Do(func() {
+		close(s.entered)
+		<-s.release
+	})
+	return s.Store.SaveFeishuUserOAuthCredential(credential)
+}
+
+func (s *authorizeOnRefreshInvalidationStore) InvalidateFeishuOAuthRefreshAttempt(attemptID, accountID, errorCategory string, now time.Time) (store.FeishuUserOAuthCredential, store.FeishuOAuthRefreshAttempt, error) {
+	s.once.Do(func() {
+		if s.authorize != nil {
+			s.err = s.authorize()
+		}
+	})
+	if s.err != nil {
+		return store.FeishuUserOAuthCredential{}, store.FeishuOAuthRefreshAttempt{}, s.err
+	}
+	return s.Store.InvalidateFeishuOAuthRefreshAttempt(attemptID, accountID, errorCategory, now)
+}
 
 func TestFeishuOAuthCredentialCipherAuthenticatesIdentityAndAccount(t *testing.T) {
 	ciphertextCipher, err := newFeishuOAuthCredentialCipher("app-secret", "feishu:cli_test")
@@ -107,6 +177,124 @@ func TestFeishuOAuthCredentialCipherAuthenticatesRefreshAttemptContext(t *testin
 	}
 }
 
+func TestPersistFeishuOAuthCredentialCompletesIdentityBeforeEncryptingReplacement(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	now := time.Date(2026, time.August, 4, 12, 0, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	if _, err := manager.persistFeishuOAuthCredential(context.Background(), feishuOAuthIdentity{
+		OpenID: "ou_requester",
+		UserID: "u_requester",
+	}, feishuOAuthTokenBundle{
+		AccessToken:           "old-access-token",
+		AccessTokenExpiresIn:  2 * time.Hour,
+		RefreshToken:          "old-refresh-token",
+		RefreshTokenExpiresIn: 24 * time.Hour,
+		Scopes:                resourceAccessOAuthScope,
+	}); err != nil {
+		t.Fatalf("persist initial OAuth credential: %v", err)
+	}
+
+	if _, err := manager.persistFeishuOAuthCredential(context.Background(), feishuOAuthIdentity{
+		UserID: "u_requester",
+	}, feishuOAuthTokenBundle{
+		AccessToken:           "new-access-token",
+		AccessTokenExpiresIn:  2 * time.Hour,
+		RefreshToken:          "new-refresh-token",
+		RefreshTokenExpiresIn: 24 * time.Hour,
+		Scopes:                resourceAccessOAuthScope,
+	}); err != nil {
+		t.Fatalf("replace OAuth credential through user ID alias: %v", err)
+	}
+
+	credential, err := st.GetFeishuUserOAuthCredential(manager.account.ID, "ou_requester", "u_requester")
+	if err != nil {
+		t.Fatalf("load replaced OAuth credential: %v", err)
+	}
+	if credential.ActorOpenID != "ou_requester" || credential.ActorUserID != "u_requester" {
+		t.Fatalf("replaced OAuth identity = open_id %q user_id %q", credential.ActorOpenID, credential.ActorUserID)
+	}
+	token, err := manager.feishuUserAccessToken(context.Background(), "ou_requester", "u_requester")
+	if err != nil || token != "new-access-token" {
+		t.Fatalf("feishuUserAccessToken after alias replacement = %q err=%v", token, err)
+	}
+}
+
+func TestPersistFeishuOAuthCredentialReencryptsWhenConcurrentAuthorizationAddsCanonicalIdentity(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	now := time.Date(2026, time.August, 4, 12, 0, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	blockedStore := &blockFirstOAuthCredentialSaveStore{
+		Store:   st,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	partialService := manager.oauthCredentialService()
+	partialService.store = blockedStore
+	canonicalService := manager.oauthCredentialService()
+	canonicalService.store = st
+
+	type persistResult struct {
+		credential store.FeishuUserOAuthCredential
+		err        error
+	}
+	partialResult := make(chan persistResult, 1)
+	go func() {
+		credential, err := partialService.persistFeishuOAuthCredential(context.Background(), feishuOAuthIdentity{
+			UserID: "u_requester",
+		}, feishuOAuthTokenBundle{
+			AccessToken:           "partial-access-token",
+			AccessTokenExpiresIn:  2 * time.Hour,
+			RefreshToken:          "partial-refresh-token",
+			RefreshTokenExpiresIn: 24 * time.Hour,
+			Scopes:                resourceAccessOAuthScope,
+		})
+		partialResult <- persistResult{credential: credential, err: err}
+	}()
+	select {
+	case <-blockedStore.entered:
+	case <-time.After(time.Second):
+		t.Fatal("partial authorization did not reach credential save")
+	}
+	if _, err := canonicalService.persistFeishuOAuthCredential(context.Background(), feishuOAuthIdentity{
+		OpenID: "ou_requester",
+		UserID: "u_requester",
+	}, feishuOAuthTokenBundle{
+		AccessToken:           "canonical-access-token",
+		AccessTokenExpiresIn:  2 * time.Hour,
+		RefreshToken:          "canonical-refresh-token",
+		RefreshTokenExpiresIn: 24 * time.Hour,
+		Scopes:                resourceAccessOAuthScope,
+	}); err != nil {
+		t.Fatalf("persist concurrent canonical OAuth credential: %v", err)
+	}
+	close(blockedStore.release)
+	select {
+	case result := <-partialResult:
+		if result.err != nil || result.credential.ActorOpenID != "ou_requester" {
+			t.Fatalf("partial authorization result = %#v err=%v", result.credential, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("partial authorization did not finish")
+	}
+
+	token, err := manager.feishuUserAccessToken(context.Background(), "ou_requester", "u_requester")
+	if err != nil || token != "partial-access-token" {
+		t.Fatalf("feishuUserAccessToken after concurrent identity completion = %q err=%v", token, err)
+	}
+}
+
 func TestFeishuOAuthRefreshErrorCategoryDoesNotPersistArbitraryRemoteText(t *testing.T) {
 	err := &accesstoken.AccessTokenError{ErrorType: "invalid grant token=secret"}
 	if category := feishuOAuthRefreshErrorCategory(err); category != "oauth_error" {
@@ -115,6 +303,496 @@ func TestFeishuOAuthRefreshErrorCategoryDoesNotPersistArbitraryRemoteText(t *tes
 	err = &accesstoken.AccessTokenError{ErrorType: "invalid_grant"}
 	if category := feishuOAuthRefreshErrorCategory(err); category != "oauth_invalid_grant" {
 		t.Fatalf("valid OAuth error category = %q", category)
+	}
+}
+
+func TestFeishuOAuthRefreshRequiresReauthorizationOnlyForInvalidGrant(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "invalid refresh grant",
+			err: &accesstoken.AccessTokenError{
+				ErrorType: "invalid_grant",
+				ApiResp:   &larkcore.ApiResp{StatusCode: http.StatusBadRequest},
+			},
+			want: true,
+		},
+		{
+			name: "invalid client configuration",
+			err: &accesstoken.AccessTokenError{
+				ErrorType: "invalid_client",
+				ApiResp:   &larkcore.ApiResp{StatusCode: http.StatusUnauthorized},
+			},
+			want: false,
+		},
+		{
+			name: "permission response without token rejection",
+			err: &accesstoken.AccessTokenError{
+				ApiResp: &larkcore.ApiResp{StatusCode: http.StatusForbidden},
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := feishuOAuthRefreshRequiresReauthorization(tt.err); got != tt.want {
+				t.Fatalf("feishuOAuthRefreshRequiresReauthorization(%v) = %t, want %t", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFeishuOAuthRefreshOutcomeTreatsServerFailureAsAmbiguous(t *testing.T) {
+	err := &accesstoken.AccessTokenError{
+		ApiResp: &larkcore.ApiResp{StatusCode: http.StatusBadGateway},
+	}
+	if !feishuOAuthRefreshOutcomeAmbiguous(err) {
+		t.Fatal("OAuth 502 response was treated as a deterministic refresh rejection")
+	}
+	err = &accesstoken.AccessTokenError{
+		ErrorType: "invalid_grant",
+		ApiResp:   &larkcore.ApiResp{StatusCode: http.StatusBadRequest},
+	}
+	if feishuOAuthRefreshOutcomeAmbiguous(err) {
+		t.Fatal("OAuth invalid_grant response was treated as an ambiguous refresh outcome")
+	}
+}
+
+func TestFeishuOAuthRefreshUsesNewAuthorizationThatWinsDuringRemoteResolution(t *testing.T) {
+	tests := []struct {
+		name      string
+		respond   func(*testing.T, http.ResponseWriter)
+		wantState string
+	}{
+		{
+			name: "lost response",
+			respond: func(t *testing.T, w http.ResponseWriter) {
+				t.Helper()
+				closeHTTPResponseWithoutReply(t, w)
+			},
+			wantState: store.FeishuOAuthRefreshAttemptStateCompleted,
+		},
+		{
+			name: "invalid grant response",
+			respond: func(t *testing.T, w http.ResponseWriter) {
+				t.Helper()
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				if err := json.NewEncoder(w).Encode(map[string]any{
+					"error":             "invalid_grant",
+					"error_description": "refresh token rejected",
+				}); err != nil {
+					t.Fatalf("encode refresh rejection: %v", err)
+				}
+			},
+			wantState: store.FeishuOAuthRefreshAttemptStateCompleted,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			refreshStarted := make(chan struct{})
+			releaseRefresh := make(chan struct{})
+			var startedOnce sync.Once
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/oauth/v3/token" {
+					t.Fatalf("unexpected path: %s", r.URL.Path)
+				}
+				startedOnce.Do(func() { close(refreshStarted) })
+				<-releaseRefresh
+				tt.respond(t, w)
+			}))
+			defer server.Close()
+
+			manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+				ClientID:    "cli_xxx",
+				BaseURL:     server.URL,
+				CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+			})
+			now := time.Date(2026, time.August, 4, 12, 20, 0, 0, time.UTC)
+			manager.now = func() time.Time { return now }
+			oldCredential, err := manager.persistFeishuOAuthCredential(context.Background(), feishuOAuthIdentity{
+				OpenID: "ou_requester", UserID: "u_requester",
+			}, feishuOAuthTokenBundle{
+				AccessToken: "old-access-token", AccessTokenExpiresIn: time.Minute,
+				RefreshToken: "old-refresh-token", RefreshTokenExpiresIn: 24 * time.Hour,
+				Scopes: resourceAccessOAuthScope,
+			})
+			if err != nil {
+				t.Fatalf("persist old OAuth credential: %v", err)
+			}
+
+			type tokenResult struct {
+				token string
+				err   error
+			}
+			result := make(chan tokenResult, 1)
+			go func() {
+				token, tokenErr := manager.feishuUserAccessToken(context.Background(), "ou_requester", "u_requester")
+				result <- tokenResult{token: token, err: tokenErr}
+			}()
+			select {
+			case <-refreshStarted:
+			case <-time.After(time.Second):
+				t.Fatal("refresh request did not start")
+			}
+			activeAttempt, err := st.ActiveFeishuOAuthRefreshAttempt(oldCredential.ID, oldCredential.AccountID)
+			if err != nil || activeAttempt.State != store.FeishuOAuthRefreshAttemptStatePrepared {
+				t.Fatalf("active refresh attempt before winning authorization = %#v err=%v", activeAttempt, err)
+			}
+			newCredential, err := manager.persistFeishuOAuthCredential(context.Background(), feishuOAuthIdentity{
+				OpenID: "ou_requester", UserID: "u_requester",
+			}, feishuOAuthTokenBundle{
+				AccessToken: "new-authorized-access-token", AccessTokenExpiresIn: 2 * time.Hour,
+				RefreshToken: "new-authorized-refresh-token", RefreshTokenExpiresIn: 30 * 24 * time.Hour,
+				Scopes: resourceAccessOAuthScope,
+			})
+			if err != nil {
+				t.Fatalf("persist winning OAuth credential: %v", err)
+			}
+			close(releaseRefresh)
+
+			select {
+			case got := <-result:
+				if got.err != nil || got.token != "new-authorized-access-token" {
+					t.Fatalf("feishuUserAccessToken after concurrent authorization = %q err=%v", got.token, got.err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("refresh caller did not finish")
+			}
+			if newCredential.Version != oldCredential.Version+1 || newCredential.Status != store.FeishuUserOAuthCredentialStatusActive {
+				t.Fatalf("winning OAuth credential = %#v", newCredential)
+			}
+			attempt, err := st.ActiveFeishuOAuthRefreshAttempt(oldCredential.ID, oldCredential.AccountID)
+			if !errors.Is(err, store.ErrFeishuOAuthRefreshAttemptNotFound) {
+				t.Fatalf("active refresh attempt after winning authorization = %#v err=%v", attempt, err)
+			}
+			terminal, err := st.GetFeishuOAuthRefreshAttempt(activeAttempt.ID, activeAttempt.AccountID)
+			if err != nil || terminal.State != tt.wantState {
+				t.Fatalf("terminal refresh attempt = %#v err=%v, want state %s", terminal, err, tt.wantState)
+			}
+		})
+	}
+}
+
+func TestFeishuOAuthRefreshWaiterUsesNewCredentialWhenStaleLeaseExpires(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	now := time.Date(2026, time.August, 4, 12, 25, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	oldCredential, err := manager.persistFeishuOAuthCredential(context.Background(), feishuOAuthIdentity{
+		OpenID: "ou_requester", UserID: "u_requester",
+	}, feishuOAuthTokenBundle{
+		AccessToken: "old-access-token", AccessTokenExpiresIn: time.Minute,
+		RefreshToken: "old-refresh-token", RefreshTokenExpiresIn: 24 * time.Hour,
+		Scopes: resourceAccessOAuthScope,
+	})
+	if err != nil {
+		t.Fatalf("persist old OAuth credential: %v", err)
+	}
+	attempt, owner, err := st.PrepareFeishuOAuthRefreshAttempt(
+		oldCredential.ID, oldCredential.AccountID, oldCredential.Version, "lost-owner", now, 10*time.Second,
+	)
+	if err != nil || !owner {
+		t.Fatalf("prepare stale refresh attempt = %#v owner=%t err=%v", attempt, owner, err)
+	}
+	newCredential, err := manager.persistFeishuOAuthCredential(context.Background(), feishuOAuthIdentity{
+		OpenID: "ou_requester", UserID: "u_requester",
+	}, feishuOAuthTokenBundle{
+		AccessToken: "new-authorized-access-token", AccessTokenExpiresIn: 2 * time.Hour,
+		RefreshToken: "new-authorized-refresh-token", RefreshTokenExpiresIn: 30 * 24 * time.Hour,
+		Scopes: resourceAccessOAuthScope,
+	})
+	if err != nil {
+		t.Fatalf("persist new OAuth credential: %v", err)
+	}
+	manager.now = func() time.Time { return now.Add(20 * time.Second) }
+
+	token, err := manager.waitForFeishuOAuthRefresh(context.Background(), newCredential, attempt)
+	if err != nil || token != "new-authorized-access-token" {
+		t.Fatalf("waitForFeishuOAuthRefresh with superseded lease = %q err=%v", token, err)
+	}
+	resolved, err := st.GetFeishuOAuthRefreshAttempt(attempt.ID, attempt.AccountID)
+	if err != nil || resolved.State != store.FeishuOAuthRefreshAttemptStateCompleted {
+		t.Fatalf("superseded stale refresh attempt = %#v err=%v", resolved, err)
+	}
+}
+
+func TestFeishuUserAccessTokenFailsClosedWhenRefreshResponseIsLost(t *testing.T) {
+	var refreshCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/oauth/v3/token" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		refreshCalls.Add(1)
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("test server does not support connection hijacking")
+		}
+		conn, _, err := hijacker.Hijack()
+		if err != nil {
+			t.Fatalf("hijack refresh response: %v", err)
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	now := time.Date(2026, time.August, 4, 12, 30, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	credential, err := manager.persistFeishuOAuthCredential(context.Background(), feishuOAuthIdentity{
+		OpenID: "ou_requester",
+		UserID: "u_requester",
+	}, feishuOAuthTokenBundle{
+		AccessToken:           "still-valid-access-token",
+		AccessTokenExpiresIn:  time.Minute,
+		RefreshToken:          "one-time-refresh-token",
+		RefreshTokenExpiresIn: 24 * time.Hour,
+		Scopes:                resourceAccessOAuthScope,
+	})
+	if err != nil {
+		t.Fatalf("persistFeishuOAuthCredential returned error: %v", err)
+	}
+
+	if _, err := manager.feishuUserAccessToken(context.Background(), "ou_requester", "u_requester"); !errors.Is(err, ErrFeishuUserOAuthReauthorizationNeeded) {
+		t.Fatalf("feishuUserAccessToken error = %v, want reauthorization after ambiguous refresh outcome", err)
+	}
+	marked, err := st.GetFeishuUserOAuthCredentialByID(credential.ID, credential.AccountID)
+	if err != nil || marked.Status != store.FeishuUserOAuthCredentialStatusReauthRequired ||
+		marked.AccessTokenCiphertext != "" || marked.RefreshTokenCiphertext != "" {
+		t.Fatalf("credential after lost refresh response = %#v err=%v", marked, err)
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh calls = %d, want exactly one ambiguous remote request", got)
+	}
+}
+
+func TestFeishuUserAccessTokenUsesFallbackWhenRefreshCannotConnect(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	now := time.Date(2026, time.August, 4, 12, 45, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	credential, err := manager.persistFeishuOAuthCredential(context.Background(), feishuOAuthIdentity{
+		OpenID: "ou_requester",
+		UserID: "u_requester",
+	}, feishuOAuthTokenBundle{
+		AccessToken:           "still-valid-access-token",
+		AccessTokenExpiresIn:  time.Minute,
+		RefreshToken:          "unconsumed-refresh-token",
+		RefreshTokenExpiresIn: 24 * time.Hour,
+		Scopes:                resourceAccessOAuthScope,
+	})
+	if err != nil {
+		server.Close()
+		t.Fatalf("persistFeishuOAuthCredential returned error: %v", err)
+	}
+	server.Close()
+
+	token, err := manager.feishuUserAccessToken(context.Background(), "ou_requester", "u_requester")
+	if err != nil || token != "still-valid-access-token" {
+		t.Fatalf("feishuUserAccessToken fallback = %q err=%v", token, err)
+	}
+	unchanged, err := st.GetFeishuUserOAuthCredentialByID(credential.ID, credential.AccountID)
+	if err != nil || unchanged.Status != store.FeishuUserOAuthCredentialStatusActive || unchanged.Version != credential.Version {
+		t.Fatalf("credential after pre-connect refresh failure = %#v err=%v", unchanged, err)
+	}
+}
+
+func TestFeishuOAuthRefreshPeerTimeoutDoesNotUseCredentialMarkedAmbiguous(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	now := time.Date(2026, time.August, 4, 12, 55, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	credential, err := manager.persistFeishuOAuthCredential(context.Background(), feishuOAuthIdentity{
+		OpenID: "ou_requester", UserID: "u_requester",
+	}, feishuOAuthTokenBundle{
+		AccessToken: "still-valid-access-token", AccessTokenExpiresIn: time.Minute,
+		RefreshToken: "one-time-refresh-token", RefreshTokenExpiresIn: 24 * time.Hour,
+		Scopes: resourceAccessOAuthScope,
+	})
+	if err != nil {
+		t.Fatalf("persistFeishuOAuthCredential returned error: %v", err)
+	}
+	attempt, owner, err := st.PrepareFeishuOAuthRefreshAttempt(
+		credential.ID, credential.AccountID, credential.Version, "lease-owner", now, time.Minute,
+	)
+	if err != nil || !owner {
+		t.Fatalf("PrepareFeishuOAuthRefreshAttempt = %#v owner=%t err=%v", attempt, owner, err)
+	}
+	observed := &observedRefreshAttemptStore{Store: st, preparedRead: make(chan struct{})}
+	manager.store = observed
+	manager.refreshPeerWait = 100 * time.Millisecond
+	manager.refreshPoll = time.Hour
+
+	tokenResult := make(chan string, 1)
+	errorResult := make(chan error, 1)
+	go func() {
+		token, waitErr := manager.waitForFeishuOAuthRefresh(context.Background(), credential, attempt)
+		tokenResult <- token
+		errorResult <- waitErr
+	}()
+	select {
+	case <-observed.preparedRead:
+	case <-time.After(time.Second):
+		t.Fatal("refresh waiter did not read the prepared attempt")
+	}
+	if _, _, err := st.MarkOwnedFeishuOAuthRefreshAttemptAmbiguous(
+		attempt.ID, attempt.AccountID, attempt.LeaseToken, now.Add(time.Second),
+	); err != nil {
+		t.Fatalf("MarkOwnedFeishuOAuthRefreshAttemptAmbiguous returned error: %v", err)
+	}
+
+	select {
+	case token := <-tokenResult:
+		waitErr := <-errorResult
+		if token != "" || !errors.Is(waitErr, ErrFeishuUserOAuthReauthorizationNeeded) {
+			t.Fatalf("waitForFeishuOAuthRefresh = %q err=%v, want fail-closed reauthorization", token, waitErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("refresh waiter did not finish")
+	}
+}
+
+func TestFeishuOAuthRefreshPeerTimeoutReloadsAttemptAfterAmbiguousClaimConflict(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	now := time.Date(2026, time.August, 4, 12, 58, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	credential, err := manager.persistFeishuOAuthCredential(context.Background(), feishuOAuthIdentity{
+		OpenID: "ou_requester", UserID: "u_requester",
+	}, feishuOAuthTokenBundle{
+		AccessToken: "expired-before-peer-timeout", AccessTokenExpiresIn: time.Minute,
+		RefreshToken: "one-time-refresh-token", RefreshTokenExpiresIn: 24 * time.Hour,
+		Scopes: resourceAccessOAuthScope,
+	})
+	if err != nil {
+		t.Fatalf("persistFeishuOAuthCredential returned error: %v", err)
+	}
+	attempt, owner, err := st.PrepareFeishuOAuthRefreshAttempt(
+		credential.ID, credential.AccountID, credential.Version, "lease-owner", now, time.Minute,
+	)
+	if err != nil || !owner {
+		t.Fatalf("PrepareFeishuOAuthRefreshAttempt = %#v owner=%t err=%v", attempt, owner, err)
+	}
+	stagedAccess, err := manager.credentialCipher.EncryptRefreshAttempt(attempt, "access_token", "staged-access-token")
+	if err != nil {
+		t.Fatalf("encrypt staged access token: %v", err)
+	}
+	stagedRefresh, err := manager.credentialCipher.EncryptRefreshAttempt(attempt, "refresh_token", "staged-refresh-token")
+	if err != nil {
+		t.Fatalf("encrypt staged refresh token: %v", err)
+	}
+	manager.now = func() time.Time { return now.Add(2 * time.Minute) }
+	manager.store = &stageOnAmbiguousRefreshStore{
+		Store: st,
+		stage: func() error {
+			_, stageErr := st.StageFeishuOAuthRefreshResponse(attempt.ID, attempt.AccountID, attempt.LeaseToken, store.FeishuOAuthRefreshStage{
+				AccessTokenCiphertext:  stagedAccess,
+				AccessTokenExpiresAt:   now.Add(2 * time.Hour),
+				RefreshTokenCiphertext: stagedRefresh,
+				RefreshTokenExpiresAt:  now.Add(30 * 24 * time.Hour),
+				Scopes:                 resourceAccessOAuthScope,
+			}, now.Add(2*time.Minute))
+			return stageErr
+		},
+	}
+
+	token, err := manager.resolveFeishuOAuthRefreshPeerTimeout(context.Background(), credential, attempt)
+	if err != nil || token != "staged-access-token" {
+		t.Fatalf("resolveFeishuOAuthRefreshPeerTimeout = %q err=%v, want safely staged token", token, err)
+	}
+	resolved, err := st.GetFeishuOAuthRefreshAttempt(attempt.ID, attempt.AccountID)
+	if err != nil || resolved.State != store.FeishuOAuthRefreshAttemptStateCompleted {
+		t.Fatalf("resolved refresh attempt = %#v err=%v", resolved, err)
+	}
+}
+
+func TestFeishuOAuthStagedInvalidationUsesConcurrentNewAuthorization(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	now := time.Date(2026, time.August, 4, 12, 59, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	oldCredential, err := manager.persistFeishuOAuthCredential(context.Background(), feishuOAuthIdentity{
+		OpenID: "ou_requester", UserID: "u_requester",
+	}, feishuOAuthTokenBundle{
+		AccessToken: "old-access-token", AccessTokenExpiresIn: time.Minute,
+		RefreshToken: "old-refresh-token", RefreshTokenExpiresIn: 24 * time.Hour,
+		Scopes: resourceAccessOAuthScope,
+	})
+	if err != nil {
+		t.Fatalf("persist old OAuth credential: %v", err)
+	}
+	attempt, owner, err := st.PrepareFeishuOAuthRefreshAttempt(
+		oldCredential.ID, oldCredential.AccountID, oldCredential.Version, "lease-owner", now, time.Minute,
+	)
+	if err != nil || !owner {
+		t.Fatalf("PrepareFeishuOAuthRefreshAttempt = %#v owner=%t err=%v", attempt, owner, err)
+	}
+	staged, err := st.StageFeishuOAuthRefreshResponse(attempt.ID, attempt.AccountID, attempt.LeaseToken, store.FeishuOAuthRefreshStage{
+		AccessTokenCiphertext:  "corrupt-staged-access-token",
+		AccessTokenExpiresAt:   now.Add(2 * time.Hour),
+		RefreshTokenCiphertext: "corrupt-staged-refresh-token",
+		RefreshTokenExpiresAt:  now.Add(30 * 24 * time.Hour),
+		Scopes:                 resourceAccessOAuthScope,
+	}, now)
+	if err != nil {
+		t.Fatalf("StageFeishuOAuthRefreshResponse returned error: %v", err)
+	}
+	manager.store = &authorizeOnRefreshInvalidationStore{
+		Store: st,
+		authorize: func() error {
+			_, authorizeErr := manager.persistFeishuOAuthCredential(context.Background(), feishuOAuthIdentity{
+				OpenID: "ou_requester", UserID: "u_requester",
+			}, feishuOAuthTokenBundle{
+				AccessToken: "new-authorized-access-token", AccessTokenExpiresIn: 2 * time.Hour,
+				RefreshToken: "new-authorized-refresh-token", RefreshTokenExpiresIn: 30 * 24 * time.Hour,
+				Scopes: resourceAccessOAuthScope,
+			})
+			return authorizeErr
+		},
+	}
+
+	token, err := manager.accessTokenFromStagedFeishuOAuthRefresh(context.Background(), staged)
+	if err != nil || token != "new-authorized-access-token" {
+		t.Fatalf("accessTokenFromStagedFeishuOAuthRefresh = %q err=%v, want concurrent authorization", token, err)
+	}
+	latest, err := st.GetFeishuUserOAuthCredentialByID(oldCredential.ID, oldCredential.AccountID)
+	if err != nil || latest.Status != store.FeishuUserOAuthCredentialStatusActive || latest.Version != oldCredential.Version+1 {
+		t.Fatalf("winning OAuth credential = %#v err=%v", latest, err)
+	}
+	resolved, err := st.GetFeishuOAuthRefreshAttempt(attempt.ID, attempt.AccountID)
+	if err != nil || resolved.State != store.FeishuOAuthRefreshAttemptStateCompleted {
+		t.Fatalf("superseded invalid staged attempt = %#v err=%v", resolved, err)
 	}
 }
 
@@ -376,6 +1054,61 @@ func TestFeishuOAuthRefreshRecoveryMarksExpiredPreparedAttemptAmbiguous(t *testi
 	}
 }
 
+func TestFeishuOAuthRefreshRecoveryProcessesAllBatches(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("batched recovery called remote OAuth endpoint: %s", r.URL.Path)
+	}))
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	now := time.Date(2026, time.August, 4, 14, 30, 0, 0, time.UTC)
+	for i := 0; i < feishuOAuthRefreshRecoveryLimit+1; i++ {
+		actorOpenID := fmt.Sprintf("ou_recovery_%03d", i)
+		credential, err := st.SaveFeishuUserOAuthCredential(store.FeishuUserOAuthCredential{
+			AccountID:              manager.account.ID,
+			ActorOpenID:            actorOpenID,
+			AccessTokenCiphertext:  "v1.access-" + actorOpenID,
+			AccessTokenExpiresAt:   now.Add(time.Minute),
+			RefreshTokenCiphertext: "v1.refresh-" + actorOpenID,
+			RefreshTokenExpiresAt:  now.Add(24 * time.Hour),
+			Scopes:                 resourceAccessOAuthScope,
+			AuthorizedAt:           now,
+			ReauthorizeAt:          now.Add(365 * 24 * time.Hour),
+			Status:                 store.FeishuUserOAuthCredentialStatusActive,
+			CreatedAt:              now,
+			UpdatedAt:              now,
+		})
+		if err != nil {
+			t.Fatalf("save recovery credential %d: %v", i, err)
+		}
+		if _, _, err := st.PrepareFeishuOAuthRefreshAttempt(
+			credential.ID,
+			credential.AccountID,
+			credential.Version,
+			fmt.Sprintf("lease-%03d", i),
+			now,
+			time.Minute,
+		); err != nil {
+			t.Fatalf("prepare recovery attempt %d: %v", i, err)
+		}
+	}
+	manager.now = func() time.Time { return now.Add(2 * time.Minute) }
+
+	if err := manager.recoverFeishuOAuthRefreshAttempts(context.Background()); err != nil {
+		t.Fatalf("recoverFeishuOAuthRefreshAttempts returned error: %v", err)
+	}
+	remaining, err := st.ListRecoverableFeishuOAuthRefreshAttempts(manager.account.ID, manager.currentTime(), 10)
+	if err != nil {
+		t.Fatalf("ListRecoverableFeishuOAuthRefreshAttempts returned error: %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("recoverable attempts after batched recovery = %d, want 0", len(remaining))
+	}
+}
+
 func TestFeishuOAuthRefreshRecoveryFailsClosedAfterCredentialKeyRotation(t *testing.T) {
 	server := httptest.NewServer(http.NotFoundHandler())
 	defer server.Close()
@@ -540,10 +1273,10 @@ func TestFeishuUserAccessTokenUsesSafeFallbackAfterRecoverableRefreshFailure(t *
 		mu.Lock()
 		refreshCalls++
 		mu.Unlock()
-		w.WriteHeader(http.StatusServiceUnavailable)
+		w.WriteHeader(http.StatusTooManyRequests)
 		writeResourceAccessJSON(t, w, map[string]any{
-			"error":             "temporarily_unavailable",
-			"error_description": "try again later",
+			"error":             "rate_limited",
+			"error_description": "retry later",
 		})
 	}))
 	defer server.Close()

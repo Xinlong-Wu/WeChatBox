@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -61,6 +62,28 @@ type ProviderContext struct {
 	Items    []json.RawMessage `json:"items,omitempty"`
 }
 
+// WorkflowResumeReceipt is a model-invisible record of an asynchronously
+// resumed turn that committed to the conversation. It keeps retry delivery
+// idempotent even after ordinary messages are compacted away.
+type WorkflowResumeReceipt struct {
+	Assistant         Message `json:"assistant"`
+	CommittedRevision int64   `json:"committed_revision"`
+	// TextChunks preserves the exact first-delivery UUID-to-text mapping. A nil
+	// value identifies a legacy receipt that predates durable chunk storage;
+	// newly committed receipts persist an empty or populated JSON array.
+	TextChunks []string `json:"text_chunks"`
+}
+
+// WorkflowOriginReceipt is a model-invisible proof that the conversation CAS
+// containing a pending workflow tool trace committed. It survives compaction
+// of the ordinary message list so startup recovery can finish the origin
+// continuation commit without guessing from the conversation revision alone.
+type WorkflowOriginReceipt struct {
+	ToolCallID        string `json:"tool_call_id"`
+	ToolName          string `json:"tool_name"`
+	CommittedRevision int64  `json:"committed_revision"`
+}
+
 // IsEmpty reports whether the context has no provider-owned items to round-trip.
 func (c ProviderContext) IsEmpty() bool {
 	return len(c.Items) == 0
@@ -68,9 +91,11 @@ func (c ProviderContext) IsEmpty() bool {
 
 // Conversation is a snapshot of a full conversation (one JSONL line).
 type Conversation struct {
-	Revision         int64                      `json:"revision"`
-	Messages         []Message                  `json:"messages"`
-	ProviderContexts map[string]ProviderContext `json:"provider_contexts,omitempty"`
+	Revision               int64                            `json:"revision"`
+	Messages               []Message                        `json:"messages"`
+	ProviderContexts       map[string]ProviderContext       `json:"provider_contexts,omitempty"`
+	WorkflowResumeReceipts map[string]WorkflowResumeReceipt `json:"workflow_resume_receipts,omitempty"`
+	WorkflowOriginReceipts map[string]WorkflowOriginReceipt `json:"workflow_origin_receipts,omitempty"`
 }
 
 // SessionDir returns the directory for a user's sessions in this platform store.
@@ -132,6 +157,23 @@ func (s *Store) SaveConversationCAS(userID, sessionID string, expectedRevision i
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	tx, err := s.beginConversationFileWrite(userID, sessionID)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var archived bool
+	err = tx.QueryRow(
+		`SELECT archived FROM sessions WHERE user_id=? AND id=?`,
+		userID,
+		sessionID,
+	).Scan(&archived)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("check conversation session state: %w", err)
+	}
+	if err == nil && archived {
+		return 0, fmt.Errorf("%w: session %s is archived", ErrSessionNotFound, sessionID)
+	}
 
 	current, err := loadConversationFile(path)
 	if err != nil {
@@ -154,14 +196,32 @@ func (s *Store) SaveConversationCAS(userID, sessionID string, expectedRevision i
 		return current.Revision, fmt.Errorf("marshal conversation: %w", err)
 	}
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(line, '\n'), 0600); err != nil {
+	tmpFile, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return current.Revision, fmt.Errorf("create session temp file: %w", err)
+	}
+	tmp := tmpFile.Name()
+	removeTemp := true
+	defer func() {
+		_ = tmpFile.Close()
+		if removeTemp {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if _, err := tmpFile.Write(append(line, '\n')); err != nil {
 		return current.Revision, fmt.Errorf("write session temp file: %w", err)
 	}
+	if err := tmpFile.Close(); err != nil {
+		return current.Revision, fmt.Errorf("close session temp file: %w", err)
+	}
 	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
 		return current.Revision, fmt.Errorf("rename session file: %w", err)
 	}
+	removeTemp = false
+	// The transaction only coordinates file writers. Once rename succeeds the
+	// conversation is durable enough for subsequent CAS readers even if the
+	// advisory lock transaction itself cannot be committed.
+	_ = tx.Commit()
 
 	conv.Revision = nextRevision
 	return nextRevision, nil
@@ -172,11 +232,36 @@ func (s *Store) TruncateConversation(userID, sessionID string) error {
 	path := s.SessionPath(userID, sessionID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	tx, err := s.beginConversationFileWrite(userID, sessionID)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	// Just delete the file; next append will recreate it
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("truncate session: %w", err)
 	}
+	_ = tx.Commit()
 	return nil
+}
+
+func (s *Store) beginConversationFileWrite(userID, sessionID string) (*sql.Tx, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin conversation file write: %w", err)
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO conversation_file_locks (user_id, session_id, generation)
+		 VALUES (?, ?, 1)
+		 ON CONFLICT(user_id, session_id)
+		 DO UPDATE SET generation=conversation_file_locks.generation+1`,
+		userID,
+		sessionID,
+	); err != nil {
+		_ = tx.Rollback()
+		return nil, fmt.Errorf("acquire conversation file write lock: %w", err)
+	}
+	return tx, nil
 }
 
 func splitLines(s string) []string {

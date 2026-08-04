@@ -107,10 +107,28 @@ func (b *bot) configureEventHandlers(d *dispatcher.EventDispatcher, events []fei
 
 func (b *bot) handleCustomizedEvent(ctx context.Context, eventName string, event *larkevent.EventReq) error {
 	env, chatID := customizedFeishuEventEnv(eventName, event)
-	return runFeishuEventCommands(ctx, b.sender, eventName, chatID, b.eventCommands[eventName], env)
+	return b.runTrackedEventCommands(ctx, eventName, chatID, b.eventCommands[eventName], env)
 }
 
 func (b *bot) handleBotP2PChatEntered(ctx context.Context, event *larkim.P2ChatAccessEventBotP2pChatEnteredV1) error {
 	env, chatID := botP2PChatEnteredEnv(event)
-	return runFeishuEventCommands(ctx, b.sender, feishuBotP2PChatEnteredV2Event, chatID, b.eventCommands[feishuBotP2PChatEnteredV2Event], env)
+	return b.runTrackedEventCommands(ctx, feishuBotP2PChatEnteredV2Event, chatID, b.eventCommands[feishuBotP2PChatEnteredV2Event], env)
+}
+
+func (b *bot) runTrackedEventCommands(ctx context.Context, eventName, chatID string, scripts []string, env map[string]string) error {
+	if b.processingContext().Err() != nil {
+		feishuLog.Debug(ctx, "feishu event ignored because the runtime is shutting down event=%s chat=%s", eventName, chatID)
+		return nil
+	}
+	releaseTask, accepted := b.tasks.Reserve()
+	if !accepted {
+		feishuLog.Debug(ctx, "feishu event ignored because event admission is closed event=%s chat=%s", eventName, chatID)
+		return nil
+	}
+	defer releaseTask()
+	if b.processingContext().Err() != nil {
+		feishuLog.Debug(ctx, "feishu event ignored because the runtime stopped before execution event=%s chat=%s", eventName, chatID)
+		return nil
+	}
+	return runFeishuEventCommands(ctx, b.sender, eventName, chatID, scripts, env)
 }

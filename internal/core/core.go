@@ -74,6 +74,7 @@ type PrepareUserMessageFunc func(ctx context.Context, userID, sessionID string, 
 type ConversationManager interface {
 	commands.SessionManager
 	GetOrCreateCurrentSession(userID string) (*store.Session, error)
+	GetSession(userID, sessionID string) (*store.Session, error)
 	LoadHistory(userID, sessionID string) (*store.Conversation, error)
 	SaveHistoryCAS(userID, sessionID string, expectedRevision int64, conv *store.Conversation) (int64, error)
 }
@@ -308,6 +309,7 @@ func (b *Bot) replyInSession(ctx context.Context, msg InboundMessage, sender Sen
 	if conv == nil {
 		conv = &store.Conversation{}
 	}
+	backfillWorkflowResumeReceipts(conv)
 	expectedRevision := conv.Revision
 	if userMsg.Internal != nil {
 		userMsg.Internal.CommittedRevision = expectedRevision + 1
@@ -415,6 +417,8 @@ func (b *Bot) replyInSession(ctx context.Context, msg InboundMessage, sender Sen
 		return err
 	}
 	assistantHistory.ToolTraces = toolTraces
+	rememberWorkflowOriginReceipts(conv, toolTraces, expectedRevision+1)
+	rememberWorkflowResumeReceipt(conv, userMsg, assistantHistory, workflowResumeDeliveryTextChunks(llmResponse.Text, b.chunkLimit()))
 	historyForSave := conv.Messages
 	if compactAllowed {
 		if preCompacted {

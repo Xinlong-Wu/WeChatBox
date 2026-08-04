@@ -106,7 +106,7 @@ func (s *Store) PrepareFeishuOAuthRefreshAttempt(
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	tx, err := beginFeishuOAuthRefreshTx(s.db)
+	tx, err := beginFeishuOAuthCredentialTx(s.db)
 	if err != nil {
 		return FeishuOAuthRefreshAttempt{}, false, fmt.Errorf("begin prepare feishu oauth refresh attempt: %w", err)
 	}
@@ -197,7 +197,7 @@ func (s *Store) StageFeishuOAuthRefreshResponse(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	tx, err := beginFeishuOAuthRefreshTx(s.db)
+	tx, err := beginFeishuOAuthCredentialTx(s.db)
 	if err != nil {
 		return FeishuOAuthRefreshAttempt{}, fmt.Errorf("begin stage feishu oauth refresh response: %w", err)
 	}
@@ -268,7 +268,7 @@ func (s *Store) ApplyFeishuOAuthRefreshAttempt(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	tx, err := beginFeishuOAuthRefreshTx(s.db)
+	tx, err := beginFeishuOAuthCredentialTx(s.db)
 	if err != nil {
 		return FeishuUserOAuthCredential{}, FeishuOAuthRefreshAttempt{}, fmt.Errorf("begin apply feishu oauth refresh attempt: %w", err)
 	}
@@ -366,7 +366,7 @@ func (s *Store) FailFeishuOAuthRefreshAttempt(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	tx, err := beginFeishuOAuthRefreshTx(s.db)
+	tx, err := beginFeishuOAuthCredentialTx(s.db)
 	if err != nil {
 		return FeishuUserOAuthCredential{}, FeishuOAuthRefreshAttempt{}, fmt.Errorf("begin fail feishu oauth refresh attempt: %w", err)
 	}
@@ -387,19 +387,25 @@ func (s *Store) FailFeishuOAuthRefreshAttempt(
 	if err != nil {
 		return FeishuUserOAuthCredential{}, FeishuOAuthRefreshAttempt{}, err
 	}
-	if requireReauthorization && credential.Version == attempt.ExpectedVersion {
+	terminalState := FeishuOAuthRefreshAttemptStateFailed
+	if credential.Version > attempt.ExpectedVersion {
+		terminalState = FeishuOAuthRefreshAttemptStateCompleted
+		errorCategory = ""
+	} else if credential.Version < attempt.ExpectedVersion {
+		return credential, attempt, ErrFeishuUserOAuthCredentialConflict
+	} else if requireReauthorization {
 		credential, err = markFeishuOAuthCredentialReauthTx(tx, credential, now)
 		if err != nil {
 			return FeishuUserOAuthCredential{}, FeishuOAuthRefreshAttempt{}, err
 		}
 	}
-	if err := completeFeishuOAuthRefreshAttemptTx(tx, attempt, FeishuOAuthRefreshAttemptStateFailed, errorCategory, now); err != nil {
+	if err := completeFeishuOAuthRefreshAttemptTx(tx, attempt, terminalState, errorCategory, now); err != nil {
 		return FeishuUserOAuthCredential{}, FeishuOAuthRefreshAttempt{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return FeishuUserOAuthCredential{}, FeishuOAuthRefreshAttempt{}, fmt.Errorf("commit failed feishu oauth refresh attempt: %w", err)
 	}
-	attempt = clearedTerminalFeishuOAuthRefreshAttempt(attempt, FeishuOAuthRefreshAttemptStateFailed, errorCategory, now)
+	attempt = clearedTerminalFeishuOAuthRefreshAttempt(attempt, terminalState, errorCategory, now)
 	return credential, attempt, nil
 }
 
@@ -417,7 +423,7 @@ func (s *Store) MarkFeishuOAuthRefreshAttemptAmbiguous(attemptID, accountID stri
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	tx, err := beginFeishuOAuthRefreshTx(s.db)
+	tx, err := beginFeishuOAuthCredentialTx(s.db)
 	if err != nil {
 		return FeishuUserOAuthCredential{}, FeishuOAuthRefreshAttempt{}, fmt.Errorf("begin ambiguous feishu oauth refresh attempt: %w", err)
 	}
@@ -426,36 +432,65 @@ func (s *Store) MarkFeishuOAuthRefreshAttemptAmbiguous(attemptID, accountID stri
 	if err != nil {
 		return FeishuUserOAuthCredential{}, FeishuOAuthRefreshAttempt{}, err
 	}
-	credential, err := scanFeishuUserOAuthCredential(tx.QueryRow(
-		feishuUserOAuthCredentialSelect+` WHERE id=? AND account_id=?`, attempt.CredentialID, attempt.AccountID,
-	))
-	if err != nil {
-		return FeishuUserOAuthCredential{}, FeishuOAuthRefreshAttempt{}, err
-	}
 	if attempt.State != FeishuOAuthRefreshAttemptStatePrepared {
-		return credential, attempt, ErrFeishuOAuthRefreshAttemptConflict
+		return FeishuUserOAuthCredential{}, attempt, ErrFeishuOAuthRefreshAttemptConflict
 	}
 	if attempt.LeaseExpiresAt.After(now) {
-		return credential, attempt, ErrFeishuOAuthRefreshAttemptLeaseLost
+		return FeishuUserOAuthCredential{}, attempt, ErrFeishuOAuthRefreshAttemptLeaseLost
 	}
-	terminalState := FeishuOAuthRefreshAttemptStateAmbiguous
-	errorCategory := FeishuOAuthRefreshErrorAmbiguousOutcome
-	if credential.Version > attempt.ExpectedVersion {
-		terminalState = FeishuOAuthRefreshAttemptStateCompleted
-		errorCategory = ""
-	} else if credential.Version == attempt.ExpectedVersion {
-		credential, err = markFeishuOAuthCredentialReauthTx(tx, credential, now)
-		if err != nil {
-			return FeishuUserOAuthCredential{}, FeishuOAuthRefreshAttempt{}, err
-		}
-	} else {
-		return credential, attempt, ErrFeishuUserOAuthCredentialConflict
-	}
-	if err := completeFeishuOAuthRefreshAttemptTx(tx, attempt, terminalState, errorCategory, now); err != nil {
+	credential, terminalState, errorCategory, err := resolveAmbiguousFeishuOAuthRefreshAttemptTx(tx, attempt, now)
+	if err != nil {
 		return FeishuUserOAuthCredential{}, FeishuOAuthRefreshAttempt{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return FeishuUserOAuthCredential{}, FeishuOAuthRefreshAttempt{}, fmt.Errorf("commit ambiguous feishu oauth refresh attempt: %w", err)
+	}
+	attempt = clearedTerminalFeishuOAuthRefreshAttempt(attempt, terminalState, errorCategory, now)
+	return credential, attempt, nil
+}
+
+// MarkOwnedFeishuOAuthRefreshAttemptAmbiguous fails closed immediately when
+// the current lease owner cannot determine whether Feishu consumed the
+// one-time refresh token. Unlike startup recovery, it does not wait for lease
+// expiry because the owner has already observed the ambiguous transport
+// outcome.
+func (s *Store) MarkOwnedFeishuOAuthRefreshAttemptAmbiguous(
+	attemptID, accountID, leaseToken string,
+	now time.Time,
+) (FeishuUserOAuthCredential, FeishuOAuthRefreshAttempt, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return FeishuUserOAuthCredential{}, FeishuOAuthRefreshAttempt{}, err
+	}
+	attemptID = strings.TrimSpace(attemptID)
+	accountID = strings.TrimSpace(accountID)
+	leaseToken = strings.TrimSpace(leaseToken)
+	now = normalizedWorkflowTime(now)
+	if attemptID == "" || accountID == "" || leaseToken == "" {
+		return FeishuUserOAuthCredential{}, FeishuOAuthRefreshAttempt{}, fmt.Errorf("feishu oauth refresh attempt, account, and lease are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := beginFeishuOAuthCredentialTx(s.db)
+	if err != nil {
+		return FeishuUserOAuthCredential{}, FeishuOAuthRefreshAttempt{}, fmt.Errorf("begin owned ambiguous feishu oauth refresh attempt: %w", err)
+	}
+	defer tx.Rollback()
+	attempt, err := feishuOAuthRefreshAttemptByID(tx, attemptID, accountID)
+	if err != nil {
+		return FeishuUserOAuthCredential{}, FeishuOAuthRefreshAttempt{}, err
+	}
+	if attempt.State != FeishuOAuthRefreshAttemptStatePrepared {
+		return FeishuUserOAuthCredential{}, attempt, ErrFeishuOAuthRefreshAttemptConflict
+	}
+	if attempt.LeaseToken != leaseToken {
+		return FeishuUserOAuthCredential{}, attempt, ErrFeishuOAuthRefreshAttemptLeaseLost
+	}
+	credential, terminalState, errorCategory, err := resolveAmbiguousFeishuOAuthRefreshAttemptTx(tx, attempt, now)
+	if err != nil {
+		return FeishuUserOAuthCredential{}, FeishuOAuthRefreshAttempt{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return FeishuUserOAuthCredential{}, FeishuOAuthRefreshAttempt{}, fmt.Errorf("commit owned ambiguous feishu oauth refresh attempt: %w", err)
 	}
 	attempt = clearedTerminalFeishuOAuthRefreshAttempt(attempt, terminalState, errorCategory, now)
 	return credential, attempt, nil
@@ -481,7 +516,7 @@ func (s *Store) InvalidateFeishuOAuthRefreshAttempt(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	tx, err := beginFeishuOAuthRefreshTx(s.db)
+	tx, err := beginFeishuOAuthCredentialTx(s.db)
 	if err != nil {
 		return FeishuUserOAuthCredential{}, FeishuOAuthRefreshAttempt{}, fmt.Errorf("begin invalidate feishu oauth refresh attempt: %w", err)
 	}
@@ -519,65 +554,6 @@ func (s *Store) InvalidateFeishuOAuthRefreshAttempt(
 	}
 	attempt = clearedTerminalFeishuOAuthRefreshAttempt(attempt, terminalState, errorCategory, now)
 	return credential, attempt, nil
-}
-
-// CompleteFeishuOAuthRefreshAttempt marks an active attempt superseded after
-// the caller verifies that the credential version already advanced.
-func (s *Store) CompleteFeishuOAuthRefreshAttempt(attemptID, accountID string, now time.Time) (FeishuOAuthRefreshAttempt, error) {
-	if err := s.requireFeishuDocsStore(); err != nil {
-		return FeishuOAuthRefreshAttempt{}, err
-	}
-	attemptID = strings.TrimSpace(attemptID)
-	accountID = strings.TrimSpace(accountID)
-	now = normalizedWorkflowTime(now)
-	if attemptID == "" || accountID == "" {
-		return FeishuOAuthRefreshAttempt{}, fmt.Errorf("feishu oauth refresh attempt and account are required")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	tx, err := beginFeishuOAuthRefreshTx(s.db)
-	if err != nil {
-		return FeishuOAuthRefreshAttempt{}, fmt.Errorf("begin complete feishu oauth refresh attempt: %w", err)
-	}
-	defer tx.Rollback()
-	attempt, err := feishuOAuthRefreshAttemptByID(tx, attemptID, accountID)
-	if err != nil {
-		return FeishuOAuthRefreshAttempt{}, err
-	}
-	if attempt.State == FeishuOAuthRefreshAttemptStateCompleted {
-		return attempt, nil
-	}
-	if attempt.State != FeishuOAuthRefreshAttemptStatePrepared && attempt.State != FeishuOAuthRefreshAttemptStateResponseStaged {
-		return attempt, ErrFeishuOAuthRefreshAttemptConflict
-	}
-	result, err := tx.Exec(
-		`UPDATE feishu_oauth_refresh_attempts SET
-		 state=?, lease_token='', lease_expires_at_ms=0,
-		 access_token_ciphertext='', access_token_expires_at_ms=0,
-		 refresh_token_ciphertext='', refresh_token_expires_at_ms=0,
-		 scopes='', error_category='', updated_at_ms=?
-		 WHERE attempt_id=? AND account_id=? AND state IN (?, ?)`,
-		FeishuOAuthRefreshAttemptStateCompleted,
-		now.UnixMilli(),
-		attempt.ID,
-		attempt.AccountID,
-		FeishuOAuthRefreshAttemptStatePrepared,
-		FeishuOAuthRefreshAttemptStateResponseStaged,
-	)
-	if err != nil {
-		return FeishuOAuthRefreshAttempt{}, fmt.Errorf("complete superseded feishu oauth refresh attempt: %w", err)
-	}
-	count, err := result.RowsAffected()
-	if err != nil {
-		return FeishuOAuthRefreshAttempt{}, fmt.Errorf("inspect superseded feishu oauth refresh attempt completion: %w", err)
-	}
-	if count != 1 {
-		return FeishuOAuthRefreshAttempt{}, ErrFeishuOAuthRefreshAttemptConflict
-	}
-	if err := tx.Commit(); err != nil {
-		return FeishuOAuthRefreshAttempt{}, fmt.Errorf("commit superseded feishu oauth refresh attempt: %w", err)
-	}
-	return clearedTerminalFeishuOAuthRefreshAttempt(attempt, FeishuOAuthRefreshAttemptStateCompleted, "", now), nil
 }
 
 func (s *Store) GetFeishuOAuthRefreshAttempt(attemptID, accountID string) (FeishuOAuthRefreshAttempt, error) {
@@ -634,6 +610,75 @@ func (s *Store) ListRecoverableFeishuOAuthRefreshAttempts(accountID string, now 
 		return nil, fmt.Errorf("iterate recoverable feishu oauth refresh attempts: %w", err)
 	}
 	return attempts, nil
+}
+
+// DeleteTerminalFeishuOAuthRefreshAttempts removes one bounded batch of old,
+// sanitized terminal attempts for one Feishu account. Rows that still contain
+// staged token ciphertext are deliberately retained for diagnosis.
+func (s *Store) DeleteTerminalFeishuOAuthRefreshAttempts(accountID string, completedBefore time.Time, limit int) (int64, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return 0, err
+	}
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" || completedBefore.IsZero() || limit <= 0 {
+		return 0, fmt.Errorf("feishu oauth refresh account, completion cutoff, and positive limit are required")
+	}
+	completedBefore = completedBefore.UTC()
+	if limit > 1000 {
+		limit = 1000
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.Exec(
+		`DELETE FROM feishu_oauth_refresh_attempts
+		 WHERE attempt_id IN (
+		  SELECT attempt_id FROM feishu_oauth_refresh_attempts
+		  WHERE account_id=? AND state IN (?, ?, ?) AND updated_at_ms<?
+		   AND access_token_ciphertext='' AND refresh_token_ciphertext=''
+		  ORDER BY updated_at_ms ASC, attempt_id ASC
+		  LIMIT ?
+		 )`,
+		accountID,
+		FeishuOAuthRefreshAttemptStateCompleted,
+		FeishuOAuthRefreshAttemptStateAmbiguous,
+		FeishuOAuthRefreshAttemptStateFailed,
+		completedBefore.UnixMilli(),
+		limit,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("delete terminal feishu oauth refresh attempts: %w", err)
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("inspect terminal feishu oauth refresh attempt cleanup: %w", err)
+	}
+	return deleted, nil
+}
+
+// CountUnsafeTerminalFeishuOAuthRefreshAttempts reports old terminal rows that
+// cannot be retention-cleaned because they still contain token ciphertext.
+func (s *Store) CountUnsafeTerminalFeishuOAuthRefreshAttempts(accountID string, completedBefore time.Time) (int64, error) {
+	if err := s.requireFeishuDocsStore(); err != nil {
+		return 0, err
+	}
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" || completedBefore.IsZero() {
+		return 0, fmt.Errorf("feishu oauth refresh account and completion cutoff are required")
+	}
+	var count int64
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM feishu_oauth_refresh_attempts
+		 WHERE account_id=? AND state IN (?, ?, ?) AND updated_at_ms<?
+		  AND (access_token_ciphertext<>'' OR refresh_token_ciphertext<>'')`,
+		accountID,
+		FeishuOAuthRefreshAttemptStateCompleted,
+		FeishuOAuthRefreshAttemptStateAmbiguous,
+		FeishuOAuthRefreshAttemptStateFailed,
+		completedBefore.UTC().UnixMilli(),
+	).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count unsafe terminal feishu oauth refresh attempts: %w", err)
+	}
+	return count, nil
 }
 
 func feishuOAuthRefreshAttemptByID(queryer interface {
@@ -779,6 +824,36 @@ func markFeishuOAuthCredentialReauthTx(tx feishuOAuthRefreshExecutor, credential
 	))
 }
 
+func resolveAmbiguousFeishuOAuthRefreshAttemptTx(
+	tx feishuOAuthRefreshExecutor,
+	attempt FeishuOAuthRefreshAttempt,
+	now time.Time,
+) (FeishuUserOAuthCredential, string, string, error) {
+	credential, err := scanFeishuUserOAuthCredential(tx.QueryRow(
+		feishuUserOAuthCredentialSelect+` WHERE id=? AND account_id=?`, attempt.CredentialID, attempt.AccountID,
+	))
+	if err != nil {
+		return FeishuUserOAuthCredential{}, "", "", err
+	}
+	terminalState := FeishuOAuthRefreshAttemptStateAmbiguous
+	errorCategory := FeishuOAuthRefreshErrorAmbiguousOutcome
+	if credential.Version > attempt.ExpectedVersion {
+		terminalState = FeishuOAuthRefreshAttemptStateCompleted
+		errorCategory = ""
+	} else if credential.Version == attempt.ExpectedVersion {
+		credential, err = markFeishuOAuthCredentialReauthTx(tx, credential, now)
+		if err != nil {
+			return FeishuUserOAuthCredential{}, "", "", err
+		}
+	} else {
+		return credential, "", "", ErrFeishuUserOAuthCredentialConflict
+	}
+	if err := completeFeishuOAuthRefreshAttemptTx(tx, attempt, terminalState, errorCategory, now); err != nil {
+		return FeishuUserOAuthCredential{}, "", "", err
+	}
+	return credential, terminalState, errorCategory, nil
+}
+
 func clearedTerminalFeishuOAuthRefreshAttempt(attempt FeishuOAuthRefreshAttempt, state, errorCategory string, now time.Time) FeishuOAuthRefreshAttempt {
 	attempt.State = state
 	attempt.LeaseToken = ""
@@ -807,15 +882,15 @@ type feishuOAuthRefreshExecutor interface {
 	QueryRow(query string, args ...any) *sql.Row
 }
 
-// feishuOAuthRefreshTx uses BEGIN IMMEDIATE so separate LingoBridge processes
-// queue before reading refresh state instead of failing later with
-// SQLITE_BUSY_SNAPSHOT after a concurrent writer commits.
-type feishuOAuthRefreshTx struct {
+// feishuOAuthCredentialTx uses BEGIN IMMEDIATE so separate LingoBridge
+// processes queue before reading credential or refresh state instead of
+// failing later with SQLITE_BUSY_SNAPSHOT after a concurrent writer commits.
+type feishuOAuthCredentialTx struct {
 	conn *sql.Conn
 	done bool
 }
 
-func beginFeishuOAuthRefreshTx(db *sql.DB) (*feishuOAuthRefreshTx, error) {
+func beginFeishuOAuthCredentialTx(db *sql.DB) (*feishuOAuthCredentialTx, error) {
 	if db == nil {
 		return nil, fmt.Errorf("feishu oauth refresh database is required")
 	}
@@ -832,18 +907,18 @@ func beginFeishuOAuthRefreshTx(db *sql.DB) (*feishuOAuthRefreshTx, error) {
 		conn.Close()
 		return nil, err
 	}
-	return &feishuOAuthRefreshTx{conn: conn}, nil
+	return &feishuOAuthCredentialTx{conn: conn}, nil
 }
 
-func (tx *feishuOAuthRefreshTx) Exec(query string, args ...any) (sql.Result, error) {
+func (tx *feishuOAuthCredentialTx) Exec(query string, args ...any) (sql.Result, error) {
 	return tx.conn.ExecContext(context.Background(), query, args...)
 }
 
-func (tx *feishuOAuthRefreshTx) QueryRow(query string, args ...any) *sql.Row {
+func (tx *feishuOAuthCredentialTx) QueryRow(query string, args ...any) *sql.Row {
 	return tx.conn.QueryRowContext(context.Background(), query, args...)
 }
 
-func (tx *feishuOAuthRefreshTx) Commit() error {
+func (tx *feishuOAuthCredentialTx) Commit() error {
 	if tx == nil || tx.conn == nil || tx.done {
 		return nil
 	}
@@ -859,7 +934,7 @@ func (tx *feishuOAuthRefreshTx) Commit() error {
 	return nil
 }
 
-func (tx *feishuOAuthRefreshTx) Rollback() error {
+func (tx *feishuOAuthCredentialTx) Rollback() error {
 	if tx == nil || tx.conn == nil || tx.done {
 		return nil
 	}

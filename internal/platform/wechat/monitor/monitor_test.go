@@ -128,6 +128,13 @@ func (f *fakeConversationManager) GetOrCreateCurrentSession(userID string) (*sto
 	return &store.Session{ID: "session", UserID: userID, Name: "default", Current: true}, nil
 }
 
+func (f *fakeConversationManager) GetSession(userID, sessionID string) (*store.Session, error) {
+	if f.sess != nil && f.sess.ID == sessionID && f.sess.UserID == userID && !f.sess.Archived {
+		return f.sess, nil
+	}
+	return &store.Session{ID: sessionID, UserID: userID, Name: "target"}, nil
+}
+
 func (f *fakeConversationManager) CurrentSession(userID string) (*store.Session, error) {
 	return f.GetOrCreateCurrentSession(userID)
 }

@@ -12,6 +12,7 @@ var (
 	ErrFeishuUserOAuthCredentialNotFound = errors.New("feishu user oauth credential not found")
 	ErrFeishuUserOAuthCredentialConflict = errors.New("feishu user oauth credential version conflict")
 	ErrFeishuUserOAuthIdentityConflict   = errors.New("feishu user oauth identities belong to different credentials")
+	ErrFeishuUserOAuthIdentityChanged    = errors.New("feishu user oauth credential identity changed")
 )
 
 const (
@@ -60,7 +61,7 @@ func (s *Store) SaveFeishuUserOAuthCredential(credential FeishuUserOAuthCredenti
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	tx, err := s.db.Begin()
+	tx, err := beginFeishuOAuthCredentialTx(s.db)
 	if err != nil {
 		return FeishuUserOAuthCredential{}, fmt.Errorf("begin save feishu user oauth credential: %w", err)
 	}
@@ -71,6 +72,14 @@ func (s *Store) SaveFeishuUserOAuthCredential(credential FeishuUserOAuthCredenti
 		return FeishuUserOAuthCredential{}, err
 	}
 	if found {
+		incomingIdentityType, incomingIdentityID := feishuUserOAuthCredentialIdentityKey(credential)
+		existingIdentityType, existingIdentityID := feishuUserOAuthCredentialIdentityKey(existing)
+		if incomingIdentityType != existingIdentityType || incomingIdentityID != existingIdentityID {
+			// Ciphertext is authenticated against the identity supplied by the
+			// caller. Do not silently add a higher-priority alias after encryption;
+			// return the canonical stored identity so the caller can re-encrypt.
+			return existing, ErrFeishuUserOAuthIdentityChanged
+		}
 		credential.ID = existing.ID
 		credential.CreatedAt = existing.CreatedAt
 		credential.Version = existing.Version + 1
@@ -150,6 +159,13 @@ func (s *Store) SaveFeishuUserOAuthCredential(credential FeishuUserOAuthCredenti
 		return FeishuUserOAuthCredential{}, fmt.Errorf("commit feishu user oauth credential: %w", err)
 	}
 	return credential, nil
+}
+
+func feishuUserOAuthCredentialIdentityKey(credential FeishuUserOAuthCredential) (string, string) {
+	if credential.ActorOpenID != "" {
+		return "open_id", credential.ActorOpenID
+	}
+	return "user_id", credential.ActorUserID
 }
 
 // GetFeishuUserOAuthCredential returns the credential matching either trusted

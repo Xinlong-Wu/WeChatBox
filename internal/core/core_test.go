@@ -32,6 +32,8 @@ func testLLMConfig() config.LLMConfig {
 
 type fakeSessions struct {
 	sess       *store.Session
+	targetSess *store.Session
+	sessionErr error
 	conv       *store.Conversation
 	saved      *store.Conversation
 	model      string
@@ -44,6 +46,16 @@ func (f *fakeSessions) GetOrCreateCurrentSession(userID string) (*store.Session,
 		return f.sess, nil
 	}
 	return &store.Session{ID: "session", UserID: userID, Name: "default", Current: true}, nil
+}
+
+func (f *fakeSessions) GetSession(userID, sessionID string) (*store.Session, error) {
+	if f.sessionErr != nil {
+		return nil, f.sessionErr
+	}
+	if f.targetSess != nil {
+		return f.targetSess, nil
+	}
+	return &store.Session{ID: sessionID, UserID: userID, Name: "target"}, nil
 }
 
 func (f *fakeSessions) LoadHistory(userID, sessionID string) (*store.Conversation, error) {
@@ -827,6 +839,10 @@ func TestHandleCommitsPendingWorkflowAfterConversationCAS(t *testing.T) {
 	if sessions.saved == nil || sessions.saved.Revision != 8 {
 		t.Fatalf("saved conversation = %#v, want revision 8", sessions.saved)
 	}
+	receipt, ok := sessions.saved.WorkflowOriginReceipts["req_pending"]
+	if !ok || receipt.ToolCallID != "call_1" || receipt.ToolName != "fake_tool" || receipt.CommittedRevision != 8 {
+		t.Fatalf("saved workflow origin receipt = %#v present=%t, want durable revision-8 proof", receipt, ok)
+	}
 	if len(workflows.commits) != 1 || workflows.commits[0] != (workflowCommitCall{
 		requestID:         "req_pending",
 		accountID:         "feishu:cli_test",
@@ -900,7 +916,7 @@ func TestHandleCancelsPendingWorkflowWhenToolLoopCannotFinish(t *testing.T) {
 	}
 }
 
-func TestHandleCancelsPendingWorkflowWhenContinuationCommitFails(t *testing.T) {
+func TestHandleLeavesSavedPendingWorkflowRecoverableWhenContinuationCommitFails(t *testing.T) {
 	commitErr := errors.New("continuation commit failed")
 	sessions := &fakeSessions{sess: &store.Session{ID: "session", UserID: "user", Name: "default", Current: true}}
 	client := &fakeToolLLM{
@@ -922,7 +938,7 @@ func TestHandleCancelsPendingWorkflowWhenContinuationCommitFails(t *testing.T) {
 	if !errors.Is(err, commitErr) {
 		t.Fatalf("Handle error = %v, want continuation commit error", err)
 	}
-	if len(workflows.commits) != 1 || len(workflows.cancels) != 1 || workflows.cancels[0].requestID != "req_pending" {
+	if len(workflows.commits) != 1 || len(workflows.cancels) != 0 {
 		t.Fatalf("workflow commits=%#v cancels=%#v", workflows.commits, workflows.cancels)
 	}
 }

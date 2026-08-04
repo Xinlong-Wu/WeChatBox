@@ -60,6 +60,7 @@ func (b *Bot) compactSession(ctx context.Context, msg InboundMessage, sender Sen
 	if conv == nil {
 		conv = &store.Conversation{}
 	}
+	backfillWorkflowResumeReceipts(conv)
 	expectedRevision := conv.Revision
 	if len(conv.Messages) <= nativeContextKeepRecentMessages {
 		return sender.Send(ctx, OutboundMessage{Text: "当前会话没有足够的旧历史可压缩。"})

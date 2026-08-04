@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -53,7 +54,47 @@ func NewPlatform(st *store.Store, acc store.Account, cfg feishu.Config, level lo
 	return &Platform{store: st, account: acc, config: cfg, level: level}
 }
 
-func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
+func (p *Platform) Run(ctx context.Context, handler core.Handler) (runErr error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ownershipCtx, cancelOwnership := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelOwnership()
+	lifecycleCtx, cancelLifecycle := context.WithCancel(withFeishuRuntimeOwnership(ctx, ownershipCtx))
+	var (
+		approvals         *operationApprovalService
+		resourceAccess    *resourceAccessManager
+		continuationDone  <-chan struct{}
+		cardDeliveryDone  <-chan struct{}
+		messageBot        *bot
+		runtimeLease      *feishuAccountRuntimeLease
+		leaseHeartbeat    *feishuAccountRuntimeHeartbeat
+		leaseHeartbeatErr error
+	)
+	defer func() {
+		var releaseErr error
+		leaseHeartbeatErr, releaseErr = shutdownFeishuAccountRuntime(
+			cancelLifecycle,
+			continuationDone,
+			cardDeliveryDone,
+			messageBot,
+			approvals,
+			resourceAccess,
+			leaseHeartbeat,
+			runtimeLease,
+		)
+		if releaseErr != nil && runtimeLease != nil {
+			feishuLog.Warn(context.Background(), "release feishu account runtime lease failed account=%s owner_ref=%s: %v",
+				runtimeLease.accountID, shortResourceRef(runtimeLease.ownerID), releaseErr)
+		}
+		if leaseHeartbeatErr != nil {
+			feishuLog.Error(context.Background(), "feishu account runtime lease heartbeat failed account=%s: %v", p.account.ID, leaseHeartbeatErr)
+			if ctx.Err() == nil && (runErr == nil || errors.Is(runErr, context.Canceled)) {
+				runErr = fmt.Errorf("maintain feishu account runtime lease for account %s: %w", p.account.Name, leaseHeartbeatErr)
+			}
+		}
+	}()
+
 	acc := p.account
 	accountConfig, ok := p.config.Accounts[acc.Name]
 	if !ok {
@@ -75,9 +116,23 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 	if err != nil {
 		return fmt.Errorf("resolve feishu bot identity for account %s: %w", acc.Name, err)
 	}
+	if p.store == nil {
+		return fmt.Errorf("feishu account runtime lease requires a Feishu store")
+	}
+	runtimeLease, err = acquireFeishuAccountRuntimeLease(p.store, acc.ID, feishuAccountRuntimeLeaseOptions{})
+	if err != nil {
+		if errors.Is(err, store.ErrFeishuAccountRuntimeLeaseHeld) {
+			return fmt.Errorf("feishu account %s is already active in another LingoBridge runtime: %w", acc.Name, err)
+		}
+		return fmt.Errorf("acquire feishu account runtime lease for account %s: %w", acc.Name, err)
+	}
+	leaseHeartbeat = runtimeLease.startHeartbeat(func() {
+		// A lost account lease is not an orderly shutdown. Cancel both ordinary
+		// runtime work and ownership-bound admitted side effects immediately.
+		cancelOwnership()
+		cancelLifecycle()
+	})
 	sender := &sdkSender{client: restClient}
-	var approvals *operationApprovalService
-	var resourceAccess *resourceAccessManager
 	var cards CardService
 	var operationApprovals feishutools.OperationApprovalService
 	if docsToolsEnabled(p.config.Tools) {
@@ -85,7 +140,7 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 		if err != nil {
 			return fmt.Errorf("initialize feishu cards for account %s: %w", acc.Name, err)
 		}
-		resourceAccess, err = newResourceAccessManager(ctx, p.store, restClient, acc, botOpenID, cards, resourceAccessOAuthConfig{
+		resourceAccess, err = newResourceAccessManager(lifecycleCtx, p.store, restClient, acc, botOpenID, cards, resourceAccessOAuthConfig{
 			ClientID:              creds.AppID,
 			BaseURL:               accountConfig.OAuthBaseURL,
 			CallbackURL:           accountConfig.OAuthCallbackURL,
@@ -95,17 +150,17 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 		if err != nil {
 			return fmt.Errorf("initialize feishu resource access for account %s: %w", acc.Name, err)
 		}
-		if err := resourceAccess.recoverPersistedRequests(ctx); err != nil {
+		if err := resourceAccess.recoverPersistedRequests(lifecycleCtx); err != nil {
 			return fmt.Errorf("recover feishu resource access for account %s: %w", acc.Name, err)
+		}
+		if err := resourceAccess.startFeishuOAuthRefreshAttemptCleanup(); err != nil {
+			return fmt.Errorf("start feishu OAuth refresh attempt cleanup for account %s: %w", acc.Name, err)
 		}
 	}
 	if docsOperationApprovalRequired(p.config.Tools) {
-		approvals, err = newOperationApprovalService(ctx, p.store, acc, cards)
+		approvals, err = newOperationApprovalService(lifecycleCtx, p.store, acc, cards)
 		if err != nil {
 			return fmt.Errorf("initialize feishu tool approvals for account %s: %w", acc.Name, err)
-		}
-		if err := approvals.recoverPersistedApprovals(ctx); err != nil {
-			return fmt.Errorf("recover feishu tool approvals for account %s: %w", acc.Name, err)
 		}
 		operationApprovals = approvals
 	}
@@ -114,6 +169,21 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 		if err := registerApprovalExecutors(approvals, tools); err != nil {
 			return fmt.Errorf("register feishu tool approval executors for account %s: %w", acc.Name, err)
 		}
+		if err := approvals.recoverPersistedApprovals(lifecycleCtx); err != nil {
+			return fmt.Errorf("recover feishu tool approvals for account %s: %w", acc.Name, err)
+		}
+	}
+	if docsToolsEnabled(p.config.Tools) {
+		cardWorker, workerErr := newFeishuCardDeliveryWorker(p.store, cards, resourceAccess, acc)
+		if workerErr != nil {
+			return fmt.Errorf("initialize feishu card delivery worker for account %s: %w", acc.Name, workerErr)
+		}
+		done := make(chan struct{})
+		cardDeliveryDone = done
+		go func() {
+			defer close(done)
+			cardWorker.Run(lifecycleCtx)
+		}()
 	}
 	if docsToolsEnabled(p.config.Tools) {
 		if resumer, ok := handler.(core.WorkflowResumer); ok {
@@ -121,9 +191,12 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 			if workerErr != nil {
 				return fmt.Errorf("initialize feishu workflow continuation worker for account %s: %w", acc.Name, workerErr)
 			}
-			workerCtx, stopWorker := context.WithCancel(ctx)
-			defer stopWorker()
-			go worker.Run(workerCtx)
+			done := make(chan struct{})
+			continuationDone = done
+			go func() {
+				defer close(done)
+				worker.Run(lifecycleCtx)
+			}()
 		} else {
 			feishuLog.Warn(ctx, "feishu workflow continuation worker disabled because handler does not support resumption account=%s", acc.ID)
 		}
@@ -133,7 +206,7 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 	} else {
 		feishuLog.Debug(ctx, "no tools registered for account %s (%s)", acc.Name, acc.ID)
 	}
-	b := &bot{
+	messageBot = &bot{
 		handler:       handler,
 		sender:        sender,
 		tools:         tools,
@@ -143,9 +216,10 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 		approvals:     approvals,
 		cards:         cards,
 		deduper:       newEventDeduper(defaultFeishuDedupeTTL),
-		runCtx:        ctx,
+		runCtx:        lifecycleCtx,
 		reactionDelay: feishuReactionClearDelay,
 	}
+	b := messageBot
 
 	d := dispatcher.NewEventDispatcher("", "")
 	d.Config.Logger = sdkLog
@@ -168,7 +242,7 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 		opts = append(opts, larkws.WithDomain(domain))
 	}
 	wsClient := larkws.NewClient(creds.AppID, creds.AppSecret, opts...)
-	oauthServer, err := startResourceAccessOAuthServer(ctx, resourceAccess)
+	oauthServer, err := startResourceAccessOAuthServer(lifecycleCtx, resourceAccess)
 	if err != nil {
 		return fmt.Errorf("start feishu OAuth callback server for account %s: %w", acc.Name, err)
 	}
@@ -181,7 +255,7 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 	}
 	feishuLog.Info(ctx, "registered events for account %s (%s): %s", acc.Name, acc.ID, strings.Join(registeredEvents, ", "))
 	feishuLog.Info(ctx, "starting for account %s (%s)", acc.Name, acc.ID)
-	return runClient(ctx, wsClient, oauthServer)
+	return runClient(lifecycleCtx, wsClient, oauthServer)
 }
 
 func newFeishuTools(client *lark.Client, st *store.Store, accountID string, cfg feishutools.Config, approvals feishutools.OperationApprovalService, resourceAccess feishutools.ResourceAccessController) []tooltypes.Tool {

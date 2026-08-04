@@ -238,6 +238,7 @@ func approvalCallbackResponse(toastType, content string, card Card) *callback.Ca
 }
 
 func escapeApprovalMarkdown(value string) string {
+	value = strings.Join(strings.Fields(value), " ")
 	replacer := strings.NewReplacer(
 		"\\", "\\\\",
 		"*", "\\*",

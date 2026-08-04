@@ -25,6 +25,10 @@ type OperationApprovalPolicy struct {
 	ActionKey   string
 	Action      string
 	SupportsAll bool
+	// RecoverInterrupted is true only when re-executing the persisted payload
+	// after a process restart is guarded by a durable remote-operation ledger
+	// or a stable remote idempotency token derived from the request ID.
+	RecoverInterrupted bool
 }
 
 // OperationApprovalRequest asks the shared service to check reusable approval

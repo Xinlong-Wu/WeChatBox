@@ -6,12 +6,16 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 
+	feishuidempotency "lingobridge/internal/platform/feishu/idempotency"
 	"lingobridge/internal/store"
 	tooltypes "lingobridge/internal/tools"
 )
@@ -47,24 +51,41 @@ func TestDocsToolConfigDefaultsAndRegistration(t *testing.T) {
 		t.Fatalf("disabled tools = %d, want 0", len(got))
 	}
 	cfg.Docs.Enabled = true
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil, nil); len(got) != 2 {
-		t.Fatalf("read-only tools = %d, want search/read", len(got))
+	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil, nil); len(got) != 0 {
+		t.Fatalf("docs tools without resource access guard = %d, want 0", len(got))
 	}
 	cfg.Docs.AllowWrite = true
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil, nil); len(got) != 2 {
-		t.Fatalf("write tools without approval or resource access workflow = %d, want search/read", len(got))
+	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil, nil); len(got) != 0 {
+		t.Fatalf("write tools without approval or resource access workflow = %d, want 0", len(got))
 	}
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, &fakeApprovalRequester{}, nil); len(got) != 2 {
-		t.Fatalf("write tools without resource access workflow = %d, want search/read", len(got))
+	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, &fakeApprovalRequester{}, nil); len(got) != 0 {
+		t.Fatalf("write tools without resource access workflow = %d, want 0", len(got))
 	}
 	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, &fakeApprovalRequester{result: OperationApprovalResult{Status: OperationApprovalStatusGranted}}, grantedResourceAccessController("req_access")); len(got) != 4 {
 		t.Fatalf("write tools with approval workflow = %d, want four tools", len(got))
 	} else {
+		sharedService := got[0].(docsTool).service
+		for _, registered := range got[1:] {
+			if service := registered.(docsTool).service; sharedService == nil || service != sharedService {
+				t.Fatalf("docs tools do not share one service: first=%p current=%p", sharedService, service)
+			}
+		}
 		createPolicy := findDocsTool(t, got, createToolName).(OperationApprovalExecutor).OperationApprovalPolicy()
 		appendPolicy := findDocsTool(t, got, appendToolName).(OperationApprovalExecutor).OperationApprovalPolicy()
-		if createPolicy.ActionKey != "create" || appendPolicy.ActionKey != "append" || createPolicy.ToolName == appendPolicy.ToolName {
-			t.Fatalf("operation policies create=%#v append=%#v, want independent actions", createPolicy, appendPolicy)
+		if createPolicy.ActionKey != "create" || appendPolicy.ActionKey != "append" || createPolicy.ToolName == appendPolicy.ToolName ||
+			!createPolicy.RecoverInterrupted || !appendPolicy.RecoverInterrupted {
+			t.Fatalf("operation policies create=%#v append=%#v, want independent restart-safe actions", createPolicy, appendPolicy)
 		}
+	}
+}
+
+func TestDocsToolWithoutServiceFailsClosed(t *testing.T) {
+	result := (docsTool{name: readToolName, spec: docsReadSpec()}).Execute(
+		t.Context(),
+		tooltypes.Call{ID: "call_nil_service", Name: readToolName, Arguments: json.RawMessage(`{"token":"doc_token"}`)},
+	)
+	if !result.IsError || !strings.Contains(result.Content, "service is unavailable") {
+		t.Fatalf("nil-service result = %#v, want explicit error", result)
 	}
 }
 
@@ -137,6 +158,7 @@ func TestDocsReadAndAppendExternalDocumentUseResourceAccessWithoutBinding(t *tes
 
 func TestDocsAppendTextBlocksUsesSinglePageChildCount(t *testing.T) {
 	const documentToken = "doxcnsinglepage123"
+	const requestID = "req_single_page"
 	var getCalls, postCalls int
 	var appendIndex int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -163,6 +185,9 @@ func TestDocsAppendTextBlocksUsesSinglePageChildCount(t *testing.T) {
 			})
 		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodPost:
 			postCalls++
+			if got, want := r.URL.Query().Get("client_token"), docxAppendClientToken(requestID); got != want {
+				t.Fatalf("client_token = %q, want %q", got, want)
+			}
 			var body struct {
 				Index *int `json:"index"`
 			}
@@ -185,7 +210,7 @@ func TestDocsAppendTextBlocksUsesSinglePageChildCount(t *testing.T) {
 		lark.WithOAuthBaseUrl(server.URL),
 		lark.WithHttpClient(server.Client()),
 	)
-	if err := (docsTool{client: client}).appendTextBlocks(context.Background(), documentToken, "new paragraph"); err != nil {
+	if err := (&docsService{client: client}).appendTextBlocks(context.Background(), requestID, authorizedDocForTest(documentToken), "new paragraph"); err != nil {
 		t.Fatalf("appendTextBlocks returned error: %v", err)
 	}
 	if getCalls != 1 || postCalls != 1 || appendIndex != 2 {
@@ -193,8 +218,291 @@ func TestDocsAppendTextBlocksUsesSinglePageChildCount(t *testing.T) {
 	}
 }
 
+func TestDocsAppendTextBlocksRetriesLostMutationResponseWithSameClientToken(t *testing.T) {
+	const documentToken = "doxcnlostresponse123"
+	const requestID = "req_lost_append_response"
+	var postCalls int
+	var clientTokens []string
+	var appendIndexes []int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/oauth/v3/token" || r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200,
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodGet:
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{
+					"items":    []any{map[string]any{"block_id": "block_1"}},
+					"has_more": false,
+				},
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodPost:
+			postCalls++
+			clientTokens = append(clientTokens, r.URL.Query().Get("client_token"))
+			var body struct {
+				Index int `json:"index"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode append body: %v", err)
+			}
+			appendIndexes = append(appendIndexes, body.Index)
+			if postCalls == 1 {
+				hijacker, ok := w.(http.Hijacker)
+				if !ok {
+					t.Fatal("test server does not support response hijacking")
+				}
+				conn, _, err := hijacker.Hijack()
+				if err != nil {
+					t.Fatalf("hijack append response: %v", err)
+				}
+				_ = conn.Close()
+				return
+			}
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok"})
+		default:
+			t.Fatalf("unexpected path: %s method=%s", r.URL.Path, r.Method)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	if err := (&docsService{client: client}).appendTextBlocks(context.Background(), requestID, authorizedDocForTest(documentToken), "new paragraph"); err != nil {
+		t.Fatalf("appendTextBlocks returned error after idempotent retry: %v", err)
+	}
+	wantToken := docxAppendClientToken(requestID)
+	if postCalls != 2 || len(clientTokens) != 2 || clientTokens[0] != wantToken || clientTokens[1] != wantToken {
+		t.Fatalf("append retries/tokens = %d/%#v, want two calls with %q", postCalls, clientTokens, wantToken)
+	}
+	if len(appendIndexes) != 2 || appendIndexes[0] != 1 || appendIndexes[1] != 1 {
+		t.Fatalf("append retry indexes = %#v, want identical request bodies", appendIndexes)
+	}
+}
+
+func TestDocsAppendTextBlocksDoesNotRetryAfterRuntimeOwnershipLoss(t *testing.T) {
+	const documentToken = "doxcnownershiplost123"
+	const requestID = "req_append_ownership_lost"
+	ownershipCtx, cancelOwnership := context.WithCancel(context.Background())
+	defer cancelOwnership()
+	var postCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/oauth/v3/token" || r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200,
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodGet:
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{"items": []any{}, "has_more": false},
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodPost:
+			call := postCalls.Add(1)
+			if call == 1 {
+				cancelOwnership()
+				conn, _, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					t.Fatalf("hijack append response: %v", err)
+				}
+				_ = conn.Close()
+				return
+			}
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok"})
+		default:
+			t.Fatalf("unexpected path: %s method=%s", r.URL.Path, r.Method)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	operationCtx := feishuidempotency.WithRetryContext(context.Background(), ownershipCtx)
+	err := (&docsService{client: client}).appendTextBlocks(operationCtx, requestID, authorizedDocForTest(documentToken), "new paragraph")
+	if !errors.Is(err, errDocxAppendOutcomeUnknown) {
+		t.Fatalf("appendTextBlocks error = %v, want conservative outcome_unknown after ownership loss", err)
+	}
+	if got := postCalls.Load(); got != 1 {
+		t.Fatalf("append calls after runtime ownership loss = %d, want no reconciliation request from the old owner", got)
+	}
+}
+
+func TestDocsAppendApprovedExecutionTreatsTwoLostMutationResponsesAsOutcomeUnknown(t *testing.T) {
+	const documentToken = "doxcnlostbothresponses123"
+	server, postCalls := newLostDocxAppendResponsesServer(t, documentToken)
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
+	_, tools, _ := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
+	executor := findDocsTool(t, tools, appendToolName).(OperationApprovalExecutor)
+
+	result, err := executor.ExecuteApproved(context.Background(), "req_append_lost_both", json.RawMessage(
+		`{"document_token":"doxcnlostbothresponses123","content":"approved paragraph","chat_id":"oc_chat","actor_open_id":"ou_requester"}`,
+	))
+	if err != nil {
+		t.Fatalf("ExecuteApproved returned error after two uncertain responses: %v", err)
+	}
+	if !result.Warning || !strings.Contains(result.WarningReason, "outcome is unknown") ||
+		!strings.Contains(result.Message, "请勿重复追加") || !strings.Contains(result.Message, "检查文档") {
+		t.Fatalf("approved append result = %#v, want manual-check warning without retry advice", result)
+	}
+	if got := postCalls(); got != 2 {
+		t.Fatalf("append calls = %d, want one request plus one idempotent reconciliation request", got)
+	}
+}
+
+func TestDocsAppendPermanentGrantReturnsOutcomeUnknownAfterTwoLostMutationResponses(t *testing.T) {
+	const documentToken = "doxcnlostdirectresponses123"
+	server, postCalls := newLostDocxAppendResponsesServer(t, documentToken)
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
+	approver := &fakeApprovalRequester{result: OperationApprovalResult{Status: OperationApprovalStatusGranted}}
+	st, tools, _ := newDocsToolsForTest(t, client, cfg, approver)
+
+	result := findDocsTool(t, tools, appendToolName).Execute(groupDocsContext(), tooltypes.Call{
+		ID:        "append_lost_both_direct",
+		Name:      appendToolName,
+		Arguments: json.RawMessage(`{"token":"doxcnlostdirectresponses123","content":"new paragraph"}`),
+	})
+	if result.IsError {
+		t.Fatalf("direct append result = %#v, want structured outcome_unknown", result)
+	}
+	var output writeOutput
+	if err := json.Unmarshal([]byte(result.Content), &output); err != nil {
+		t.Fatalf("decode direct append output: %v", err)
+	}
+	if output.Status != "outcome_unknown" || output.RequestID == "" || output.Appended ||
+		!strings.Contains(output.Warning, "请勿重复追加") || !strings.Contains(output.Warning, "检查文档") {
+		t.Fatalf("direct append output = %#v, want manual-check outcome_unknown", output)
+	}
+	workflow, err := st.GetWorkflowRequest(output.RequestID, "feishu:cli_test")
+	if err != nil || workflow.State != store.WorkflowRequestStatePartial {
+		t.Fatalf("direct append workflow = %#v err=%v, want partial", workflow, err)
+	}
+	if got := postCalls(); got != 2 {
+		t.Fatalf("append calls = %d, want one request plus one idempotent reconciliation request", got)
+	}
+}
+
+func newLostDocxAppendResponsesServer(t *testing.T, documentToken string) (*httptest.Server, func() int) {
+	t.Helper()
+	var mu sync.Mutex
+	postCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/oauth/v3/token" || r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200,
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodGet:
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{"items": []any{}, "has_more": false},
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodPost:
+			mu.Lock()
+			postCalls++
+			mu.Unlock()
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("test server does not support response hijacking")
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Fatalf("hijack append response: %v", err)
+			}
+			_ = conn.Close()
+		default:
+			t.Fatalf("unexpected path: %s method=%s", r.URL.Path, r.Method)
+		}
+	}))
+	return server, func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return postCalls
+	}
+}
+
+func TestDocsAppendTextBlocksRetriesAfterOperationDeadlineWithSameClientToken(t *testing.T) {
+	const documentToken = "doxcndeadline123"
+	const requestID = "req_deadline_append_response"
+	var mu sync.Mutex
+	var postCalls int
+	var clientTokens []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/oauth/v3/token" || r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200,
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodGet:
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{
+					"items":    []any{},
+					"has_more": false,
+				},
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodPost:
+			mu.Lock()
+			postCalls++
+			call := postCalls
+			clientTokens = append(clientTokens, r.URL.Query().Get("client_token"))
+			mu.Unlock()
+			if call == 1 {
+				time.Sleep(75 * time.Millisecond)
+				return
+			}
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok"})
+		default:
+			t.Fatalf("unexpected path: %s method=%s", r.URL.Path, r.Method)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if err := (&docsService{client: client}).appendTextBlocks(ctx, requestID, authorizedDocForTest(documentToken), "new paragraph"); err != nil {
+		t.Fatalf("appendTextBlocks returned error after deadline reconciliation: %v", err)
+	}
+	wantToken := docxAppendClientToken(requestID)
+	mu.Lock()
+	defer mu.Unlock()
+	if postCalls != 2 || len(clientTokens) != 2 || clientTokens[0] != wantToken || clientTokens[1] != wantToken {
+		t.Fatalf("append deadline retries/tokens = %d/%#v, want two calls with %q", postCalls, clientTokens, wantToken)
+	}
+}
+
 func TestDocsAppendTextBlocksUsesAllChildPages(t *testing.T) {
 	const documentToken = "doxcnmultipage123"
+	const requestID = "req_multi_page"
 	var getCalls, postCalls int
 	var appendIndex int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -234,6 +542,9 @@ func TestDocsAppendTextBlocksUsesAllChildPages(t *testing.T) {
 			}
 		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodPost:
 			postCalls++
+			if got, want := r.URL.Query().Get("client_token"), docxAppendClientToken(requestID); got != want {
+				t.Fatalf("client_token = %q, want %q", got, want)
+			}
 			var body struct {
 				Index *int `json:"index"`
 			}
@@ -256,11 +567,18 @@ func TestDocsAppendTextBlocksUsesAllChildPages(t *testing.T) {
 		lark.WithOAuthBaseUrl(server.URL),
 		lark.WithHttpClient(server.Client()),
 	)
-	if err := (docsTool{client: client}).appendTextBlocks(context.Background(), documentToken, "new paragraph"); err != nil {
+	if err := (&docsService{client: client}).appendTextBlocks(context.Background(), requestID, authorizedDocForTest(documentToken), "new paragraph"); err != nil {
 		t.Fatalf("appendTextBlocks returned error: %v", err)
 	}
 	if getCalls != 2 || postCalls != 1 || appendIndex != 5 {
 		t.Fatalf("get_calls=%d post_calls=%d append_index=%d, want 2/1/5", getCalls, postCalls, appendIndex)
+	}
+}
+
+func TestDocsAppendTextBlocksRequiresStableWorkflowRequestID(t *testing.T) {
+	err := (&docsService{}).appendTextBlocks(context.Background(), "", authorizedDocForTest("doxcnstableid123"), "must not append")
+	if err == nil || !strings.Contains(err.Error(), "stable workflow request id") {
+		t.Fatalf("appendTextBlocks error = %v, want stable request id rejection", err)
 	}
 }
 
@@ -289,12 +607,52 @@ func TestDocsAppendTextBlocksDoesNotWriteWhenChildLookupFails(t *testing.T) {
 		lark.WithOAuthBaseUrl(server.URL),
 		lark.WithHttpClient(server.Client()),
 	)
-	err := (docsTool{client: client}).appendTextBlocks(context.Background(), documentToken, "must not append")
+	err := (&docsService{client: client}).appendTextBlocks(context.Background(), "req_lookup_failure", authorizedDocForTest(documentToken), "must not append")
 	if err == nil || !strings.Contains(err.Error(), "resolve feishu document append position") || !strings.Contains(err.Error(), "lookup denied") {
 		t.Fatalf("appendTextBlocks error = %v", err)
 	}
 	if postCalls != 0 {
 		t.Fatalf("append POST calls = %d, want 0 after failed child lookup", postCalls)
+	}
+}
+
+func TestDocsAppendTextBlocksFailsClosedWhenPaginationStateIsMissing(t *testing.T) {
+	const documentToken = "doxcnmissingpagination123"
+	var postCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/oauth/v3/token" || r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200,
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodGet:
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{
+					"items": []any{map[string]any{"block_id": "block_1"}},
+				},
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodPost:
+			postCalls++
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok"})
+		default:
+			t.Fatalf("unexpected path: %s method=%s", r.URL.Path, r.Method)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	err := (&docsService{client: client}).appendTextBlocks(context.Background(), "req_missing_pagination", authorizedDocForTest(documentToken), "must not append")
+	if err == nil || !strings.Contains(err.Error(), "missing has_more") {
+		t.Fatalf("appendTextBlocks error = %v, want missing has_more", err)
+	}
+	if postCalls != 0 {
+		t.Fatalf("append POST calls = %d, want 0 when pagination state is incomplete", postCalls)
 	}
 }
 
@@ -638,6 +996,153 @@ func TestDocsCreateToolUsesActiveGrantWithoutSendingCard(t *testing.T) {
 	}
 }
 
+func TestDocsCreateLostResponseReconcilesUniqueBotOwnedDocumentWithoutSecondCreate(t *testing.T) {
+	const documentToken = "doxcnreconciled123"
+	var createCalls, listCalls int
+	createdTime := strconv.FormatInt(time.Now().UTC().Unix(), 10)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/oauth/v3/token" || r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200})
+		case r.URL.Path == "/open-apis/docx/v1/documents" && r.Method == http.MethodPost:
+			createCalls++
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("test server does not support response hijacking")
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Fatalf("hijack create response: %v", err)
+			}
+			_ = conn.Close()
+		case r.URL.Path == "/open-apis/drive/explorer/v2/root_folder/meta":
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"token": "fld_root", "user_id": "app_owner"}})
+		case r.URL.Path == "/open-apis/drive/v1/files" && r.Method == http.MethodGet:
+			listCalls++
+			if got := r.URL.Query().Get("folder_token"); got != "fld_token" {
+				t.Fatalf("reconciliation folder_token = %q, want fld_token", got)
+			}
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{
+					"files": []any{map[string]any{
+						"token": documentToken, "name": "Quarterly plan", "type": "docx",
+						"parent_token": "fld_token", "url": "https://docs.feishu.cn/docx/" + documentToken,
+						"created_time": createdTime, "owner_id": "app_owner",
+					}},
+					"has_more": false,
+				},
+			})
+		default:
+			t.Fatalf("unexpected path: %s method=%s", r.URL.Path, r.Method)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	approver := &fakeApprovalRequester{result: OperationApprovalResult{Status: OperationApprovalStatusGranted}}
+	st, tools, _ := newDocsToolsForTest(t, client, Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}, approver)
+	tool := findDocsTool(t, tools, createToolName).(docsTool)
+	tool.service.remoteReconcileDelays = []time.Duration{}
+	result := tool.Execute(groupDocsContext(), tooltypes.Call{
+		ID: "create", Name: createToolName,
+		Arguments: json.RawMessage(`{"title":"Quarterly plan","folder_token":"fld_token"}`),
+	})
+	if result.IsError {
+		t.Fatalf("Execute result = %#v", result)
+	}
+	var output writeOutput
+	if err := json.Unmarshal([]byte(result.Content), &output); err != nil {
+		t.Fatalf("unmarshal reconciled output: %v", err)
+	}
+	if output.Status != "created" || output.DocumentID != documentToken || createCalls != 1 || listCalls != 1 {
+		t.Fatalf("reconciled output/calls = %#v create=%d list=%d", output, createCalls, listCalls)
+	}
+	operation, err := st.GetFeishuRemoteOperation(output.RequestID, "feishu:cli_test")
+	if err != nil || operation.State != store.FeishuRemoteOperationStatePersisted || operation.RemoteResourceToken != documentToken {
+		t.Fatalf("persisted remote operation = %#v err=%v", operation, err)
+	}
+}
+
+func TestDocsCreateUnknownOutcomeRecoveryNeverRepeatsCreate(t *testing.T) {
+	const documentToken = "doxcnlatecandidate123"
+	var createCalls, listCalls int
+	showCandidate := false
+	createdTime := strconv.FormatInt(time.Now().UTC().Unix(), 10)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/oauth/v3/token" || r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200})
+		case r.URL.Path == "/open-apis/docx/v1/documents" && r.Method == http.MethodPost:
+			createCalls++
+			hijacker := w.(http.Hijacker)
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Fatalf("hijack create response: %v", err)
+			}
+			_ = conn.Close()
+		case r.URL.Path == "/open-apis/drive/explorer/v2/root_folder/meta":
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"token": "fld_root", "user_id": "app_owner"}})
+		case r.URL.Path == "/open-apis/drive/v1/files" && r.Method == http.MethodGet:
+			listCalls++
+			files := []any{}
+			if showCandidate {
+				files = append(files, map[string]any{
+					"token": documentToken, "name": "Late plan", "type": "docx",
+					"parent_token": "fld_token", "url": "https://docs.feishu.cn/docx/" + documentToken,
+					"created_time": createdTime, "owner_id": "app_owner",
+				})
+			}
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"files": files, "has_more": false}})
+		default:
+			t.Fatalf("unexpected path: %s method=%s", r.URL.Path, r.Method)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret", lark.WithOpenBaseUrl(server.URL), lark.WithOAuthBaseUrl(server.URL), lark.WithHttpClient(server.Client()))
+	approver := &fakeApprovalRequester{result: OperationApprovalResult{Status: OperationApprovalStatusGranted}}
+	_, tools, _ := newDocsToolsForTest(t, client, Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}, approver)
+	tool := findDocsTool(t, tools, createToolName).(docsTool)
+	tool.service.remoteReconcileDelays = []time.Duration{}
+	first := tool.Execute(groupDocsContext(), tooltypes.Call{
+		ID: "create", Name: createToolName,
+		Arguments: json.RawMessage(`{"title":"Late plan","folder_token":"fld_token"}`),
+	})
+	if first.IsError {
+		t.Fatalf("first Execute result = %#v, want structured unknown outcome", first)
+	}
+	var pending writeOutput
+	if err := json.Unmarshal([]byte(first.Content), &pending); err != nil {
+		t.Fatalf("unmarshal unknown output: %v", err)
+	}
+	if pending.Status != "outcome_unknown" || pending.RequestID == "" || createCalls != 1 || !strings.Contains(pending.Retry, "request_id") {
+		t.Fatalf("unknown output/calls = %#v create=%d", pending, createCalls)
+	}
+
+	showCandidate = true
+	retryArgs, _ := json.Marshal(createArgs{RequestID: pending.RequestID})
+	second := tool.Execute(groupDocsContext(), tooltypes.Call{ID: "recover", Name: createToolName, Arguments: retryArgs})
+	if second.IsError {
+		t.Fatalf("recovery Execute result = %#v", second)
+	}
+	var recovered writeOutput
+	if err := json.Unmarshal([]byte(second.Content), &recovered); err != nil {
+		t.Fatalf("unmarshal recovered output: %v", err)
+	}
+	if recovered.Status != "created" || recovered.DocumentID != documentToken || recovered.RequestID != pending.RequestID || createCalls != 1 || listCalls != 2 {
+		t.Fatalf("recovered output/calls = %#v create=%d list=%d", recovered, createCalls, listCalls)
+	}
+	if approver.checks != 1 {
+		t.Fatalf("approval checks = %d, want recovery to bypass a new approval", approver.checks)
+	}
+}
+
 func TestDocsCreateToolActiveGrantReportsPartialSuccessWithoutRetrySignal(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -752,7 +1257,8 @@ func TestDocsCreateApprovedExecutionCreatesDocument(t *testing.T) {
 		lark.WithHttpClient(server.Client()),
 	)
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
-	_, tools, access := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
+	st, tools, access := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
+	seedDocsCreateApprovalWorkflow(t, st, "req_approved")
 	tool := findDocsTool(t, tools, createToolName)
 	executor, ok := tool.(OperationApprovalExecutor)
 	if !ok {
@@ -768,7 +1274,7 @@ func TestDocsCreateApprovedExecutionCreatesDocument(t *testing.T) {
 	if createRequest.Title != "Quarterly plan" || createRequest.FolderToken != "fld_token" {
 		t.Fatalf("create request = %#v", createRequest)
 	}
-	if len(access.requirements) != 2 || access.requirement.ResourceToken != "fld_token" || access.actor.OpenID != "ou_requester" || access.chat.ChatID != "oc_chat" {
+	if len(access.requirements) != 1 || access.requirement.ResourceToken != "fld_token" || access.actor.OpenID != "ou_requester" || access.chat.ChatID != "oc_chat" {
 		t.Fatalf("approved access requirements=%#v actor=%#v chat=%#v", access.requirements, access.actor, access.chat)
 	}
 }
@@ -803,7 +1309,8 @@ func TestDocsCreateApprovedExecutionReportsPartialSuccessWithoutRetryingCreate(t
 		lark.WithHttpClient(server.Client()),
 	)
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
-	_, tools, _ := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
+	st, tools, _ := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
+	seedDocsCreateApprovalWorkflow(t, st, "req_approved")
 	tool := findDocsTool(t, tools, createToolName)
 	executor := tool.(OperationApprovalExecutor)
 	result, err := executor.ExecuteApproved(context.Background(), "req_approved", json.RawMessage(`{"title":"Quarterly plan","content":"body","folder_token":"fld_token","chat_id":"oc_chat","actor_open_id":"ou_requester"}`))
@@ -812,6 +1319,117 @@ func TestDocsCreateApprovedExecutionReportsPartialSuccessWithoutRetryingCreate(t
 	}
 	if !result.Warning || !strings.Contains(result.WarningReason, "append denied") || !strings.Contains(result.Message, "请勿重复创建") || !strings.Contains(result.Message, "doxcn12345678") {
 		t.Fatalf("partial result = %#v, want warning with existing document link", result)
+	}
+}
+
+func TestDocsCreateApprovedExecutionReportsUnknownInitialContentWithoutRepeatAdvice(t *testing.T) {
+	const documentToken = "doxcnunknowninitial123"
+	var createCalls, appendCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/oauth/v3/token" || r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200,
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents" && r.Method == http.MethodPost:
+			createCalls.Add(1)
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{"document": map[string]any{"document_id": documentToken}},
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodGet:
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"items": []any{}, "has_more": false}})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodPost:
+			appendCalls.Add(1)
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Fatalf("hijack append response: %v", err)
+			}
+			_ = conn.Close()
+		default:
+			t.Fatalf("unexpected path: %s method=%s", r.URL.Path, r.Method)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
+	st, tools, _ := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
+	seedDocsCreateApprovalWorkflow(t, st, "req_unknown_initial")
+	executor := findDocsTool(t, tools, createToolName).(OperationApprovalExecutor)
+
+	result, err := executor.ExecuteApproved(context.Background(), "req_unknown_initial", json.RawMessage(
+		`{"title":"Quarterly plan","content":"body","folder_token":"fld_token","chat_id":"oc_chat","actor_open_id":"ou_requester"}`,
+	))
+	if err != nil {
+		t.Fatalf("ExecuteApproved returned error after unknown initial append: %v", err)
+	}
+	if !result.Warning || !strings.Contains(result.Message, "初始正文") ||
+		!strings.Contains(result.Message, "检查文档") || !strings.Contains(result.Message, "请勿重复追加") {
+		t.Fatalf("unknown initial-content result = %#v, want conservative manual-check warning", result)
+	}
+	if createCalls.Load() != 1 || appendCalls.Load() != 2 {
+		t.Fatalf("remote calls create=%d append=%d, want one create and one same-token append reconciliation", createCalls.Load(), appendCalls.Load())
+	}
+}
+
+func TestDocsCreateApprovedExecutionRecoveryDoesNotRepeatInitialContentAppend(t *testing.T) {
+	const documentToken = "doxcnrestart123"
+	var createCalls, appendCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/oauth/v3/token" || r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "ok",
+				"tenant_access_token": "tenant-token",
+				"expire":              7200,
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents":
+			createCalls++
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{"document": map[string]any{"document_id": documentToken}},
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodGet:
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"items": []any{}, "has_more": false}})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodPost:
+			appendCalls++
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"children": []any{}}})
+		default:
+			t.Fatalf("unexpected path: %s method=%s", r.URL.Path, r.Method)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
+	st, tools, _ := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
+	seedDocsCreateApprovalWorkflow(t, st, "req_restart")
+	executor := findDocsTool(t, tools, createToolName).(OperationApprovalExecutor)
+	payload := json.RawMessage(`{"title":"Quarterly plan","content":"body","folder_token":"fld_token","chat_id":"oc_chat","actor_open_id":"ou_requester"}`)
+	if _, err := executor.ExecuteApproved(context.Background(), "req_restart", payload); err != nil {
+		t.Fatalf("first ExecuteApproved returned error: %v", err)
+	}
+	recovered, err := executor.ExecuteApproved(context.Background(), "req_restart", payload)
+	if err != nil {
+		t.Fatalf("recovered ExecuteApproved returned error: %v", err)
+	}
+	if !recovered.Warning || !strings.Contains(recovered.Message, "初始正文") {
+		t.Fatalf("recovered result = %#v, want conservative initial-content warning", recovered)
+	}
+	if createCalls != 1 || appendCalls != 1 {
+		t.Fatalf("remote calls after recovery create=%d append=%d, want 1/1", createCalls, appendCalls)
 	}
 }
 
@@ -939,4 +1557,25 @@ func newDocsToolsForTest(t *testing.T, client *lark.Client, cfg Config, approver
 	}
 	access := grantedResourceAccessController("req_access")
 	return st, NewDocsTools(client, st, "feishu:cli_test", cfg, approver, access), access
+}
+
+func seedDocsCreateApprovalWorkflow(t *testing.T, st *store.Store, requestID string) {
+	t.Helper()
+	if _, err := st.CreateWorkflowRequest(store.WorkflowRequest{
+		ID:        requestID,
+		AccountID: "feishu:cli_test",
+		Kind:      store.WorkflowRequestKindToolApproval,
+		State:     store.WorkflowRequestStateExecuting,
+		CreatedAt: time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("seed document create approval workflow: %v", err)
+	}
+}
+
+func authorizedDocForTest(token string) AuthorizedResource {
+	return AuthorizedResource{
+		ResourceType:        "docx",
+		ResourceToken:       token,
+		EffectivePermission: ResourcePermissionWrite,
+	}
 }

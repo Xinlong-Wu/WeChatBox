@@ -403,6 +403,22 @@ returned, the model calls `feishu_docs_request_access` and retries the original
 tool after authorization completes. Resource request IDs remain internal to
 the workflow, card, OAuth, continuation, and audit records.
 
+Docx and folder create requests use a durable `feishu_remote_operations`
+ledger because the corresponding Feishu create APIs do not expose a
+`client_token`. The ledger is written before the first remote call and allows
+only one `prepared` caller to enter `remote_started`. A timeout, lost response,
+empty success body, HTTP 408/429, or server error is never retried as another
+create. LingoBridge instead lists the exact parent and conservatively matches
+resource type, exact name, application owner, and a bounded creation-time
+window. Only one unclaimed candidate may be adopted; zero, multiple, or
+already-claimed candidates return `outcome_unknown`. Both
+`feishu_docs_create` and `feishu_docs_folder_create` accept a retry containing
+only the returned `request_id`; this repairs or re-runs reconciliation and
+never repeats the create API after `remote_started`. If initial document text
+was requested but its append result cannot be proven after recovery, the tool
+returns the created document with an explicit warning instead of guessing and
+appending it again.
+
 When a new local grant is required, LingoBridge first sends a Card V2 choice
 with **允许 N 分钟**, **永久允许**, and **拒绝**. A temporary `once` grant starts
 when the Feishu capability is successfully verified, remains reusable for the
@@ -438,8 +454,15 @@ only when its recorded parent is a fully shared Bot folder in the same chat;
 Bot-owned documents from another chat are rejected even if their token is
 provided.
 
-The OAuth flow uses a cryptographically random state stored only as a hash and
-Feishu's confidential-client authorization-code flow. The Feishu SDK
+The OAuth flow uses a cryptographically random state and Feishu's
+confidential-client authorization-code flow. Its hash is the durable callback
+verifier. Until the exact OAuth handoff card is confirmed delivered, the state
+itself is also retained as account/actor/request-bound AES-GCM ciphertext so a
+lost card-update response or restart can resend the same authorization URL.
+The durable card-delivery worker retries that same state and URL with bounded
+backoff until the resource-access request expires. After a successful card
+update, the recovery ciphertext is cleared while the hash and delivery marker
+remain until callback claim. The Feishu SDK
 authenticates the token exchange with the app's configured client secret;
 LingoBridge deliberately omits `code_challenge`, `code_challenge_method`, and
 `code_verifier`. Feishu's authorization code is valid for five minutes and can
@@ -459,6 +482,20 @@ resulting permission with the Bot tenant identity. For a non-folder document,
 the collaborator is the Bot `open_id`. For an external folder in a group chat,
 the collaborator is the current `openchat`; a private chat cannot directly
 grant an external folder to the Bot and returns an `unsupported` result.
+Feishu collaborator create/update calls do not provide an idempotency token.
+Immediately before the first possible collaborator mutation, the approved
+request is atomically claimed as `executing`, so concurrent callbacks cannot
+issue the same mutation twice and startup will not blindly replay an uncertain
+in-flight write.
+If their response is lost or the operation deadline expires, LingoBridge
+performs an exact live capability check, with one independent bounded retry if
+that check cannot be completed, and accepts success only when the requested
+collaborator permission is visible; it does not blindly replay the mutation.
+If Feishu has already confirmed the collaborator permission but the local
+completion transaction fails, the request remains `executing` instead of being
+reported as a definite failure. Startup recovery verifies the live permission
+again and completes the local capability/grant transaction without replaying
+the collaborator mutation.
 Authorization codes and complete callback URLs are never persisted. Access and
 refresh tokens are encrypted with AES-256-GCM using an account-bound key derived
 from the Feishu App Secret; they are never included in logs, model context, or
@@ -468,6 +505,12 @@ field; they are re-encrypted with the normal credential context only while the
 durable response is atomically applied. Rotating the App Secret makes existing
 credential and staged-refresh ciphertext unreadable, causes affected
 credentials to fail closed, and requires the user to complete OAuth again.
+Sanitized terminal refresh attempts are retained for 30 days for bounded audit
+and then deleted in batches of 500. Cleanup runs once after startup recovery and
+every 24 hours while the account Runtime holds its single-active lease. Prepared
+or staged attempts are never retention-deleted. A terminal row that still
+contains access- or refresh-token ciphertext is also retained and logged as an
+unsafe anomaly instead of being deleted.
 LingoBridge updates the original card with the terminal result and does not send a separate
 success/failure text message to the chat. In direct HTTP mode the browser is
 additionally redirected to the Feishu resource; in manual mode the requester
@@ -551,8 +594,13 @@ bound to the current trusted chat or an external Docx with a live scoped
 Pending operation and resource-access requests survive process restarts in the
 Feishu platform SQLite database. The document payload is retained only while
 operation authorization is pending/executing and is cleared on denial, expiry,
-success, or failure. OAuth state is stored only as a hash and cleared when
-either the HTTP callback or exact-context card submission claims it. The
+success, or failure. OAuth state is verified by its hash. Before handoff
+delivery is confirmed, the original state is temporarily stored only as
+authenticated ciphertext; delivery success clears that ciphertext, and either
+the HTTP callback or exact-context card submission clears the remaining hash.
+If delivery was not confirmed, startup decrypts and resends the same state and
+authorization URL through the durable card-delivery worker rather than
+generating a replacement link. The
 existing `pkce_verifier` storage column remains only to identify and reject
 in-flight requests created by older versions; new requests leave it empty, and
 any legacy value is cleared on claim. Resource-access requests also retain the
@@ -563,8 +611,11 @@ expiries, scopes, authorization time, refresh version, and mandatory
 reauthorization time. Access tokens are refreshed within five minutes of
 expiry. Before calling Feishu, LingoBridge creates a leased
 `feishu_oauth_refresh_attempts` row in `prepared` state using the credential
-version as a compare-and-swap boundary, so concurrent processes do not consume
-the same one-time refresh token twice. A successful response is encrypted and
+version as a compare-and-swap boundary, so concurrent Store instances and
+processes do not consume the same one-time refresh token twice. Initial OAuth
+credential replacement and refresh-attempt transitions both serialize their
+SQLite write transactions before reading credential state. A successful
+response is encrypted and
 persisted as `response_staged` before the credential row is changed; the final
 transaction re-encrypts and replaces both tokens, increments the credential
 version, clears staged ciphertext, and marks the attempt `completed`. Competing
@@ -579,6 +630,10 @@ already-consumed refresh token also requires OAuth again, as does the mandatory
 365-day reauthorization boundary. Operations interrupted while already
 executing are marked failed rather than retried automatically, avoiding
 duplicate creation.
+An approved request that is waiting on an OAuth browser handoff keeps its
+one-time state hash across restart. A delivered authorization URL remains
+usable; an unconfirmed delivery is retried with the same encrypted state and
+same URL. Startup does not invalidate or replace a still-pending handoff.
 Feishu resource capabilities store the exact collaborator subject, actual
 read/write permission, source OAuth actor, source request, live-verification
 time, and active/revoked state. Local resource grants separately store the exact
@@ -886,8 +941,9 @@ account removes the config entry and clears that account's sync cursor. Feishu
 account deletion also removes its chat-bound document/folder metadata,
 Bot-resource records, Feishu-side resource capabilities, local resource-access
 requests/grants, encrypted user OAuth credentials and their refresh-attempt
-records, pending/completed tool approvals, reusable approval grants, and their
-global workflow request rows.
+records, account runtime lease, pending/completed tool approvals, reusable
+approval grants, pending/completed card-delivery outbox rows, durable remote
+create-operation rows, and their global workflow request rows.
 Sessions and media are left intact because current history records are not
 account-id scoped.
 
@@ -897,7 +953,11 @@ existing sessions for that user and the legacy preference column is removed.
 Each JSONL conversation snapshot also carries a monotonic `revision`. Saves use
 compare-and-swap against the revision loaded at turn start, so a stale turn
 cannot replace newer history. Legacy snapshots without the field load as
-revision zero and receive revision one on their next successful save.
+revision zero and receive revision one on their next successful save. Store
+instances that share the same platform database serialize JSONL CAS/truncate
+operations through SQLite-backed conversation file locks and use a unique
+temporary file per write, so concurrent processes cannot both commit the same
+revision or overwrite one another's staging file.
 
 Asynchronous approval and authorization workflows persist one sanitized
 terminal result per global request ID plus a continuation bound to the trusted
@@ -911,6 +971,13 @@ names, OAuth codes, callback URLs, access tokens, refresh tokens, or card callba
 tokens. Deleting a Feishu account's Docs or approval data also deletes the
 matching workflow results and continuations.
 
+The same JSONL CAS stores a model-invisible origin receipt containing only the
+workflow request ID, tool call/name, and committed revision. Origin recovery
+checks that receipt before scanning ordinary messages, so later conversation
+compaction cannot erase the proof that the pending workflow turn committed.
+Recovery advances through uncommitted origins with a keyset cursor; an old row
+whose conversation proof is unavailable cannot permanently starve newer rows.
+
 Operation approvals and resource OAuth callbacks persist a model-safe terminal
 payload for success, warning, denial, expiry, and failure. The original card is
 the immediate user-visible status surface; no duplicate result text is sent.
@@ -918,6 +985,19 @@ At startup, LingoBridge also reconciles terminal approval/resource records that
 are missing a result because the process stopped between the workflow-specific
 state update and result insertion. Recovered operation results deliberately do
 not guess or replay a possibly completed remote write.
+
+Card updates use a durable `feishu_card_deliveries` outbox. The business-state
+transition and its delivery row are committed in the same SQLite transaction
+for OAuth handoff, operation-approval terminal state, resource-access terminal
+state, and continuation terminal notices. A callback token is only a synchronous
+fast path for the callback currently being handled; it is never persisted.
+Failed or interrupted updates are rebuilt from durable request/result state and
+retried by message ID with leased claims, bounded backoff, and expired-lease
+takeover. Newer card revisions supersede older revisions so a delayed OAuth or
+pending update cannot overwrite a terminal result. OAuth handoff delivery stops
+when the resource request expires; terminal updates have a 24-hour retry window.
+The outbox stores routing, revision, lease, and retry metadata only—never card
+JSON, authorization codes, callback URLs, callback tokens, or OAuth credentials.
 
 Each Feishu account runs a continuation worker while Docs tools are enabled.
 The worker scans ready work and expired processing leases, claims one durable
@@ -928,6 +1008,31 @@ changing models while a card is pending affects the resumed turn without moving
 the workflow to another session. An archived/deleted target session cancels the
 continuation; transient model, tool, storage, or delivery failures use bounded
 backoff retries and eventually become failed.
+Runtime shutdown closes callback task admission before any new approval or
+OAuth one-shot state is consumed, waits for already admitted approval/OAuth
+tasks to exit, and returns an interrupted continuation lease to `ready` without
+charging an attempt. Results that become ready while the worker is stopping are
+picked up after restart.
+
+Each Feishu Bot account also uses a durable account-level runtime lease. Only
+one active LingoBridge runtime may start recovery, workers, callbacks, and the
+long connection for the same `account_id`; a second runtime exits before it can
+change workflow state. The active runtime renews a 30-second lease every 10
+seconds and keeps renewing while admitted background work drains during normal
+shutdown. After a crash, another runtime can take over after the lease expires,
+and an old owner cannot renew or release the replacement's lease. Competing
+processes or machines must open the same Feishu SQLite database for this
+single-active guarantee; separate local database files cannot coordinate the
+account lease. Normal lifecycle cancellation is deliberately distinct from
+lease ownership loss: orderly shutdown keeps ownership-bound admitted work
+alive until it drains, while a lost lease cancels approval/resource side-effect
+contexts and leaves their durable `executing` state for the replacement runtime
+to recover. This narrows the stale-owner overlap window; remote APIs that have
+already accepted a request still rely on their operation ledger, stable
+idempotency token, or conservative live verification for final reconciliation.
+Independent same-token append reconciliation is also bounded by this ownership
+context: normal shutdown may finish an already admitted retry, but a lost
+account lease prevents the stale runtime from issuing the reconciliation call.
 
 The resumed turn receives a runtime-generated workflow-result event with a
 per-turn attestation in the system prompt. The event payload is treated as data,
@@ -942,6 +1047,18 @@ created it and replay the already committed assistant response without calling
 the model again. Automatic resume suppresses compaction progress notices so the
 persisted assistant chunks keep the same deterministic Feishu message UUID
 positions across partial delivery retries.
+
+Docx append resolves every top-level child page before writing and fails closed
+when the position response is incomplete or inconsistent. Its block-create
+request uses a deterministic Feishu `client_token` derived from the durable
+global workflow request ID. An uncertain transport/server response gets one
+independent bounded replay with the exact same token and request body, so
+reconciling that same logical append does not add the block batch twice. If the
+replay response is also lost, the workflow becomes `partial`/`outcome_unknown`
+instead of a definite failure: the card or direct tool result tells the caller
+to inspect the document and not repeat the append. The same conservative
+message is used when a newly created document's initial-content append cannot
+be confirmed.
 
 An asynchronous tool returns its request ID to core as runtime-only result
 metadata; that ID is not part of the model-visible tool JSON. The Feishu manager
@@ -964,8 +1081,9 @@ internal/platform/wechat/   # WeChat account/runtime definition and frontend ada
 internal/platform/wechat/monitor/ # WeChat monitor, reply sender, and media handling
 internal/platform/feishu/   # Feishu account config schema and frontend support types
 internal/platform/feishu/definition/ # Feishu account/runtime definition assembly
-internal/platform/feishu/monitor/ # Feishu long-connection monitor, message/text-stream adapter, unified cards/callback routing, OAuth resource access, approvals, and event hooks
-internal/platform/feishu/tools/ # Feishu platform-level LLM tools and approval/resource-access contracts, including Docs helpers and LiteLLM invitations
+internal/platform/feishu/monitor/ # Feishu long-connection monitor, message/text-stream adapter, cards/callback routing, resource workflow/recovery, OAuth credentials, permission guard, approvals, and event hooks
+internal/platform/feishu/idempotency/ # Deterministic, namespaced Feishu idempotency-key helpers
+internal/platform/feishu/tools/ # Feishu platform-level LLM tool adapters and shared Docs/folder services, authorization contracts, remote-create reconciliation, and LiteLLM invitations
 internal/platform/github/   # GitHub account/runtime definition, App auth, PR polling, review prompt construction, and MCP review tool guards
 internal/core/              # Middle layer: scoped platform config/data APIs, tool orchestration, commands, sessions, LLM orchestration
 internal/tools/             # Shared tool interfaces, provider-neutral spec/call/result types, and runtime-owned execution context
@@ -977,6 +1095,15 @@ internal/commands/          # Shared in-chat slash commands
 internal/runner/            # Account supervisor and monitor lifecycle
 internal/control/           # Local Unix-socket reload control API
 ```
+
+Within the Feishu integration, durable responsibilities are split at service
+boundaries rather than implemented by each tool adapter. Resource permission
+checks, startup recovery, OAuth credential/refresh rotation, card-delivery
+retry, and remote-create reconciliation each have one implementation boundary.
+The document and folder tool values retain only their tool name/schema and
+delegate to one shared service per registered tool set. Store dependencies are
+expressed as small capability interfaces for those services; the resource
+access manager remains the live workflow and callback facade.
 
 In-chat slash commands live in `internal/commands/` and are shared by every
 platform adapter unless that platform's command policy disables them.

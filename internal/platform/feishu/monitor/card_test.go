@@ -83,3 +83,13 @@ func TestCardServiceSendsAndUpdatesConcreteCard(t *testing.T) {
 		t.Fatalf("card updates = %#v", updates)
 	}
 }
+
+func TestEscapeApprovalMarkdownKeepsInterpolatedFieldsOnOneLine(t *testing.T) {
+	got := escapeApprovalMarkdown("正常用途\n# 伪造状态\t*强调*")
+	if strings.ContainsAny(got, "\r\n\t") {
+		t.Fatalf("escaped approval markdown retained layout-breaking whitespace: %q", got)
+	}
+	if !strings.Contains(got, "\\*强调\\*") {
+		t.Fatalf("escaped approval markdown did not escape inline formatting: %q", got)
+	}
+}

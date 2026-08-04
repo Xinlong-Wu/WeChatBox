@@ -341,7 +341,17 @@ func (s *Store) RetryWorkflowContinuation(requestID, accountID, leaseToken strin
 	availableAt = normalizedWorkflowTime(availableAt)
 	return s.updateLeasedWorkflowContinuation(
 		requestID, accountID, leaseToken,
-		WorkflowContinuationStateReady, availableAt, lastError, now,
+		WorkflowContinuationStateReady, availableAt, lastError, now, false, "",
+	)
+}
+
+// ReleaseWorkflowContinuation returns a lease interrupted by runtime shutdown
+// to ready state without consuming a delivery-attempt budget entry.
+func (s *Store) ReleaseWorkflowContinuation(requestID, accountID, leaseToken, lastError string, now time.Time) error {
+	now = normalizedWorkflowTime(now)
+	return s.updateLeasedWorkflowContinuation(
+		requestID, accountID, leaseToken,
+		WorkflowContinuationStateReady, now, lastError, now, true, "",
 	)
 }
 
@@ -351,13 +361,20 @@ func (s *Store) CompleteWorkflowContinuation(requestID, accountID, leaseToken, s
 	if state != WorkflowContinuationStateDelivered && state != WorkflowContinuationStateCanceled && state != WorkflowContinuationStateFailed {
 		return fmt.Errorf("unsupported workflow continuation completion state %q", state)
 	}
+	purpose := ""
+	switch state {
+	case WorkflowContinuationStateCanceled:
+		purpose = FeishuCardDeliveryPurposeWorkflowUnavailable
+	case WorkflowContinuationStateFailed:
+		purpose = FeishuCardDeliveryPurposeWorkflowExhausted
+	}
 	return s.updateLeasedWorkflowContinuation(
 		requestID, accountID, leaseToken,
-		state, normalizedWorkflowTime(now), lastError, now,
+		state, normalizedWorkflowTime(now), lastError, now, false, purpose,
 	)
 }
 
-func (s *Store) updateLeasedWorkflowContinuation(requestID, accountID, leaseToken, state string, availableAt time.Time, lastError string, now time.Time) error {
+func (s *Store) updateLeasedWorkflowContinuation(requestID, accountID, leaseToken, state string, availableAt time.Time, lastError string, now time.Time, restoreAttempt bool, cardPurpose string) error {
 	requestID = strings.TrimSpace(requestID)
 	accountID = strings.TrimSpace(accountID)
 	leaseToken = strings.TrimSpace(leaseToken)
@@ -368,10 +385,23 @@ func (s *Store) updateLeasedWorkflowContinuation(requestID, accountID, leaseToke
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	result, err := s.db.Exec(
-		`UPDATE workflow_continuations
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin update leased workflow continuation: %w", err)
+	}
+	defer tx.Rollback()
+	query := `UPDATE workflow_continuations
 		 SET state=?, available_at_ms=?, lease_token='', lease_expires_at_ms=0, last_error=?, updated_at_ms=?
-		 WHERE request_id=? AND account_id=? AND state=? AND lease_token=?`,
+		 WHERE request_id=? AND account_id=? AND state=? AND lease_token=?`
+	if restoreAttempt {
+		query = `UPDATE workflow_continuations
+		 SET state=?, available_at_ms=?, lease_token='', lease_expires_at_ms=0,
+		 attempts=CASE WHEN attempts>0 THEN attempts-1 ELSE 0 END,
+		 last_error=?, updated_at_ms=?
+		 WHERE request_id=? AND account_id=? AND state=? AND lease_token=?`
+	}
+	result, err := tx.Exec(
+		query,
 		state,
 		availableAt.UnixMilli(),
 		lastError,
@@ -389,9 +419,35 @@ func (s *Store) updateLeasedWorkflowContinuation(requestID, accountID, leaseToke
 		return fmt.Errorf("inspect leased workflow continuation update: %w", err)
 	}
 	if count == 1 {
+		if cardPurpose != "" {
+			reference, err := workflowCardReferenceByID(tx, requestID, accountID)
+			if err != nil {
+				return err
+			}
+			if reference.CardMessageID != "" {
+				delivery, err := prepareFeishuCardDelivery(FeishuCardDelivery{
+					AccountID:     accountID,
+					RequestID:     requestID,
+					Purpose:       cardPurpose,
+					Revision:      FeishuCardDeliveryRevisionContinuation,
+					CardMessageID: reference.CardMessageID,
+					CreatedAt:     now,
+					ExpiresAt:     now.Add(feishuTerminalCardDeliveryTTL),
+				})
+				if err != nil {
+					return err
+				}
+				if _, err := enqueueFeishuCardDelivery(tx, delivery); err != nil {
+					return fmt.Errorf("enqueue terminal workflow card delivery: %w", err)
+				}
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit leased workflow continuation update: %w", err)
+		}
 		return nil
 	}
-	continuation, loadErr := s.GetWorkflowContinuation(requestID, accountID)
+	continuation, loadErr := workflowContinuationByID(tx, requestID, accountID)
 	if loadErr != nil {
 		return loadErr
 	}
@@ -502,6 +558,65 @@ func (s *Store) ListResumableWorkflowContinuations(accountID string, now time.Ti
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit resumable workflow continuation scan: %w", err)
+	}
+	return continuations, nil
+}
+
+// ListUncommittedWorkflowContinuations returns waiting origins whose post-tool
+// conversation revision was not recorded. Callers must verify the saved
+// conversation contains the exact tool trace before committing one of them.
+func (s *Store) ListUncommittedWorkflowContinuations(accountID string, limit int) ([]WorkflowContinuation, error) {
+	return s.ListUncommittedWorkflowContinuationsAfter(accountID, time.Time{}, "", limit)
+}
+
+// ListUncommittedWorkflowContinuationsAfter returns one keyset page of waiting
+// origin commits. A recovery worker can advance past permanently unverifiable
+// old rows instead of repeatedly starving newer recoverable continuations.
+func (s *Store) ListUncommittedWorkflowContinuationsAfter(
+	accountID string,
+	afterCreatedAt time.Time,
+	afterRequestID string,
+	limit int,
+) ([]WorkflowContinuation, error) {
+	accountID = strings.TrimSpace(accountID)
+	afterRequestID = strings.TrimSpace(afterRequestID)
+	if accountID == "" {
+		return nil, fmt.Errorf("workflow continuation account is required")
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	afterCreatedAtMS := int64(-1)
+	if !afterCreatedAt.IsZero() {
+		afterCreatedAtMS = afterCreatedAt.UTC().UnixMilli()
+	}
+	rows, err := s.db.Query(
+		workflowContinuationSelect+`
+		 WHERE account_id=? AND state=? AND committed_revision=-1
+		 AND (created_at_ms>? OR (created_at_ms=? AND request_id>?))
+		 ORDER BY created_at_ms, request_id
+		 LIMIT ?`,
+		accountID,
+		WorkflowContinuationStateWaiting,
+		afterCreatedAtMS,
+		afterCreatedAtMS,
+		afterRequestID,
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list uncommitted workflow continuations: %w", err)
+	}
+	defer rows.Close()
+	continuations := []WorkflowContinuation{}
+	for rows.Next() {
+		continuation, scanErr := scanWorkflowContinuation(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		continuations = append(continuations, continuation)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list uncommitted workflow continuations: %w", err)
 	}
 	return continuations, nil
 }

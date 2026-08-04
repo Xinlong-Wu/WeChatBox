@@ -42,6 +42,11 @@ func (m *Manager) GetOrCreateCurrentSession(userID string) (*store.Session, erro
 	return m.store.GetCurrentSession(userID)
 }
 
+// GetSession returns one active session by durable ID.
+func (m *Manager) GetSession(userID, sessionID string) (*store.Session, error) {
+	return m.store.GetSession(userID, sessionID)
+}
+
 // CurrentSession returns the current session for command display.
 func (m *Manager) CurrentSession(userID string) (*store.Session, error) {
 	return m.GetOrCreateCurrentSession(userID)

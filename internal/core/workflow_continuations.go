@@ -24,9 +24,6 @@ func (b *Bot) commitPendingWorkflows(ctx context.Context, accountID string, requ
 		continuation, ready, err := b.Workflows.CommitWorkflowContinuation(requestID, accountID, committedRevision, now)
 		if err != nil {
 			commitErrors = append(commitErrors, fmt.Errorf("commit workflow %s: %w", requestID, err))
-			if cancelErr := b.Workflows.CancelWorkflowContinuation(requestID, accountID, "origin workflow commit failed", now); cancelErr != nil && !errors.Is(cancelErr, store.ErrWorkflowContinuationResolved) {
-				commitErrors = append(commitErrors, fmt.Errorf("cancel workflow %s after commit failure: %w", requestID, cancelErr))
-			}
 			continue
 		}
 		coreLog.Debug(ctx, "committed workflow continuation request=%s account=%s session=%s revision=%d ready=%t",

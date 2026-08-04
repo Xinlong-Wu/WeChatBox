@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +20,32 @@ import (
 	feishutools "lingobridge/internal/platform/feishu/tools"
 	"lingobridge/internal/store"
 )
+
+type observingResourceAccessResultStore struct {
+	resourceAccessStore
+	onStoreResult func()
+}
+
+func (s *observingResourceAccessResultStore) StoreWorkflowResult(result store.WorkflowResult) (store.WorkflowResult, store.WorkflowContinuation, bool, error) {
+	if s.onStoreResult != nil {
+		s.onStoreResult()
+	}
+	return s.resourceAccessStore.StoreWorkflowResult(result)
+}
+
+type failingResourceAccessCompletionStore struct {
+	resourceAccessStore
+	err error
+}
+
+func (s *failingResourceAccessCompletionStore) CompleteFeishuResourceAccessRequest(
+	_, _, _, _ string,
+	_ *store.FeishuResourceCapability,
+	_ *store.FeishuResourceGrant,
+	_ time.Time,
+) error {
+	return s.err
+}
 
 func TestResourceAccessManagerGrantsBotRootWithoutCard(t *testing.T) {
 	var rootCalls int
@@ -66,13 +93,13 @@ func TestResourceAccessManagerGrantsBotRootWithoutCard(t *testing.T) {
 	if _, err := st.GetWorkflowContinuation(result.RequestID, "feishu:cli_test"); !errors.Is(err, store.ErrWorkflowContinuationNotFound) {
 		t.Fatalf("Bot-owned request continuation error = %v, want ErrWorkflowContinuationNotFound", err)
 	}
-	err = manager.RequireResourceAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequirement{
+	_, err = manager.Require(resourceAccessRequestContext(), feishutools.ResourceAccessRequirement{
 		ResourceType:  "folder",
 		ResourceToken: "fld_bot_root",
 		Permission:    feishutools.ResourcePermissionWrite,
 	})
 	if err != nil {
-		t.Fatalf("RequireResourceAccess returned error: %v", err)
+		t.Fatalf("Require returned error: %v", err)
 	}
 }
 
@@ -168,6 +195,34 @@ func TestResourceAccessOAuthDisplayStatusUsesMetadataWithoutRefreshing(t *testin
 	}
 }
 
+func TestResourceAccessResultCardUsesFreshRuntimeContext(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, _, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
+	contextActive := make(chan bool, 1)
+	sender.updateCardFunc = func(ctx context.Context, _, _ string) error {
+		contextActive <- ctx.Err() == nil
+		return nil
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	manager.updateResourceAccessResultCard(canceled, store.FeishuResourceAccessRequest{
+		ID:            "req_result_card",
+		AccountID:     "feishu:cli_test",
+		CardMessageID: "om_card",
+	}, statusCard{title: "完成", template: "green", message: "完成"})
+
+	select {
+	case active := <-contextActive:
+		if !active {
+			t.Fatal("resource result card inherited an exhausted operation context")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("resource result card update was not attempted")
+	}
+}
+
 func TestResourceAccessManagerRequiresBotOwnedAccessWithoutRequestBinding(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -206,8 +261,8 @@ func TestResourceAccessManagerRequiresBotOwnedAccessWithoutRequestBinding(t *tes
 		ResourceToken: "fld_bot_root",
 		Permission:    feishutools.ResourcePermissionWrite,
 	}
-	if err := manager.RequireResourceAccess(ctx, requirement); err != nil {
-		t.Fatalf("RequireResourceAccess returned error: %v", err)
+	if _, err := manager.Require(ctx, requirement); err != nil {
+		t.Fatalf("Require returned error: %v", err)
 	}
 	stored, err := st.GetFeishuResourceAccessRequest(first.RequestID, "feishu:cli_test")
 	if err != nil || stored.State != store.FeishuResourceAccessStateSucceeded {
@@ -216,7 +271,7 @@ func TestResourceAccessManagerRequiresBotOwnedAccessWithoutRequestBinding(t *tes
 
 	baseNow := manager.currentTime()
 	manager.now = func() time.Time { return baseNow.Add(defaultResourceAccessTTL) }
-	if err := manager.RequireResourceAccess(ctx, requirement); err != nil {
+	if _, err := manager.Require(ctx, requirement); err != nil {
 		t.Fatalf("Bot-owned access should remain valid independently of request card TTL: %v", err)
 	}
 	if first.RequestID == second.RequestID {
@@ -237,10 +292,10 @@ func TestResourceAccessManagerReturnsStructuredMissingGrantWithoutStartingWorkfl
 	requirement := feishutools.ResourceAccessRequirement{
 		ResourceType: "docx", ResourceToken: "doxcn_external", Permission: feishutools.ResourcePermissionWrite,
 	}
-	err := manager.RequireResourceAccess(resourceAccessRequestContext(), requirement)
+	_, err := manager.Require(resourceAccessRequestContext(), requirement)
 	var required *feishutools.ResourceAuthorizationRequiredError
 	if !errors.As(err, &required) {
-		t.Fatalf("RequireResourceAccess error = %v, want structured authorization required", err)
+		t.Fatalf("Require error = %v, want structured authorization required", err)
 	}
 	if required.Status != feishutools.ResourceAuthorizationRequiredStatus || required.RequiredTool != feishutools.ResourceAccessToolName ||
 		required.ResourceType != requirement.ResourceType || required.ResourceToken != requirement.ResourceToken || required.Permission != requirement.Permission {
@@ -289,8 +344,13 @@ func TestResourceAccessManagerRequiresExactActorChatGrantAndInheritsWriteForRead
 	requirement := feishutools.ResourceAccessRequirement{
 		ResourceType: "docx", ResourceToken: "doxcn_external", Permission: feishutools.ResourcePermissionRead,
 	}
-	if err := manager.RequireResourceAccess(resourceAccessRequestContext(), requirement); err != nil {
-		t.Fatalf("RequireResourceAccess returned error: %v", err)
+	authorized, err := manager.Require(resourceAccessRequestContext(), requirement)
+	if err != nil {
+		t.Fatalf("Require returned error: %v", err)
+	}
+	if authorized.EffectivePermission != store.FeishuResourcePermissionWrite || authorized.GrantMode != store.FeishuResourceGrantModeAll ||
+		authorized.ChatID != "oc_chat" || authorized.CapabilitySubjectType != "openid" || authorized.CapabilitySubjectID != "ou_bot" {
+		t.Fatalf("authorized resource = %#v", authorized)
 	}
 	if authCalls != 1 {
 		t.Fatalf("live verification calls = %d, want 1", authCalls)
@@ -299,12 +359,12 @@ func TestResourceAccessManagerRequiresExactActorChatGrantAndInheritsWriteForRead
 	wrongActor := feishutools.WithActor(context.Background(), feishutools.Actor{OpenID: "ou_other"})
 	wrongActor = feishutools.WithChatContext(wrongActor, feishutools.ChatContext{ChatID: "oc_chat", IsGroup: true})
 	var required *feishutools.ResourceAuthorizationRequiredError
-	if err := manager.RequireResourceAccess(wrongActor, requirement); !errors.As(err, &required) {
+	if _, err := manager.Require(wrongActor, requirement); !errors.As(err, &required) {
 		t.Fatalf("wrong actor error = %v, want authorization required", err)
 	}
 	wrongChat := feishutools.WithActor(context.Background(), feishutools.Actor{OpenID: "ou_requester"})
 	wrongChat = feishutools.WithChatContext(wrongChat, feishutools.ChatContext{ChatID: "oc_other", IsGroup: true})
-	if err := manager.RequireResourceAccess(wrongChat, requirement); !errors.As(err, &required) {
+	if _, err := manager.Require(wrongChat, requirement); !errors.As(err, &required) {
 		t.Fatalf("wrong chat error = %v, want authorization required", err)
 	}
 	writeRequirement := requirement
@@ -318,11 +378,47 @@ func TestResourceAccessManagerRequiresExactActorChatGrantAndInheritsWriteForRead
 	}); err != nil {
 		t.Fatalf("seed read-only grant: %v", err)
 	}
-	if err := manager.RequireResourceAccess(resourceAccessRequestContext(), writeRequirement); !errors.As(err, &required) {
+	if _, err := manager.Require(resourceAccessRequestContext(), writeRequirement); !errors.As(err, &required) {
 		t.Fatalf("read-only grant write error = %v, want authorization required", err)
 	}
 	if authCalls != 1 {
 		t.Fatalf("scope mismatch unexpectedly reached live verification; calls=%d", authCalls)
+	}
+}
+
+func TestResourceAccessManagerRejectsExpiredOnceGrantWithoutRemoteCall(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("expired local grant unexpectedly called Feishu API: %s", r.URL.Path)
+	}))
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
+	baseNow := manager.currentTime()
+	if _, err := st.UpsertFeishuResourceGrant(store.FeishuResourceGrant{
+		AccountID:       "feishu:cli_test",
+		ActorType:       store.FeishuResourceGrantActorTypeOpenID,
+		ActorID:         "ou_requester",
+		ChatID:          "oc_chat",
+		ResourceType:    "docx",
+		ResourceToken:   "doxcn_expired_once",
+		Permission:      store.FeishuResourcePermissionWrite,
+		GrantMode:       store.FeishuResourceGrantModeOnce,
+		SourceRequestID: "req_expired_once",
+		State:           store.FeishuResourceGrantStateActive,
+		CreatedAt:       baseNow,
+		UpdatedAt:       baseNow,
+		ExpiresAt:       baseNow.Add(10 * time.Minute),
+	}); err != nil {
+		t.Fatalf("seed expired-on-next-check grant: %v", err)
+	}
+	manager.now = func() time.Time { return baseNow.Add(10 * time.Minute) }
+	requirement := feishutools.ResourceAccessRequirement{
+		ResourceType:  "docx",
+		ResourceToken: "doxcn_expired_once",
+		Permission:    feishutools.ResourcePermissionRead,
+	}
+	var required *feishutools.ResourceAuthorizationRequiredError
+	if _, err := manager.Require(resourceAccessRequestContext(), requirement); !errors.As(err, &required) {
+		t.Fatalf("expired once grant error = %v, want authorization required", err)
 	}
 }
 
@@ -361,7 +457,7 @@ func TestResourceAccessManagerRevokesStaleCapabilityAndGrant(t *testing.T) {
 		ResourceType: capability.ResourceType, ResourceToken: capability.ResourceToken, Permission: feishutools.ResourcePermissionWrite,
 	}
 	var required *feishutools.ResourceAuthorizationRequiredError
-	if err := manager.RequireResourceAccess(resourceAccessRequestContext(), requirement); !errors.As(err, &required) {
+	if _, err := manager.Require(resourceAccessRequestContext(), requirement); !errors.As(err, &required) {
 		t.Fatalf("stale capability error = %v, want authorization required", err)
 	}
 	if _, active, err := st.ActiveFeishuResourceCapability(capability.AccountID, capability.ResourceType, capability.ResourceToken, capability.SubjectType, capability.SubjectID, capability.Permission); err != nil || active {
@@ -574,6 +670,96 @@ func TestResourceAccessManagerUsesPersistedOAuthCredentialAfterApproval(t *testi
 	}
 }
 
+func TestResourceAccessManagerDrainsApprovedMutationAfterLifecycleCancellation(t *testing.T) {
+	const documentToken = "doxcn_shutdown_drain"
+	mutationStarted := make(chan struct{})
+	mutationCanceled := make(chan struct{})
+	releaseMutation := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseMutation) }) }
+	var startOnce sync.Once
+	var cancelOnce sync.Once
+	var permissionGranted atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open-apis/drive/v1/permissions/" + documentToken + "/members":
+			startOnce.Do(func() { close(mutationStarted) })
+			select {
+			case <-releaseMutation:
+				permissionGranted.Store(true)
+				writeResourceAccessJSON(t, w, map[string]any{"code": 0, "msg": "Success"})
+			case <-r.Context().Done():
+				cancelOnce.Do(func() { close(mutationCanceled) })
+			}
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+		case "/open-apis/drive/v1/permissions/" + documentToken + "/members/auth":
+			writeResourceAccessJSON(t, w, map[string]any{
+				"code": 0, "msg": "Success", "data": map[string]any{"auth_result": permissionGranted.Load()},
+			})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID: "cli_xxx", BaseURL: server.URL, CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	ownershipCtx, cancelOwnership := context.WithCancel(context.Background())
+	manager.runCtx = withFeishuRuntimeOwnership(lifecycleCtx, ownershipCtx)
+	defer cancelOwnership()
+	defer func() {
+		release()
+		manager.tasks.CloseAndWait()
+	}()
+	if _, err := manager.persistFeishuOAuthCredential(context.Background(), feishuOAuthIdentity{
+		OpenID: "ou_requester", UserID: "u_requester",
+	}, feishuOAuthTokenBundle{
+		AccessToken: "stored-user-access-token", AccessTokenExpiresIn: 2 * time.Hour,
+		RefreshToken: "stored-refresh-token", RefreshTokenExpiresIn: 30 * 24 * time.Hour,
+		Scopes: resourceAccessOAuthScope,
+	}); err != nil {
+		t.Fatalf("persistFeishuOAuthCredential returned error: %v", err)
+	}
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType: "docx", ResourceToken: documentToken, Permission: feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil || result.Status != feishutools.ResourceAccessStatusPending {
+		t.Fatalf("RequestAccess = %#v err=%v", result, err)
+	}
+	event := resourceAccessCardEvent(result.RequestID, "ou_requester", "oc_chat", "om_card")
+	event.Event.Action.Value["action"] = resourceAccessCardActionApproveOnce
+	response, err := manager.HandleCardAction(t.Context(), event)
+	if err != nil || response == nil || response.Toast == nil || response.Toast.Type != "success" {
+		t.Fatalf("approve response = %#v err=%v", response, err)
+	}
+	select {
+	case <-mutationStarted:
+	case <-time.After(time.Second):
+		t.Fatal("approved collaborator mutation did not start")
+	}
+	manager.tasks.CloseAdmission()
+	cancelLifecycle()
+	select {
+	case <-mutationCanceled:
+		t.Fatal("normal lifecycle cancellation interrupted an already-admitted resource mutation")
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	manager.tasks.Wait()
+	completed, err := st.GetFeishuResourceAccessRequest(result.RequestID, manager.account.ID)
+	if err != nil || completed.State != store.FeishuResourceAccessStateSucceeded {
+		t.Fatalf("resource request after orderly drain = %#v err=%v, want succeeded", completed, err)
+	}
+	_, updates, _ := sender.snapshot()
+	if len(updates) == 0 {
+		t.Fatal("drained resource approval did not publish its terminal card")
+	}
+}
+
 func TestResourceAccessManagerUpgradesExistingCollaboratorAfterApproval(t *testing.T) {
 	var createCalls, updateCalls, verifyCalls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -641,6 +827,380 @@ func TestResourceAccessManagerUpgradesExistingCollaboratorAfterApproval(t *testi
 	if completed.GrantMode != store.FeishuResourceGrantModeOnce || createCalls != 1 || updateCalls != 1 || verifyCalls != 2 {
 		t.Fatalf("completed upgraded request = %#v create=%d update=%d verify=%d", completed, createCalls, updateCalls, verifyCalls)
 	}
+}
+
+func TestResourceAccessManagerReconcilesLostCollaboratorMutationResponses(t *testing.T) {
+	tests := []struct {
+		name                 string
+		loseCreateReply      bool
+		loseFirstVerifyReply bool
+		wantUpdateCalls      int32
+		wantVerifyCalls      int32
+	}{
+		{name: "create response lost", loseCreateReply: true, wantUpdateCalls: 0, wantVerifyCalls: 1},
+		{name: "create and first verification responses lost", loseCreateReply: true, loseFirstVerifyReply: true, wantUpdateCalls: 0, wantVerifyCalls: 2},
+		{name: "update response lost", loseCreateReply: false, wantUpdateCalls: 1, wantVerifyCalls: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var createCalls atomic.Int32
+			var updateCalls atomic.Int32
+			var verifyCalls atomic.Int32
+			var permissionGranted atomic.Bool
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/open-apis/drive/v1/permissions/doxcn_ambiguous/members":
+					createCalls.Add(1)
+					if tt.loseCreateReply {
+						permissionGranted.Store(true)
+						closeHTTPResponseWithoutReply(t, w)
+						return
+					}
+					writeResourceAccessJSON(t, w, map[string]any{"code": 1063003, "msg": "Invalid operation"})
+				case "/open-apis/drive/v1/permissions/doxcn_ambiguous/members/auth":
+					verifyCall := verifyCalls.Add(1)
+					if tt.loseFirstVerifyReply && verifyCall == 1 {
+						closeHTTPResponseWithoutReply(t, w)
+						return
+					}
+					writeResourceAccessJSON(t, w, map[string]any{
+						"code": 0,
+						"msg":  "Success",
+						"data": map[string]any{"auth_result": permissionGranted.Load()},
+					})
+				case "/open-apis/drive/v1/permissions/doxcn_ambiguous/members/ou_bot":
+					updateCalls.Add(1)
+					permissionGranted.Store(true)
+					closeHTTPResponseWithoutReply(t, w)
+				case "/open-apis/auth/v3/tenant_access_token/internal":
+					writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+				default:
+					t.Fatalf("unexpected path: %s", r.URL.Path)
+				}
+			}))
+			defer server.Close()
+
+			manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+				ClientID:    "cli_xxx",
+				BaseURL:     server.URL,
+				CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+			})
+			if _, err := manager.persistFeishuOAuthCredential(context.Background(), feishuOAuthIdentity{
+				OpenID: "ou_requester", UserID: "u_requester",
+			}, feishuOAuthTokenBundle{
+				AccessToken: "stored-user-access-token", AccessTokenExpiresIn: 2 * time.Hour,
+				RefreshToken: "stored-refresh-token", RefreshTokenExpiresIn: 30 * 24 * time.Hour,
+				Scopes: resourceAccessOAuthScope,
+			}); err != nil {
+				t.Fatalf("persistFeishuOAuthCredential returned error: %v", err)
+			}
+			result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+				ResourceType: "docx", ResourceToken: "doxcn_ambiguous", Permission: feishutools.ResourcePermissionWrite,
+				OnceDurationMinutes: 30,
+			})
+			if err != nil || result.Status != feishutools.ResourceAccessStatusPending {
+				t.Fatalf("RequestAccess = %#v err=%v", result, err)
+			}
+			event := resourceAccessCardEvent(result.RequestID, "ou_requester", "oc_chat", "om_card")
+			event.Event.Action.Value["action"] = resourceAccessCardActionApproveOnce
+			if response, err := manager.HandleCardAction(context.Background(), event); err != nil || response == nil || response.Toast == nil || response.Toast.Type != "success" {
+				t.Fatalf("approve-once response = %#v err=%v", response, err)
+			}
+			completed := waitForResourceAccessCompletion(t, st, sender, result.RequestID)
+			if completed.State != store.FeishuResourceAccessStateSucceeded || completed.GrantSource != store.FeishuResourceGrantSourceNewlyGranted {
+				t.Fatalf("completed ambiguous mutation request = %#v", completed)
+			}
+			if got := createCalls.Load(); got != 1 {
+				t.Fatalf("create calls = %d, want 1", got)
+			}
+			if got := updateCalls.Load(); got != tt.wantUpdateCalls {
+				t.Fatalf("update calls = %d, want %d", got, tt.wantUpdateCalls)
+			}
+			if got := verifyCalls.Load(); got != tt.wantVerifyCalls {
+				t.Fatalf("verify calls = %d, want %d", got, tt.wantVerifyCalls)
+			}
+		})
+	}
+}
+
+func TestResourceAccessManagerRechecksCollaboratorAfterWriteVisibilityDelay(t *testing.T) {
+	var createCalls atomic.Int32
+	var updateCalls atomic.Int32
+	var verifyCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open-apis/drive/v1/permissions/doxcn_visibility_delay/members":
+			createCalls.Add(1)
+			writeResourceAccessJSON(t, w, map[string]any{"code": 0, "msg": "Success"})
+		case "/open-apis/drive/v1/permissions/doxcn_visibility_delay/members/auth":
+			visible := verifyCalls.Add(1) > 1
+			writeResourceAccessJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "Success",
+				"data": map[string]any{"auth_result": visible},
+			})
+		case "/open-apis/drive/v1/permissions/doxcn_visibility_delay/members/ou_bot":
+			updateCalls.Add(1)
+			writeResourceAccessJSON(t, w, map[string]any{"code": 0, "msg": "Success"})
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	if _, err := manager.persistFeishuOAuthCredential(context.Background(), feishuOAuthIdentity{
+		OpenID: "ou_requester", UserID: "u_requester",
+	}, feishuOAuthTokenBundle{
+		AccessToken: "stored-user-access-token", AccessTokenExpiresIn: 2 * time.Hour,
+		RefreshToken: "stored-refresh-token", RefreshTokenExpiresIn: 30 * 24 * time.Hour,
+		Scopes: resourceAccessOAuthScope,
+	}); err != nil {
+		t.Fatalf("persistFeishuOAuthCredential returned error: %v", err)
+	}
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType: "docx", ResourceToken: "doxcn_visibility_delay", Permission: feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil || result.Status != feishutools.ResourceAccessStatusPending {
+		t.Fatalf("RequestAccess = %#v err=%v", result, err)
+	}
+	event := resourceAccessCardEvent(result.RequestID, "ou_requester", "oc_chat", "om_card")
+	event.Event.Action.Value["action"] = resourceAccessCardActionApproveOnce
+	if response, err := manager.HandleCardAction(context.Background(), event); err != nil || response == nil || response.Toast == nil || response.Toast.Type != "success" {
+		t.Fatalf("approve-once response = %#v err=%v", response, err)
+	}
+	completed := waitForResourceAccessCompletion(t, st, sender, result.RequestID)
+	if completed.State != store.FeishuResourceAccessStateSucceeded {
+		t.Fatalf("completed visibility-delay request = %#v", completed)
+	}
+	if got := createCalls.Load(); got != 1 {
+		t.Fatalf("create calls = %d, want 1", got)
+	}
+	if got := updateCalls.Load(); got != 0 {
+		t.Fatalf("update calls = %d, want no mutation replay", got)
+	}
+	if got := verifyCalls.Load(); got != 2 {
+		t.Fatalf("verify calls = %d, want one initial check and one bounded recheck", got)
+	}
+}
+
+func TestResourceAccessManagerReconcilesCollaboratorMutationAfterCallerDeadline(t *testing.T) {
+	var verifyCalls atomic.Int32
+	var permissionGranted atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open-apis/drive/v1/permissions/doxcn_deadline/members":
+			permissionGranted.Store(true)
+			timer := time.NewTimer(100 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-r.Context().Done():
+			case <-timer.C:
+			}
+			closeHTTPResponseWithoutReply(t, w)
+		case "/open-apis/drive/v1/permissions/doxcn_deadline/members/auth":
+			verifyCalls.Add(1)
+			writeResourceAccessJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "Success",
+				"data": map[string]any{"auth_result": permissionGranted.Load()},
+			})
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
+	now := manager.currentTime()
+	request, err := st.CreateFeishuResourceAccessRequest(store.FeishuResourceAccessRequest{
+		AccountID: "feishu:cli_test", ActorOpenID: "ou_requester", ActorUserID: "u_requester",
+		ChatID: "oc_chat", SourceMessageID: "om_source", ResourceType: "docx", ResourceToken: "doxcn_deadline",
+		Permission: store.FeishuResourcePermissionWrite, OnceDurationMinutes: 30,
+		SubjectType: "openid", SubjectID: "ou_bot", CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("CreateFeishuResourceAccessRequest returned error: %v", err)
+	}
+	if err := st.SetFeishuResourceAccessCardMessageID(request.ID, request.AccountID, "om_card", now); err != nil {
+		t.Fatalf("SetFeishuResourceAccessCardMessageID returned error: %v", err)
+	}
+	request, err = st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, store.FeishuResourceGrantModeOnce, store.FeishuResourceAccessMatch{
+		ActorOpenID: request.ActorOpenID, ActorUserID: request.ActorUserID, ChatID: request.ChatID, CardMessageID: "om_card",
+	}, now)
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+
+	operationCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := manager.grantAndCompleteSelectedResourceAccess(operationCtx, request, "user-access-token"); err != nil {
+		t.Fatalf("grantAndCompleteSelectedResourceAccess returned error after ambiguous deadline: %v", err)
+	}
+	completed, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil || completed.State != store.FeishuResourceAccessStateSucceeded {
+		t.Fatalf("completed deadline request = %#v err=%v", completed, err)
+	}
+	if got := verifyCalls.Load(); got != 1 {
+		t.Fatalf("fresh verification calls = %d, want 1", got)
+	}
+}
+
+func TestResourceAccessManagerClaimsApprovedRequestBeforeCollaboratorMutation(t *testing.T) {
+	var createCalls atomic.Int32
+	secondCreate := make(chan struct{})
+	var closeSecond sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open-apis/drive/v1/permissions/doxcn_concurrent_claim/members":
+			call := createCalls.Add(1)
+			if call == 1 {
+				select {
+				case <-secondCreate:
+				case <-time.After(200 * time.Millisecond):
+				}
+			} else {
+				closeSecond.Do(func() { close(secondCreate) })
+			}
+			writeResourceAccessJSON(t, w, map[string]any{"code": 0, "msg": "Success"})
+		case "/open-apis/drive/v1/permissions/doxcn_concurrent_claim/members/auth":
+			writeResourceAccessJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "Success",
+				"data": map[string]any{"auth_result": true},
+			})
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	now := manager.currentTime()
+	if _, err := manager.persistFeishuOAuthCredential(context.Background(), feishuOAuthIdentity{
+		OpenID: "ou_requester", UserID: "u_requester",
+	}, feishuOAuthTokenBundle{
+		AccessToken: "stored-user-access-token", AccessTokenExpiresIn: 2 * time.Hour,
+		RefreshToken: "stored-refresh-token", RefreshTokenExpiresIn: 30 * 24 * time.Hour,
+		Scopes: resourceAccessOAuthScope,
+	}); err != nil {
+		t.Fatalf("persistFeishuOAuthCredential returned error: %v", err)
+	}
+	request, err := st.CreateFeishuResourceAccessRequest(store.FeishuResourceAccessRequest{
+		AccountID: "feishu:cli_test", ActorOpenID: "ou_requester", ActorUserID: "u_requester",
+		ChatID: "oc_chat", SourceMessageID: "om_source", ResourceType: "docx", ResourceToken: "doxcn_concurrent_claim",
+		Permission: store.FeishuResourcePermissionWrite, OnceDurationMinutes: 30,
+		SubjectType: "openid", SubjectID: "ou_bot", CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("CreateFeishuResourceAccessRequest returned error: %v", err)
+	}
+	if err := st.SetFeishuResourceAccessCardMessageID(request.ID, request.AccountID, "om_card", now); err != nil {
+		t.Fatalf("SetFeishuResourceAccessCardMessageID returned error: %v", err)
+	}
+	request, err = st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, store.FeishuResourceGrantModeOnce, store.FeishuResourceAccessMatch{
+		ActorOpenID: request.ActorOpenID, ActorUserID: request.ActorUserID, ChatID: request.ChatID, CardMessageID: "om_card",
+	}, now)
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			errs <- manager.completeApprovedResourceAccess(t.Context(), request)
+		}()
+	}
+	close(start)
+	for range 2 {
+		err := <-errs
+		if err != nil && !errors.Is(err, store.ErrFeishuResourceAccessResolved) {
+			t.Fatalf("completeApprovedResourceAccess returned unexpected error: %v", err)
+		}
+	}
+	if got := createCalls.Load(); got != 1 {
+		t.Fatalf("collaborator create calls = %d, want exactly one claimed mutation", got)
+	}
+}
+
+func TestResourceAccessManagerAttemptsTerminalCardBeforeMakingContinuationReady(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
+	now := manager.currentTime()
+	request, err := st.CreateFeishuResourceAccessRequest(store.FeishuResourceAccessRequest{
+		AccountID: "feishu:cli_test", ActorOpenID: "ou_requester", ActorUserID: "u_requester",
+		ChatID: "oc_chat", SourceMessageID: "om_source", ResourceType: "docx", ResourceToken: "doxcn_card_order",
+		Permission: store.FeishuResourcePermissionRead, OnceDurationMinutes: 30,
+		SubjectType: "openid", SubjectID: "ou_bot", CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("CreateFeishuResourceAccessRequest returned error: %v", err)
+	}
+	if err := st.SetFeishuResourceAccessCardMessageID(request.ID, request.AccountID, "om_card", now); err != nil {
+		t.Fatalf("SetFeishuResourceAccessCardMessageID returned error: %v", err)
+	}
+	request, err = st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, store.FeishuResourceGrantModeOnce, store.FeishuResourceAccessMatch{
+		ActorOpenID: request.ActorOpenID, ActorUserID: request.ActorUserID, ChatID: request.ChatID, CardMessageID: "om_card",
+	}, now)
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+	cardUpdatedBeforeResult := make(chan bool, 1)
+	manager.store = &observingResourceAccessResultStore{
+		resourceAccessStore: manager.store,
+		onStoreResult: func() {
+			_, updates, _ := sender.snapshot()
+			cardUpdatedBeforeResult <- len(updates) > 0
+		},
+	}
+	capability := store.FeishuResourceCapability{
+		AccountID: request.AccountID, ResourceType: request.ResourceType, ResourceToken: request.ResourceToken,
+		SubjectType: request.SubjectType, SubjectID: request.SubjectID, Permission: request.Permission,
+		SourceActorOpenID: request.ActorOpenID, SourceActorUserID: request.ActorUserID,
+		State: store.FeishuResourceCapabilityStateActive, CreatedAt: now, VerifiedAt: now,
+	}
+	if err := manager.completeSelectedResourceGrant(t.Context(), request, capability, store.FeishuResourceGrantSourceExistingGrant); err != nil {
+		t.Fatalf("completeSelectedResourceGrant returned error: %v", err)
+	}
+	select {
+	case updated := <-cardUpdatedBeforeResult:
+		if !updated {
+			t.Fatal("workflow continuation became ready before the terminal resource card update was attempted")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("resource workflow result was not persisted")
+	}
+}
+
+func closeHTTPResponseWithoutReply(t *testing.T, w http.ResponseWriter) {
+	t.Helper()
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		t.Fatal("test server does not support connection hijacking")
+	}
+	conn, _, err := hijacker.Hijack()
+	if err != nil {
+		t.Fatalf("hijack response: %v", err)
+	}
+	_ = conn.Close()
 }
 
 func TestResourceAccessManagerDoesNotReuseGrantWithoutActiveCapability(t *testing.T) {
@@ -769,6 +1329,10 @@ func TestResourceAccessOAuthCardURLHandoffGrantsWithoutListener(t *testing.T) {
 
 func TestResourceAccessOAuthCardCodeHandoffGrantsWithoutListener(t *testing.T) {
 	testResourceAccessOAuthCompletion(t, "card_code")
+}
+
+func TestResourceAccessOAuthCardCodeHandoffCompletesAfterRuntimeCancellation(t *testing.T) {
+	testResourceAccessOAuthCompletion(t, "card_code_shutdown")
 }
 
 func TestResourceAccessOAuthTokenErrorDoesNotExposeSupportInstructions(t *testing.T) {
@@ -932,7 +1496,7 @@ func TestResourceAccessOAuthRejectsLegacyPKCERequestBeforeTokenExchange(t *testi
 	if err != nil {
 		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
 	}
-	if err := st.PrepareFeishuResourceAccessOAuth(request.ID, request.AccountID, hashResourceAccessState(state), legacyVerifier, "openid", "ou_bot", now); err != nil {
+	if err := st.PrepareFeishuResourceAccessOAuth(request.ID, request.AccountID, hashResourceAccessState(state), "legacy-state-ciphertext", legacyVerifier, "openid", "ou_bot", now); err != nil {
 		t.Fatalf("PrepareFeishuResourceAccessOAuth returned error: %v", err)
 	}
 
@@ -958,6 +1522,75 @@ func TestResourceAccessOAuthRejectsLegacyPKCERequestBeforeTokenExchange(t *testi
 	}
 }
 
+func TestResourceAccessHTTPCallbackExpiresCardBeforeMakingContinuationReady(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("expired OAuth callback unexpectedly called Feishu API: %s", r.URL.Path)
+	}))
+	defer server.Close()
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType: "docx", ResourceToken: "doxcn_expired_http_callback", Permission: feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil || result.Status != feishutools.ResourceAccessStatusPending {
+		t.Fatalf("RequestAccess = %#v err=%v", result, err)
+	}
+	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
+	if err != nil {
+		t.Fatalf("load pending request: %v", err)
+	}
+	request, err = st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, store.FeishuResourceGrantModeOnce, store.FeishuResourceAccessMatch{
+		ActorOpenID: request.ActorOpenID, ActorUserID: request.ActorUserID, ChatID: request.ChatID, CardMessageID: request.CardMessageID,
+	}, manager.currentTime())
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+	if err := manager.prepareResourceAccessOAuthHandoff(t.Context(), request); err != nil {
+		t.Fatalf("prepareResourceAccessOAuthHandoff returned error: %v", err)
+	}
+	_, updatesBefore, _ := sender.snapshot()
+	if len(updatesBefore) == 0 {
+		t.Fatal("OAuth handoff card was not sent")
+	}
+	state := resourceAccessCardState(t, updatesBefore[len(updatesBefore)-1].text)
+	cardUpdatedBeforeResult := make(chan bool, 1)
+	baselineUpdates := len(updatesBefore)
+	manager.store = &observingResourceAccessResultStore{
+		resourceAccessStore: manager.store,
+		onStoreResult: func() {
+			_, updates, _ := sender.snapshot()
+			cardUpdatedBeforeResult <- len(updates) > baselineUpdates
+		},
+	}
+	manager.now = func() time.Time { return request.ExpiresAt }
+	recorder := httptest.NewRecorder()
+	callbackRequest := httptest.NewRequest(http.MethodGet, "/feishu/oauth/callback?code=unused&state="+url.QueryEscape(state), nil)
+	manager.HandleOAuthCallback(recorder, callbackRequest)
+	if recorder.Code != http.StatusGone {
+		t.Fatalf("expired OAuth callback status = %d body=%q", recorder.Code, recorder.Body.String())
+	}
+	select {
+	case updated := <-cardUpdatedBeforeResult:
+		if !updated {
+			t.Fatal("expired HTTP callback made the continuation ready before updating the original card")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expired HTTP callback did not persist a workflow result")
+	}
+	workflowResult, err := st.GetWorkflowResult(request.ID, request.AccountID)
+	if err != nil || workflowResult.State != store.WorkflowResultStateExpired {
+		t.Fatalf("expired HTTP callback workflow result = %#v err=%v", workflowResult, err)
+	}
+	_, updatesAfter, _ := sender.snapshot()
+	if len(updatesAfter) != baselineUpdates+1 || !strings.Contains(updatesAfter[len(updatesAfter)-1].text, "授权已过期") {
+		t.Fatalf("expired HTTP callback card updates = %#v", updatesAfter)
+	}
+}
+
 func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 	t.Helper()
 	logs := captureMonitorLogs(t)
@@ -966,6 +1599,11 @@ func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 	var tokenBody map[string]any
 	var permissionBody map[string]any
 	var userInfoCalls, permissionCalls, verifyCalls int
+	var tokenStarted, tokenRelease chan struct{}
+	if mode == "card_code_shutdown" {
+		tokenStarted = make(chan struct{})
+		tokenRelease = make(chan struct{})
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/oauth/v3/token":
@@ -976,6 +1614,10 @@ func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 			mu.Lock()
 			tokenBody = body
 			mu.Unlock()
+			if tokenStarted != nil {
+				close(tokenStarted)
+				<-tokenRelease
+			}
 			writeResourceAccessJSON(t, w, map[string]any{
 				"access_token":             "user-access-token",
 				"token_type":               "Bearer",
@@ -1039,6 +1681,13 @@ func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 		oauth.CallbackListenAddress = "127.0.0.1:0"
 	}
 	manager, st, sender := newTestResourceAccessManager(t, server, oauth)
+	var cancelRun context.CancelFunc
+	if mode == "card_code_shutdown" {
+		var runCtx context.Context
+		runCtx, cancelRun = context.WithCancel(context.Background())
+		manager.runCtx = runCtx
+		defer cancelRun()
+	}
 	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
 		ResourceType:        "docx",
 		ResourceToken:       "doxcn_external",
@@ -1062,7 +1711,7 @@ func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 	}
 	approvalAction := resourceAccessCardActionApproveOnce
 	wantGrantMode := store.FeishuResourceGrantModeOnce
-	if mode == "card_code" {
+	if mode == "card_code" || mode == "card_code_shutdown" {
 		approvalAction = resourceAccessCardActionApproveAll
 		wantGrantMode = store.FeishuResourceGrantModeAll
 	}
@@ -1117,15 +1766,25 @@ func testResourceAccessOAuthCompletion(t *testing.T, mode string) {
 		if err != nil || response == nil || response.Toast == nil || response.Toast.Type != "success" {
 			t.Fatalf("card URL handoff response = %#v err=%v", response, err)
 		}
-	case "card_code":
+	case "card_code", "card_code_shutdown":
 		response, err := manager.HandleCardAction(context.Background(), resourceAccessCardSubmitEvent(result.RequestID, "ou_requester", "oc_chat", "om_card", "auth-code"))
 		if err != nil || response == nil || response.Toast == nil || response.Toast.Type != "success" {
 			t.Fatalf("card code handoff response = %#v err=%v", response, err)
+		}
+		if mode == "card_code_shutdown" {
+			select {
+			case <-tokenStarted:
+			case <-time.After(time.Second):
+				t.Fatal("admitted OAuth handoff did not start token exchange")
+			}
+			cancelRun()
+			close(tokenRelease)
 		}
 	default:
 		t.Fatalf("unsupported OAuth completion test mode %q", mode)
 	}
 	completed := waitForResourceAccessCompletion(t, st, sender, result.RequestID)
+	manager.tasks.CloseAndWait()
 	mu.Lock()
 	gotTokenBody := tokenBody
 	gotPermissionBody := permissionBody
@@ -1282,6 +1941,24 @@ func TestResourceAccessManagerRejectsNonFeishuRedirectURL(t *testing.T) {
 	}
 }
 
+func TestResourceAccessManagerRejectsMarkdownBreakingFeishuURL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected request: %s", r.URL.Path)
+	}))
+	defer server.Close()
+	manager, _, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
+	_, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType:        "docx",
+		ResourceToken:       "doxcn_external",
+		ResourceURL:         "https://docs.feishu.cn/docx/doxcn_external) **伪造授权状态** (",
+		Permission:          feishutools.ResourcePermissionRead,
+		OnceDurationMinutes: 30,
+	})
+	if err == nil || !strings.Contains(err.Error(), "Feishu/Lark") {
+		t.Fatalf("RequestAccess error = %v, want markdown-breaking resource URL rejection", err)
+	}
+}
+
 func TestResourceAccessCardRejectIsBoundToRequester(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatalf("unexpected request: %s", r.URL.Path)
@@ -1328,7 +2005,7 @@ func TestResourceAccessCardRejectIsBoundToRequester(t *testing.T) {
 func TestResourceAccessRecoveryReconcilesExpiredWorkflowResult(t *testing.T) {
 	server := httptest.NewServer(http.NotFoundHandler())
 	defer server.Close()
-	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
 		ClientID:    "cli_xxx",
 		BaseURL:     server.URL,
 		CallbackURL: "https://oauth.wulongxin.com/feishu/oauth/callback",
@@ -1345,9 +2022,25 @@ func TestResourceAccessRecoveryReconcilesExpiredWorkflowResult(t *testing.T) {
 		t.Fatalf("RequestAccess returned error: %v", err)
 	}
 	manager.now = func() time.Time { return result.ExpiresAt }
+	cardUpdatedBeforeResult := make(chan bool, 1)
+	manager.store = &observingResourceAccessResultStore{
+		resourceAccessStore: manager.store,
+		onStoreResult: func() {
+			_, updates, _ := sender.snapshot()
+			cardUpdatedBeforeResult <- len(updates) > 0
+		},
+	}
 
 	if err := manager.recoverPersistedRequests(t.Context()); err != nil {
 		t.Fatalf("recoverPersistedRequests returned error: %v", err)
+	}
+	select {
+	case updated := <-cardUpdatedBeforeResult:
+		if !updated {
+			t.Fatal("recovery made the continuation ready before updating the expired resource card")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recovery did not persist the expired resource result")
 	}
 	workflowResult, err := st.GetWorkflowResult(result.RequestID, "feishu:cli_test")
 	if err != nil || workflowResult.State != store.WorkflowResultStateExpired || !strings.Contains(string(workflowResult.Payload), `"status":"expired"`) {
@@ -1356,6 +2049,774 @@ func TestResourceAccessRecoveryReconcilesExpiredWorkflowResult(t *testing.T) {
 	continuation, err := st.GetWorkflowContinuation(result.RequestID, "feishu:cli_test")
 	if err != nil || continuation.State != store.WorkflowContinuationStateWaiting {
 		t.Fatalf("reconciled continuation = %#v err=%v", continuation, err)
+	}
+	_, updates, _ := sender.snapshot()
+	if len(updates) == 0 || !strings.Contains(updates[len(updates)-1].text, "授权已过期") {
+		t.Fatalf("recovered resource card updates = %#v", updates)
+	}
+}
+
+func TestResourceAccessShutdownRejectsApprovalBeforeRecordingDecision(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://oauth.wulongxin.com/feishu/oauth/callback",
+	})
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType:        "docx",
+		ResourceToken:       "doxcn_shutdown_approval",
+		Permission:          feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil {
+		t.Fatalf("RequestAccess returned error: %v", err)
+	}
+	manager.tasks.CloseAndWait()
+	event := resourceAccessCardEvent(result.RequestID, "ou_requester", "oc_chat", "om_card")
+	event.Event.Action.Value["action"] = resourceAccessCardActionApproveOnce
+	response, err := manager.HandleCardAction(t.Context(), event)
+	if err != nil {
+		t.Fatalf("HandleCardAction returned error: %v", err)
+	}
+	if response == nil || response.Toast == nil || response.Toast.Type != "error" {
+		t.Fatalf("response = %#v, want shutdown error toast", response)
+	}
+	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, manager.account.ID)
+	if err != nil {
+		t.Fatalf("GetFeishuResourceAccessRequest returned error: %v", err)
+	}
+	if request.State != store.FeishuResourceAccessStatePending || request.GrantMode != "" || !request.DecisionAt.IsZero() {
+		t.Fatalf("resource request after rejected shutdown approval = %#v, want undecided pending request", request)
+	}
+}
+
+func TestResourceAccessCanceledRuntimeRejectsApprovalBeforeRecordingDecision(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://oauth.wulongxin.com/feishu/oauth/callback",
+	})
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType:        "docx",
+		ResourceToken:       "doxcn_canceled_runtime_approval",
+		Permission:          feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil {
+		t.Fatalf("RequestAccess returned error: %v", err)
+	}
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	manager.runCtx = runCtx
+	cancelRun()
+	event := resourceAccessCardEvent(result.RequestID, "ou_requester", "oc_chat", "om_card")
+	event.Event.Action.Value["action"] = resourceAccessCardActionApproveOnce
+	response, err := manager.HandleCardAction(t.Context(), event)
+	if err != nil {
+		t.Fatalf("HandleCardAction returned error: %v", err)
+	}
+	if response == nil || response.Toast == nil || response.Toast.Type != "error" {
+		manager.tasks.CloseAndWait()
+		t.Fatalf("response = %#v, want canceled-runtime error toast", response)
+	}
+	manager.tasks.CloseAndWait()
+	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, manager.account.ID)
+	if err != nil {
+		t.Fatalf("GetFeishuResourceAccessRequest returned error: %v", err)
+	}
+	if request.State != store.FeishuResourceAccessStatePending || request.GrantMode != "" || !request.DecisionAt.IsZero() {
+		t.Fatalf("resource request after canceled-runtime approval = %#v, want undecided pending request", request)
+	}
+}
+
+func TestResourceAccessShutdownRejectsOAuthHandoffBeforeConsumingCode(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://oauth.wulongxin.com/feishu/oauth/callback",
+	})
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType:        "docx",
+		ResourceToken:       "doxcn_shutdown_oauth",
+		Permission:          feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil {
+		t.Fatalf("RequestAccess returned error: %v", err)
+	}
+	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, manager.account.ID)
+	if err != nil {
+		t.Fatalf("load pending resource request: %v", err)
+	}
+	request, err = st.ApproveFeishuResourceAccessRequest(
+		request.ID,
+		request.AccountID,
+		store.FeishuResourceGrantModeOnce,
+		store.FeishuResourceAccessMatch{
+			ActorOpenID:   request.ActorOpenID,
+			ActorUserID:   request.ActorUserID,
+			ChatID:        request.ChatID,
+			CardMessageID: request.CardMessageID,
+		},
+		manager.currentTime(),
+	)
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+	if err := manager.prepareResourceAccessOAuthHandoff(t.Context(), request); err != nil {
+		t.Fatalf("prepareResourceAccessOAuthHandoff returned error: %v", err)
+	}
+	prepared, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil || prepared.OAuthStateHash == "" {
+		t.Fatalf("prepared OAuth request = %#v err=%v", prepared, err)
+	}
+	manager.tasks.CloseAndWait()
+
+	response, err := manager.HandleCardAction(t.Context(), resourceAccessCardSubmitEvent(
+		request.ID,
+		"ou_requester",
+		"oc_chat",
+		"om_card",
+		"authorization-code",
+	))
+	if err != nil {
+		t.Fatalf("HandleCardAction returned error: %v", err)
+	}
+	if response == nil || response.Toast == nil || response.Toast.Type != "error" {
+		t.Fatalf("response = %#v, want shutdown error toast", response)
+	}
+	stillPending, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil {
+		t.Fatalf("reload OAuth request: %v", err)
+	}
+	if stillPending.State != store.FeishuResourceAccessStatePending || stillPending.OAuthStateHash != prepared.OAuthStateHash {
+		t.Fatalf("OAuth request after rejected shutdown handoff = %#v, want same actionable pending state", stillPending)
+	}
+}
+
+func TestResourceAccessShutdownRejectsHTTPCallbackBeforeConsumingState(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:              "cli_xxx",
+		BaseURL:               server.URL,
+		CallbackURL:           "https://oauth.wulongxin.com/feishu/oauth/callback",
+		CallbackListenAddress: "127.0.0.1:0",
+	})
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType:        "docx",
+		ResourceToken:       "doxcn_shutdown_http_oauth",
+		Permission:          feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil {
+		t.Fatalf("RequestAccess returned error: %v", err)
+	}
+	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, manager.account.ID)
+	if err != nil {
+		t.Fatalf("load pending resource request: %v", err)
+	}
+	request, err = st.ApproveFeishuResourceAccessRequest(
+		request.ID,
+		request.AccountID,
+		store.FeishuResourceGrantModeOnce,
+		store.FeishuResourceAccessMatch{
+			ActorOpenID:   request.ActorOpenID,
+			ActorUserID:   request.ActorUserID,
+			ChatID:        request.ChatID,
+			CardMessageID: request.CardMessageID,
+		},
+		manager.currentTime(),
+	)
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+	if err := manager.prepareResourceAccessOAuthHandoff(t.Context(), request); err != nil {
+		t.Fatalf("prepareResourceAccessOAuthHandoff returned error: %v", err)
+	}
+	_, updates, _ := sender.snapshot()
+	if len(updates) == 0 {
+		t.Fatal("OAuth handoff card was not updated")
+	}
+	state := resourceAccessCardState(t, updates[len(updates)-1].text)
+	prepared, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil || prepared.OAuthStateHash == "" {
+		t.Fatalf("prepared OAuth request = %#v err=%v", prepared, err)
+	}
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	manager.runCtx = runCtx
+	cancelRun()
+
+	recorder := httptest.NewRecorder()
+	callbackRequest := httptest.NewRequest(
+		http.MethodGet,
+		"/feishu/oauth/callback?code=authorization-code&state="+url.QueryEscape(state),
+		nil,
+	)
+	manager.HandleOAuthCallback(recorder, callbackRequest)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("callback status = %d body=%q, want 503", recorder.Code, recorder.Body.String())
+	}
+	stillPending, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil {
+		t.Fatalf("reload OAuth request: %v", err)
+	}
+	if stillPending.State != store.FeishuResourceAccessStatePending || stillPending.OAuthStateHash != prepared.OAuthStateHash {
+		t.Fatalf("OAuth request after rejected HTTP callback = %#v, want same actionable pending state", stillPending)
+	}
+}
+
+func TestResourceAccessRecoverySharesTerminalCardTimeoutBudget(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://oauth.wulongxin.com/feishu/oauth/callback",
+	})
+	manager.cardUpdateTimeout = 15 * time.Millisecond
+	sender.updateCardFunc = func(ctx context.Context, _, _ string) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	request := func(token string) feishutools.ResourceAccessResult {
+		result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+			ResourceType:        "docx",
+			ResourceToken:       token,
+			Permission:          feishutools.ResourcePermissionWrite,
+			OnceDurationMinutes: 30,
+		})
+		if err != nil {
+			t.Fatalf("RequestAccess(%s) returned error: %v", token, err)
+		}
+		return result
+	}
+	first := request("doxcn_recovery_budget_1")
+	second := request("doxcn_recovery_budget_2")
+	manager.now = func() time.Time { return first.ExpiresAt }
+
+	started := time.Now()
+	if err := manager.recoverPersistedRequests(t.Context()); err != nil {
+		t.Fatalf("recoverPersistedRequests returned error: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("recovery exceeded one shared card timeout budget: %s", elapsed)
+	}
+	_, updates, _ := sender.snapshot()
+	if len(updates) != 1 {
+		t.Fatalf("terminal card update attempts = %d, want one attempt before the shared context expires", len(updates))
+	}
+	for _, requestID := range []string{first.RequestID, second.RequestID} {
+		workflowResult, err := st.GetWorkflowResult(requestID, "feishu:cli_test")
+		if err != nil || workflowResult.State != store.WorkflowResultStateExpired {
+			t.Fatalf("workflow result for %s = %#v err=%v", requestID, workflowResult, err)
+		}
+	}
+}
+
+func TestResourceAccessRecoveryKeepsPendingRequestOnRuntimeCancellationBeforeMutationClaim(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://oauth.wulongxin.com/feishu/oauth/callback",
+	})
+	now := manager.currentTime()
+	if _, err := st.UpsertFeishuResourceCapability(store.FeishuResourceCapability{
+		AccountID:         manager.account.ID,
+		ResourceType:      "docx",
+		ResourceToken:     "doxcn_shutdown_recovery",
+		SubjectType:       "openid",
+		SubjectID:         manager.botOpenID,
+		Permission:        store.FeishuResourcePermissionWrite,
+		SourceActorOpenID: "ou_requester",
+		SourceRequestID:   "req_capability",
+		State:             store.FeishuResourceCapabilityStateActive,
+		CreatedAt:         now,
+		VerifiedAt:        now,
+	}); err != nil {
+		t.Fatalf("UpsertFeishuResourceCapability returned error: %v", err)
+	}
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType:        "docx",
+		ResourceToken:       "doxcn_shutdown_recovery",
+		Permission:          feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil {
+		t.Fatalf("RequestAccess returned error: %v", err)
+	}
+	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, manager.account.ID)
+	if err != nil {
+		t.Fatalf("load pending resource request: %v", err)
+	}
+	request, err = st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, store.FeishuResourceGrantModeOnce, store.FeishuResourceAccessMatch{
+		ActorOpenID:   request.ActorOpenID,
+		ActorUserID:   request.ActorUserID,
+		ChatID:        request.ChatID,
+		CardMessageID: request.CardMessageID,
+	}, now)
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	resumed, err := manager.recoverApprovedPendingResourceAccess(canceledCtx, now)
+	if resumed != 0 || !errors.Is(err, context.Canceled) {
+		t.Fatalf("recoverApprovedPendingResourceAccess resumed=%d err=%v, want canceled without completion", resumed, err)
+	}
+	stored, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil || stored.State != store.FeishuResourceAccessStatePending {
+		t.Fatalf("request after canceled recovery = %#v err=%v, want pending", stored, err)
+	}
+	if workflowResult, err := st.GetWorkflowResult(request.ID, request.AccountID); !errors.Is(err, store.ErrWorkflowResultNotFound) {
+		t.Fatalf("workflow result after canceled recovery = %#v err=%v, want none", workflowResult, err)
+	}
+}
+
+func TestResourceAccessCardCompletionKeepsPendingRequestOnOwnershipLossBeforeMutationClaim(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://oauth.wulongxin.com/feishu/oauth/callback",
+	})
+	now := manager.currentTime()
+	if _, err := st.UpsertFeishuResourceCapability(store.FeishuResourceCapability{
+		AccountID:         manager.account.ID,
+		ResourceType:      "docx",
+		ResourceToken:     "doxcn_shutdown_callback",
+		SubjectType:       "openid",
+		SubjectID:         manager.botOpenID,
+		Permission:        store.FeishuResourcePermissionWrite,
+		SourceActorOpenID: "ou_requester",
+		SourceRequestID:   "req_capability",
+		State:             store.FeishuResourceCapabilityStateActive,
+		CreatedAt:         now,
+		VerifiedAt:        now,
+	}); err != nil {
+		t.Fatalf("UpsertFeishuResourceCapability returned error: %v", err)
+	}
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType:        "docx",
+		ResourceToken:       "doxcn_shutdown_callback",
+		Permission:          feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil {
+		t.Fatalf("RequestAccess returned error: %v", err)
+	}
+	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, manager.account.ID)
+	if err != nil {
+		t.Fatalf("load pending resource request: %v", err)
+	}
+	request, err = st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, store.FeishuResourceGrantModeOnce, store.FeishuResourceAccessMatch{
+		ActorOpenID:   request.ActorOpenID,
+		ActorUserID:   request.ActorUserID,
+		ChatID:        request.ChatID,
+		CardMessageID: request.CardMessageID,
+	}, now)
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	defer cancelLifecycle()
+	ownershipCtx, cancelOwnership := context.WithCancel(context.Background())
+	cancelOwnership()
+	manager.runCtx = withFeishuRuntimeOwnership(lifecycleCtx, ownershipCtx)
+
+	manager.completeApprovedResourceAccessFromCard(request)
+
+	stored, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil || stored.State != store.FeishuResourceAccessStatePending {
+		t.Fatalf("request after canceled card completion = %#v err=%v, want pending", stored, err)
+	}
+	if workflowResult, err := st.GetWorkflowResult(request.ID, request.AccountID); !errors.Is(err, store.ErrWorkflowResultNotFound) {
+		t.Fatalf("workflow result after canceled card completion = %#v err=%v, want none", workflowResult, err)
+	}
+}
+
+func TestResourceAccessRecoveryFailsClaimedMutationWithoutRemoteReplay(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+		case r.URL.Path == "/open-apis/drive/v1/permissions/doxcn_interrupted_mutation/members/auth":
+			writeResourceAccessJSON(t, w, map[string]any{"code": 0, "msg": "Success", "data": map[string]any{"auth_result": false}})
+		case strings.Contains(r.URL.Path, "/members"):
+			t.Fatalf("recovery replayed an interrupted collaborator mutation: %s", r.URL.Path)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType: "docx", ResourceToken: "doxcn_interrupted_mutation", Permission: feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil || result.Status != feishutools.ResourceAccessStatusPending {
+		t.Fatalf("RequestAccess = %#v err=%v", result, err)
+	}
+	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
+	if err != nil {
+		t.Fatalf("load pending request: %v", err)
+	}
+	request, err = st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, store.FeishuResourceGrantModeOnce, store.FeishuResourceAccessMatch{
+		ActorOpenID: request.ActorOpenID, ActorUserID: request.ActorUserID, ChatID: request.ChatID, CardMessageID: request.CardMessageID,
+	}, manager.currentTime())
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+	claimed, err := st.ClaimFeishuResourceAccessExecution(request.ID, request.AccountID, manager.currentTime())
+	if err != nil || claimed.State != store.FeishuResourceAccessStateExecuting {
+		t.Fatalf("ClaimFeishuResourceAccessExecution = %#v err=%v", claimed, err)
+	}
+
+	if err := manager.recoverPersistedRequests(t.Context()); err != nil {
+		t.Fatalf("recoverPersistedRequests returned error: %v", err)
+	}
+	failed, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil || failed.State != store.FeishuResourceAccessStateFailed {
+		t.Fatalf("interrupted mutation request = %#v err=%v", failed, err)
+	}
+	workflowResult, err := st.GetWorkflowResult(request.ID, request.AccountID)
+	if err != nil || workflowResult.State != store.WorkflowResultStateFailed {
+		t.Fatalf("interrupted mutation workflow result = %#v err=%v", workflowResult, err)
+	}
+	_, updates, _ := sender.snapshot()
+	if len(updates) == 0 || !strings.Contains(updates[len(updates)-1].text, "资源授权未完成") {
+		t.Fatalf("interrupted mutation card updates = %#v", updates)
+	}
+}
+
+func TestResourceAccessRecoveryAdoptsVerifiedInterruptedMutationWithoutRemoteReplay(t *testing.T) {
+	var verifyCalls, mutationCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+		case r.URL.Path == "/open-apis/drive/v1/permissions/doxcn_interrupted_success/members/auth":
+			verifyCalls++
+			writeResourceAccessJSON(t, w, map[string]any{"code": 0, "msg": "Success", "data": map[string]any{"auth_result": true}})
+		case strings.Contains(r.URL.Path, "/members"):
+			mutationCalls++
+			t.Fatalf("recovery replayed an interrupted collaborator mutation: %s", r.URL.Path)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType: "docx", ResourceToken: "doxcn_interrupted_success", Permission: feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil || result.Status != feishutools.ResourceAccessStatusPending {
+		t.Fatalf("RequestAccess = %#v err=%v", result, err)
+	}
+	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
+	if err != nil {
+		t.Fatalf("load pending request: %v", err)
+	}
+	request, err = st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, store.FeishuResourceGrantModeOnce, store.FeishuResourceAccessMatch{
+		ActorOpenID: request.ActorOpenID, ActorUserID: request.ActorUserID, ChatID: request.ChatID, CardMessageID: request.CardMessageID,
+	}, manager.currentTime())
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+	claimed, err := st.ClaimFeishuResourceAccessExecution(request.ID, request.AccountID, manager.currentTime())
+	if err != nil || claimed.State != store.FeishuResourceAccessStateExecuting {
+		t.Fatalf("ClaimFeishuResourceAccessExecution = %#v err=%v", claimed, err)
+	}
+
+	if err := manager.recoverPersistedRequests(t.Context()); err != nil {
+		t.Fatalf("recoverPersistedRequests returned error: %v", err)
+	}
+	recovered, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil || recovered.State != store.FeishuResourceAccessStateSucceeded {
+		t.Fatalf("recovered interrupted mutation request = %#v err=%v, want succeeded", recovered, err)
+	}
+	workflowResult, err := st.GetWorkflowResult(request.ID, request.AccountID)
+	if err != nil || workflowResult.State != store.WorkflowResultStateSucceeded {
+		t.Fatalf("recovered interrupted mutation workflow result = %#v err=%v", workflowResult, err)
+	}
+	if verifyCalls == 0 || mutationCalls != 0 {
+		t.Fatalf("recovery verify_calls=%d mutation_calls=%d, want verification without mutation replay", verifyCalls, mutationCalls)
+	}
+}
+
+func TestResourceAccessManagerPreservesVerifiedRemoteGrantWhenLocalCompletionFails(t *testing.T) {
+	tests := []struct {
+		name   string
+		finish func(*resourceAccessManager, store.FeishuResourceAccessRequest, error)
+	}{
+		{
+			name: "operation approval failure path",
+			finish: func(manager *resourceAccessManager, request store.FeishuResourceAccessRequest, err error) {
+				manager.finishResourceAccessFailure(t.Context(), request, err, "资源授权失败", "不应显示为确定失败")
+			},
+		},
+		{
+			name: "OAuth failure path",
+			finish: func(manager *resourceAccessManager, request store.FeishuResourceAccessRequest, err error) {
+				manager.finishOAuthFailure(t.Context(), request, err, "授予权限失败", "不应显示为确定失败")
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			const documentToken = "doxcn_local_completion_failure"
+			var mutationCalls atomic.Int32
+			var verifyCalls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/open-apis/auth/v3/tenant_access_token/internal":
+					writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+				case "/open-apis/drive/v1/permissions/" + documentToken + "/members":
+					mutationCalls.Add(1)
+					writeResourceAccessJSON(t, w, map[string]any{"code": 0, "msg": "Success"})
+				case "/open-apis/drive/v1/permissions/" + documentToken + "/members/auth":
+					verifyCalls.Add(1)
+					writeResourceAccessJSON(t, w, map[string]any{"code": 0, "msg": "Success", "data": map[string]any{"auth_result": true}})
+				default:
+					t.Fatalf("unexpected path: %s", r.URL.Path)
+				}
+			}))
+			defer server.Close()
+
+			manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+				ClientID:    "cli_xxx",
+				BaseURL:     server.URL,
+				CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+			})
+			result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+				ResourceType: "docx", ResourceToken: documentToken, Permission: feishutools.ResourcePermissionWrite,
+				OnceDurationMinutes: 30,
+			})
+			if err != nil || result.Status != feishutools.ResourceAccessStatusPending {
+				t.Fatalf("RequestAccess = %#v err=%v", result, err)
+			}
+			request, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
+			if err != nil {
+				t.Fatalf("load pending request: %v", err)
+			}
+			request, err = st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, store.FeishuResourceGrantModeOnce, store.FeishuResourceAccessMatch{
+				ActorOpenID: request.ActorOpenID, ActorUserID: request.ActorUserID, ChatID: request.ChatID, CardMessageID: request.CardMessageID,
+			}, manager.currentTime())
+			if err != nil {
+				t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+			}
+			request, err = st.ClaimFeishuResourceAccessExecution(request.ID, request.AccountID, manager.currentTime())
+			if err != nil || request.State != store.FeishuResourceAccessStateExecuting {
+				t.Fatalf("ClaimFeishuResourceAccessExecution = %#v err=%v", request, err)
+			}
+
+			manager.store = &failingResourceAccessCompletionStore{
+				resourceAccessStore: manager.store,
+				err:                 errors.New("injected local completion failure"),
+			}
+			completionErr := manager.grantAndCompleteSelectedResourceAccess(t.Context(), request, "user-access-token")
+			if !errors.Is(completionErr, errFeishuResourceAccessCompletionDeferred) {
+				t.Fatalf("grantAndCompleteSelectedResourceAccess error = %v, want completion deferred", completionErr)
+			}
+			tt.finish(manager, request, completionErr)
+
+			preserved, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+			if err != nil || preserved.State != store.FeishuResourceAccessStateExecuting {
+				t.Fatalf("request after local completion failure = %#v err=%v, want executing for recovery", preserved, err)
+			}
+			workflow, err := st.GetWorkflowRequest(request.ID, request.AccountID)
+			if err != nil || workflow.State != store.WorkflowRequestStateExecuting {
+				t.Fatalf("workflow after local completion failure = %#v err=%v, want executing", workflow, err)
+			}
+			if result, err := st.GetWorkflowResult(request.ID, request.AccountID); !errors.Is(err, store.ErrWorkflowResultNotFound) {
+				t.Fatalf("workflow result after local completion failure = %#v err=%v, want none", result, err)
+			}
+			_, updates, _ := sender.snapshot()
+			if len(updates) != 0 {
+				t.Fatalf("terminal card updates after local completion failure = %#v, want none", updates)
+			}
+			if mutationCalls.Load() != 1 || verifyCalls.Load() != 1 {
+				t.Fatalf("mutation_calls=%d verify_calls=%d, want verified remote success before local failure", mutationCalls.Load(), verifyCalls.Load())
+			}
+
+			manager.store = st
+			recoveredCount, failedCount, err := manager.resourceAccessRecoveryService().recoverExecutingResourceAccess(t.Context(), []store.FeishuResourceAccessRequest{preserved})
+			if err != nil || recoveredCount != 1 || failedCount != 0 {
+				t.Fatalf("recoverExecutingResourceAccess = recovered=%d failed=%d err=%v", recoveredCount, failedCount, err)
+			}
+			recovered, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+			if err != nil || recovered.State != store.FeishuResourceAccessStateSucceeded {
+				t.Fatalf("recovered request = %#v err=%v, want succeeded", recovered, err)
+			}
+			if mutationCalls.Load() != 1 || verifyCalls.Load() != 2 {
+				t.Fatalf("post-recovery mutation_calls=%d verify_calls=%d, want read-only verification without mutation replay", mutationCalls.Load(), verifyCalls.Load())
+			}
+		})
+	}
+}
+
+func TestResourceAccessManagerLeaseOwnershipLossPreservesVerifiedMutationForRecovery(t *testing.T) {
+	const documentToken = "doxcn_ownership_lost_mutation"
+	mutationStarted := make(chan struct{})
+	releaseMutation := make(chan struct{})
+	var startOnce sync.Once
+	var mutationCalls atomic.Int32
+	var verifyCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+		case "/open-apis/drive/v1/permissions/" + documentToken + "/members":
+			mutationCalls.Add(1)
+			startOnce.Do(func() { close(mutationStarted) })
+			<-releaseMutation
+			closeHTTPResponseWithoutReply(t, w)
+		case "/open-apis/drive/v1/permissions/" + documentToken + "/members/auth":
+			verifyCalls.Add(1)
+			writeResourceAccessJSON(t, w, map[string]any{"code": 0, "msg": "Success", "data": map[string]any{"auth_result": true}})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	defer cancelLifecycle()
+	ownershipCtx, cancelOwnership := context.WithCancel(context.Background())
+	manager.runCtx = withFeishuRuntimeOwnership(lifecycleCtx, ownershipCtx)
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType: "docx", ResourceToken: documentToken, Permission: feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil || result.Status != feishutools.ResourceAccessStatusPending {
+		t.Fatalf("RequestAccess = %#v err=%v", result, err)
+	}
+	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
+	if err != nil {
+		t.Fatalf("load pending request: %v", err)
+	}
+	request, err = st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, store.FeishuResourceGrantModeOnce, store.FeishuResourceAccessMatch{
+		ActorOpenID: request.ActorOpenID, ActorUserID: request.ActorUserID, ChatID: request.ChatID, CardMessageID: request.CardMessageID,
+	}, manager.currentTime())
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+	request, err = st.ClaimFeishuResourceAccessExecution(request.ID, request.AccountID, manager.currentTime())
+	if err != nil || request.State != store.FeishuResourceAccessStateExecuting {
+		t.Fatalf("ClaimFeishuResourceAccessExecution = %#v err=%v", request, err)
+	}
+
+	drainCtx, cancelDrain := feishuRuntimeDrainContext(manager.baseContext())
+	defer cancelDrain()
+	completionErrCh := make(chan error, 1)
+	go func() {
+		completionErrCh <- manager.grantAndCompleteSelectedResourceAccess(drainCtx, request, "user-access-token")
+	}()
+	select {
+	case <-mutationStarted:
+	case <-time.After(time.Second):
+		t.Fatal("collaborator mutation did not start")
+	}
+	cancelOwnership()
+	close(releaseMutation)
+	completionErr := <-completionErrCh
+	if !errors.Is(completionErr, errFeishuResourceAccessOwnershipLost) {
+		t.Fatalf("grant after ownership loss error = %v, want ownership-lost recovery", completionErr)
+	}
+	manager.finishResourceAccessFailure(t.Context(), request, completionErr, "资源授权失败", "不应显示为确定失败")
+
+	preserved, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil || preserved.State != store.FeishuResourceAccessStateExecuting {
+		t.Fatalf("request after lease ownership loss = %#v err=%v, want executing", preserved, err)
+	}
+	if workflowResult, err := st.GetWorkflowResult(request.ID, request.AccountID); !errors.Is(err, store.ErrWorkflowResultNotFound) {
+		t.Fatalf("workflow result after lease ownership loss = %#v err=%v, want none", workflowResult, err)
+	}
+	_, updates, _ := sender.snapshot()
+	if len(updates) != 0 || mutationCalls.Load() != 1 || verifyCalls.Load() != 0 {
+		t.Fatalf("updates=%#v mutation_calls=%d verify_calls=%d, want immediate ownership fencing and no terminal card", updates, mutationCalls.Load(), verifyCalls.Load())
+	}
+}
+
+func TestResourceAccessRecoveryPreservesInterruptedMutationWhenVerificationFails(t *testing.T) {
+	var mutationCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+		case r.URL.Path == "/open-apis/drive/v1/permissions/doxcn_interrupted_unknown/members/auth":
+			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+		case strings.Contains(r.URL.Path, "/members"):
+			mutationCalls++
+			t.Fatalf("recovery replayed an interrupted collaborator mutation: %s", r.URL.Path)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType: "docx", ResourceToken: "doxcn_interrupted_unknown", Permission: feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil || result.Status != feishutools.ResourceAccessStatusPending {
+		t.Fatalf("RequestAccess = %#v err=%v", result, err)
+	}
+	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
+	if err != nil {
+		t.Fatalf("load pending request: %v", err)
+	}
+	request, err = st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, store.FeishuResourceGrantModeOnce, store.FeishuResourceAccessMatch{
+		ActorOpenID: request.ActorOpenID, ActorUserID: request.ActorUserID, ChatID: request.ChatID, CardMessageID: request.CardMessageID,
+	}, manager.currentTime())
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+	claimed, err := st.ClaimFeishuResourceAccessExecution(request.ID, request.AccountID, manager.currentTime())
+	if err != nil || claimed.State != store.FeishuResourceAccessStateExecuting {
+		t.Fatalf("ClaimFeishuResourceAccessExecution = %#v err=%v", claimed, err)
+	}
+
+	if err := manager.recoverPersistedRequests(t.Context()); err == nil || !strings.Contains(err.Error(), "verify interrupted feishu resource access") {
+		t.Fatalf("recoverPersistedRequests error = %v, want verification failure", err)
+	}
+	preserved, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil || preserved.State != store.FeishuResourceAccessStateExecuting {
+		t.Fatalf("request after inconclusive recovery = %#v err=%v, want executing", preserved, err)
+	}
+	if workflowResult, err := st.GetWorkflowResult(request.ID, request.AccountID); !errors.Is(err, store.ErrWorkflowResultNotFound) {
+		t.Fatalf("workflow result after inconclusive recovery = %#v err=%v, want none", workflowResult, err)
+	}
+	_, updates, _ := sender.snapshot()
+	if len(updates) != 0 || mutationCalls != 0 {
+		t.Fatalf("updates=%#v mutation_calls=%d, want no terminal output or mutation replay", updates, mutationCalls)
 	}
 }
 
@@ -1416,6 +2877,499 @@ func TestResourceAccessRecoveryResumesApprovedPendingRequest(t *testing.T) {
 	_, updates, _ := sender.snapshot()
 	if len(updates) == 0 || !strings.Contains(updates[len(updates)-1].text, "权限已授予") {
 		t.Fatalf("recovered card updates = %#v", updates)
+	}
+}
+
+func TestResourceAccessRecoveryPreservesUsableOAuthHandoff(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("interrupted OAuth handoff unexpectedly called Feishu API: %s", r.URL.Path)
+	}))
+	defer server.Close()
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://oauth.wulongxin.com/feishu/oauth/callback",
+	})
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType: "docx", ResourceToken: "doxcn_interrupted_oauth", Permission: feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil || result.Status != feishutools.ResourceAccessStatusPending {
+		t.Fatalf("RequestAccess = %#v err=%v", result, err)
+	}
+	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
+	if err != nil {
+		t.Fatalf("load pending request: %v", err)
+	}
+	approvedAt := manager.currentTime().Add(time.Minute)
+	if _, err := st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, store.FeishuResourceGrantModeOnce, store.FeishuResourceAccessMatch{
+		ActorOpenID: request.ActorOpenID, ActorUserID: request.ActorUserID, ChatID: request.ChatID, CardMessageID: request.CardMessageID,
+	}, approvedAt); err != nil {
+		t.Fatalf("persist approval decision: %v", err)
+	}
+	const oauthState = "restart-surviving-oauth-state"
+	oauthStateHash := hashResourceAccessState(oauthState)
+	oauthStateCiphertext, err := manager.encryptResourceAccessOAuthState(request, oauthState)
+	if err != nil {
+		t.Fatalf("encrypt OAuth handoff state: %v", err)
+	}
+	if err := st.PrepareFeishuResourceAccessOAuth(
+		request.ID, request.AccountID, oauthStateHash, oauthStateCiphertext, "", request.SubjectType, request.SubjectID, approvedAt,
+	); err != nil {
+		t.Fatalf("prepare OAuth handoff: %v", err)
+	}
+	if err := st.MarkFeishuResourceAccessOAuthHandoffDelivered(request.ID, request.AccountID, oauthStateHash, approvedAt); err != nil {
+		t.Fatalf("mark OAuth handoff delivered: %v", err)
+	}
+	_, updatesBefore, _ := sender.snapshot()
+	manager.now = func() time.Time { return approvedAt.Add(time.Minute) }
+	if err := manager.recoverPersistedRequests(t.Context()); err != nil {
+		t.Fatalf("recoverPersistedRequests returned error: %v", err)
+	}
+	recovered, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil {
+		t.Fatalf("load recovered OAuth request: %v", err)
+	}
+	if recovered.State != store.FeishuResourceAccessStatePending || recovered.OAuthStateHash != oauthStateHash {
+		t.Fatalf("recovered OAuth request = %#v, want the delivered handoff to remain usable", recovered)
+	}
+	_, updatesAfter, _ := sender.snapshot()
+	if len(updatesAfter) != len(updatesBefore) {
+		t.Fatalf("OAuth recovery unexpectedly replaced a usable card: before=%d after=%#v", len(updatesBefore), updatesAfter)
+	}
+	claimed, err := st.ClaimFeishuResourceAccessOAuth(oauthStateHash, request.AccountID, manager.currentTime())
+	if err != nil || claimed.ID != request.ID || claimed.State != store.FeishuResourceAccessStateExecuting {
+		t.Fatalf("ClaimFeishuResourceAccessOAuth after recovery = %#v err=%v", claimed, err)
+	}
+}
+
+func TestResourceAccessRecoveryRetriesOAuthCardInterruptedAfterStatePersistence(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://oauth.wulongxin.com/feishu/oauth/callback",
+	})
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType: "docx", ResourceToken: "doxcn_interrupted_oauth_card", Permission: feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil || result.Status != feishutools.ResourceAccessStatusPending {
+		t.Fatalf("RequestAccess = %#v err=%v", result, err)
+	}
+	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
+	if err != nil {
+		t.Fatalf("load pending request: %v", err)
+	}
+	request, err = st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, store.FeishuResourceGrantModeOnce, store.FeishuResourceAccessMatch{
+		ActorOpenID: request.ActorOpenID, ActorUserID: request.ActorUserID, ChatID: request.ChatID, CardMessageID: request.CardMessageID,
+	}, manager.currentTime().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+	sender.updateCardFunc = func(context.Context, string, string) error {
+		return errors.New("simulated process loss before OAuth card delivery")
+	}
+	if err := manager.prepareResourceAccessOAuthHandoff(t.Context(), request); err != nil {
+		t.Fatalf("prepareResourceAccessOAuthHandoff returned error: %v", err)
+	}
+	pending, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil || pending.State != store.FeishuResourceAccessStatePending || pending.OAuthStateHash == "" {
+		t.Fatalf("request after interrupted OAuth card delivery = %#v err=%v", pending, err)
+	}
+	_, updatesBefore, _ := sender.snapshot()
+	sender.updateCardFunc = nil
+	deliveryWorker, err := newFeishuCardDeliveryWorker(st, manager.cards, manager, manager.account)
+	if err != nil {
+		t.Fatalf("newFeishuCardDeliveryWorker returned error: %v", err)
+	}
+	deliveryWorker.now = func() time.Time { return request.DecisionAt.Add(time.Minute) }
+	deliveryWorker.processAvailable(t.Context())
+	_, updatesAfter, _ := sender.snapshot()
+	if len(updatesAfter) != len(updatesBefore)+1 ||
+		!strings.Contains(updatesAfter[len(updatesAfter)-1].text, "前往飞书官方授权页面") {
+		t.Fatalf("OAuth card recovery updates before=%d after=%#v", len(updatesBefore), updatesAfter)
+	}
+	recovered, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil || recovered.State != store.FeishuResourceAccessStatePending || recovered.OAuthStateHash != pending.OAuthStateHash {
+		t.Fatalf("recovered OAuth request = %#v err=%v", recovered, err)
+	}
+}
+
+func TestResourceAccessOAuthHandoffRetriesOneTransientCardFailure(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://oauth.wulongxin.com/feishu/oauth/callback",
+	})
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType:        "docx",
+		ResourceToken:       "doxcn_transient_oauth_card",
+		Permission:          feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil {
+		t.Fatalf("RequestAccess returned error: %v", err)
+	}
+	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, manager.account.ID)
+	if err != nil {
+		t.Fatalf("load pending request: %v", err)
+	}
+	request, err = st.ApproveFeishuResourceAccessRequest(
+		request.ID,
+		request.AccountID,
+		store.FeishuResourceGrantModeOnce,
+		store.FeishuResourceAccessMatch{
+			ActorOpenID:   request.ActorOpenID,
+			ActorUserID:   request.ActorUserID,
+			ChatID:        request.ChatID,
+			CardMessageID: request.CardMessageID,
+		},
+		manager.currentTime(),
+	)
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+	updates := 0
+	sender.updateCardFunc = func(context.Context, string, string) error {
+		updates++
+		if updates == 1 {
+			return errors.New("transient card transport failure")
+		}
+		return nil
+	}
+
+	if err := manager.prepareResourceAccessOAuthHandoff(t.Context(), request); err != nil {
+		t.Fatalf("prepareResourceAccessOAuthHandoff returned error after transient failure: %v", err)
+	}
+	if updates != 1 {
+		t.Fatalf("synchronous card update attempts = %d, want 1", updates)
+	}
+	deliveryWorker, err := newFeishuCardDeliveryWorker(st, manager.cards, manager, manager.account)
+	if err != nil {
+		t.Fatalf("newFeishuCardDeliveryWorker returned error: %v", err)
+	}
+	deliveryWorker.now = func() time.Time { return manager.currentTime().Add(time.Second) }
+	deliveryWorker.processAvailable(t.Context())
+	if updates != 2 {
+		t.Fatalf("card update attempts after durable worker = %d, want 2", updates)
+	}
+	delivered, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil {
+		t.Fatalf("reload delivered OAuth request: %v", err)
+	}
+	if delivered.OAuthStateHash == "" || delivered.OAuthStateCiphertext != "" || delivered.OAuthHandoffDeliveredAt.IsZero() {
+		t.Fatalf("delivered OAuth request = %#v, want marked handoff with cleared recovery ciphertext", delivered)
+	}
+}
+
+func TestResourceAccessOAuthHandoffKeepsSameURLAcrossFailuresAndWorkerRestarts(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://oauth.wulongxin.com/feishu/oauth/callback",
+	})
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType:        "docx",
+		ResourceToken:       "doxcn_restart_stable_oauth_card",
+		Permission:          feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil {
+		t.Fatalf("RequestAccess returned error: %v", err)
+	}
+	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, manager.account.ID)
+	if err != nil {
+		t.Fatalf("load pending request: %v", err)
+	}
+	request, err = st.ApproveFeishuResourceAccessRequest(
+		request.ID,
+		request.AccountID,
+		store.FeishuResourceGrantModeOnce,
+		store.FeishuResourceAccessMatch{
+			ActorOpenID:   request.ActorOpenID,
+			ActorUserID:   request.ActorUserID,
+			ChatID:        request.ChatID,
+			CardMessageID: request.CardMessageID,
+		},
+		manager.currentTime(),
+	)
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+	updateAttempts := 0
+	sender.updateCardFunc = func(context.Context, string, string) error {
+		updateAttempts++
+		if updateAttempts <= 3 {
+			return errors.New("temporary card transport failure")
+		}
+		return nil
+	}
+
+	if err := manager.prepareResourceAccessOAuthHandoff(t.Context(), request); err != nil {
+		t.Fatalf("prepareResourceAccessOAuthHandoff returned error: %v", err)
+	}
+	for attempt, offset := range []time.Duration{time.Second, 3 * time.Second, 5 * time.Second} {
+		worker, err := newFeishuCardDeliveryWorker(st, manager.cards, manager, manager.account)
+		if err != nil {
+			t.Fatalf("new restarted worker %d: %v", attempt+1, err)
+		}
+		worker.retryDelays = []time.Duration{time.Second, time.Second, time.Second}
+		worker.now = func() time.Time { return manager.currentTime().Add(offset) }
+		worker.processAvailable(t.Context())
+	}
+
+	_, updates, _ := sender.snapshot()
+	if len(updates) != 4 {
+		t.Fatalf("OAuth handoff update attempts = %d, want 4", len(updates))
+	}
+	wantURL := resourceAccessCardURL(t, updates[0].text)
+	wantState := resourceAccessCardState(t, updates[0].text)
+	for index, update := range updates[1:] {
+		if got := resourceAccessCardURL(t, update.text); got != wantURL {
+			t.Fatalf("OAuth URL attempt %d changed: got %q want %q", index+2, got, wantURL)
+		}
+		if got := resourceAccessCardState(t, update.text); got != wantState {
+			t.Fatalf("OAuth state attempt %d changed: got %q want %q", index+2, got, wantState)
+		}
+	}
+	delivered, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil {
+		t.Fatalf("reload delivered OAuth request: %v", err)
+	}
+	if delivered.OAuthStateHash != hashResourceAccessState(wantState) || delivered.OAuthStateCiphertext != "" || delivered.OAuthHandoffDeliveredAt.IsZero() {
+		t.Fatalf("delivered OAuth request = %#v, want the original state marked delivered", delivered)
+	}
+}
+
+func TestResourceAccessCardCompletionKeepsRecoverableOAuthStateWhenCardDeliveryFails(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://oauth.wulongxin.com/feishu/oauth/callback",
+	})
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType:        "docx",
+		ResourceToken:       "doxcn_interrupted_oauth_callback",
+		Permission:          feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil {
+		t.Fatalf("RequestAccess returned error: %v", err)
+	}
+	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, manager.account.ID)
+	if err != nil {
+		t.Fatalf("load pending resource request: %v", err)
+	}
+	request, err = st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, store.FeishuResourceGrantModeOnce, store.FeishuResourceAccessMatch{
+		ActorOpenID:   request.ActorOpenID,
+		ActorUserID:   request.ActorUserID,
+		ChatID:        request.ChatID,
+		CardMessageID: request.CardMessageID,
+	}, manager.currentTime())
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+	sender.updateCardFunc = func(context.Context, string, string) error {
+		return errors.New("simulated ambiguous OAuth card delivery")
+	}
+
+	manager.completeApprovedResourceAccessFromCard(request)
+
+	stored, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil || stored.State != store.FeishuResourceAccessStatePending || stored.OAuthStateHash == "" || stored.OAuthStateCiphertext == "" {
+		t.Fatalf("request after failed OAuth card delivery = %#v err=%v, want recoverable pending state", stored, err)
+	}
+	if workflowResult, err := st.GetWorkflowResult(request.ID, request.AccountID); !errors.Is(err, store.ErrWorkflowResultNotFound) {
+		t.Fatalf("workflow result after failed OAuth card delivery = %#v err=%v, want none", workflowResult, err)
+	}
+	if err := manager.recoverPersistedRequests(t.Context()); err != nil {
+		t.Fatalf("recovery with an unavailable card transport returned error: %v", err)
+	}
+	deliveryWorker, err := newFeishuCardDeliveryWorker(st, manager.cards, manager, manager.account)
+	if err != nil {
+		t.Fatalf("newFeishuCardDeliveryWorker returned error: %v", err)
+	}
+	deliveryWorker.now = manager.now
+	deliveryWorker.retryDelays = []time.Duration{time.Second}
+	deliveryWorker.processAvailable(t.Context())
+	stillPending, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil || stillPending.State != store.FeishuResourceAccessStatePending || stillPending.OAuthStateHash != stored.OAuthStateHash || stillPending.OAuthStateCiphertext == "" {
+		t.Fatalf("request after failed OAuth card recovery = %#v err=%v, want the same recoverable state", stillPending, err)
+	}
+	sender.updateCardFunc = nil
+	deliveryWorker.now = func() time.Time { return manager.currentTime().Add(2 * time.Second) }
+	deliveryWorker.processAvailable(t.Context())
+	delivered, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil || delivered.State != store.FeishuResourceAccessStatePending || delivered.OAuthStateHash != stored.OAuthStateHash || delivered.OAuthStateCiphertext != "" || delivered.OAuthHandoffDeliveredAt.IsZero() {
+		t.Fatalf("request after successful OAuth card recovery = %#v err=%v", delivered, err)
+	}
+}
+
+func TestResourceAccessDurablyRetriesTerminalCardWhenFastPathFails(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://oauth.wulongxin.com/feishu/oauth/callback",
+	})
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType:        "docx",
+		ResourceToken:       "doxcn_terminal_card_retry",
+		Permission:          feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil {
+		t.Fatalf("RequestAccess returned error: %v", err)
+	}
+	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, manager.account.ID)
+	if err != nil {
+		t.Fatalf("load pending resource request: %v", err)
+	}
+	sender.mu.Lock()
+	sender.updateErr = errors.New("terminal card update unavailable")
+	sender.mu.Unlock()
+	manager.finishResourceAccessFailure(
+		t.Context(),
+		request,
+		errors.New("permission denied"),
+		"资源授权未完成",
+		"飞书未能授予所需权限。",
+	)
+	delivery, err := st.GetFeishuCardDeliveryByKey(
+		request.AccountID,
+		request.ID,
+		store.FeishuCardDeliveryPurposeResourceTerminal,
+		store.FeishuCardDeliveryRevisionTerminal,
+	)
+	if err != nil || delivery.State != store.FeishuCardDeliveryStatePending {
+		t.Fatalf("durable resource terminal delivery = %#v err=%v", delivery, err)
+	}
+	sender.mu.Lock()
+	sender.updateErr = nil
+	sender.mu.Unlock()
+	deliveryWorker, err := newFeishuCardDeliveryWorker(st, manager.cards, manager, manager.account)
+	if err != nil {
+		t.Fatalf("newFeishuCardDeliveryWorker returned error: %v", err)
+	}
+	deliveryWorker.now = func() time.Time { return manager.currentTime().Add(time.Second) }
+	deliveryWorker.processAvailable(t.Context())
+	delivery, err = st.GetFeishuCardDelivery(delivery.ID, delivery.AccountID)
+	if err != nil || delivery.State != store.FeishuCardDeliveryStateDelivered {
+		t.Fatalf("retried resource terminal delivery = %#v err=%v", delivery, err)
+	}
+	_, updates, _ := sender.snapshot()
+	if len(updates) != 2 || !strings.Contains(updates[1].text, "资源授权未完成") {
+		t.Fatalf("resource terminal card updates = %#v", updates)
+	}
+}
+
+func TestResourceAccessOAuthPreparationIsIdempotentWhenAnotherWorkerAlreadyPreparedIt(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID:    "cli_xxx",
+		BaseURL:     server.URL,
+		CallbackURL: "https://oauth.wulongxin.com/feishu/oauth/callback",
+	})
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType: "docx", ResourceToken: "doxcn_duplicate_oauth_prepare", Permission: feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil {
+		t.Fatalf("RequestAccess returned error: %v", err)
+	}
+	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
+	if err != nil {
+		t.Fatalf("load pending request: %v", err)
+	}
+	request, err = st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, store.FeishuResourceGrantModeOnce, store.FeishuResourceAccessMatch{
+		ActorOpenID: request.ActorOpenID, ActorUserID: request.ActorUserID, ChatID: request.ChatID, CardMessageID: request.CardMessageID,
+	}, manager.currentTime().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("ApproveFeishuResourceAccessRequest returned error: %v", err)
+	}
+	if err := manager.prepareResourceAccessOAuthHandoff(t.Context(), request); err != nil {
+		t.Fatalf("first prepareResourceAccessOAuthHandoff returned error: %v", err)
+	}
+	_, updatesBefore, _ := sender.snapshot()
+	if err := manager.prepareResourceAccessOAuthHandoff(t.Context(), request); err != nil {
+		t.Fatalf("duplicate prepareResourceAccessOAuthHandoff returned error: %v", err)
+	}
+	stored, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
+	if err != nil || stored.State != store.FeishuResourceAccessStatePending || stored.OAuthStateHash == "" {
+		t.Fatalf("stored OAuth handoff = %#v err=%v", stored, err)
+	}
+	_, updatesAfter, _ := sender.snapshot()
+	if len(updatesAfter) != len(updatesBefore) {
+		t.Fatalf("duplicate OAuth preparation sent another card update: before=%d after=%d", len(updatesBefore), len(updatesAfter))
+	}
+}
+
+func TestResourceAccessRecoveryProcessesMoreThanOneBatch(t *testing.T) {
+	var authCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+		case "/open-apis/drive/v1/permissions/doxcn_recovery_batch/members/auth":
+			authCalls++
+			writeResourceAccessJSON(t, w, map[string]any{"code": 0, "msg": "Success", "data": map[string]any{"auth_result": true}})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
+	now := manager.currentTime()
+	if _, err := st.UpsertFeishuResourceCapability(store.FeishuResourceCapability{
+		AccountID: "feishu:cli_test", ResourceType: "docx", ResourceToken: "doxcn_recovery_batch",
+		SubjectType: "openid", SubjectID: "ou_bot", Permission: store.FeishuResourcePermissionRead,
+		SourceActorOpenID: "ou_requester", SourceRequestID: "req_recovery_capability",
+		State: store.FeishuResourceCapabilityStateActive, CreatedAt: now, VerifiedAt: now,
+	}); err != nil {
+		t.Fatalf("seed resource capability: %v", err)
+	}
+	requestIDs := make([]string, 0, 101)
+	for index := 0; index < 101; index++ {
+		result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+			ResourceType: "docx", ResourceToken: "doxcn_recovery_batch", Permission: feishutools.ResourcePermissionRead,
+			OnceDurationMinutes: 30,
+		})
+		if err != nil || result.Status != feishutools.ResourceAccessStatusPending {
+			t.Fatalf("RequestAccess[%d] = %#v err=%v", index, result, err)
+		}
+		request, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
+		if err != nil {
+			t.Fatalf("load request[%d]: %v", index, err)
+		}
+		if _, err := st.ApproveFeishuResourceAccessRequest(request.ID, request.AccountID, store.FeishuResourceGrantModeAll, store.FeishuResourceAccessMatch{
+			ActorOpenID: request.ActorOpenID, ActorUserID: request.ActorUserID, ChatID: request.ChatID, CardMessageID: request.CardMessageID,
+		}, now.Add(time.Duration(index+1)*time.Millisecond)); err != nil {
+			t.Fatalf("approve request[%d]: %v", index, err)
+		}
+		requestIDs = append(requestIDs, request.ID)
+	}
+	manager.now = func() time.Time { return now.Add(time.Minute) }
+	if err := manager.recoverPersistedRequests(t.Context()); err != nil {
+		t.Fatalf("recoverPersistedRequests returned error: %v", err)
+	}
+	for _, requestID := range requestIDs {
+		request, err := st.GetFeishuResourceAccessRequest(requestID, "feishu:cli_test")
+		if err != nil || request.State != store.FeishuResourceAccessStateSucceeded {
+			t.Fatalf("recovered request %s = %#v err=%v", requestID, request, err)
+		}
+	}
+	if authCalls != len(requestIDs) {
+		t.Fatalf("live verification calls = %d, want %d", authCalls, len(requestIDs))
 	}
 }
 
@@ -1759,6 +3713,7 @@ func newTestResourceAccessManager(t *testing.T, server *httptest.Server, oauth r
 	if err != nil {
 		t.Fatalf("newResourceAccessManager returned error: %v", err)
 	}
+	t.Cleanup(manager.tasks.CloseAndWait)
 	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
 	manager.now = func() time.Time { return now }
 	return manager, st, sender
@@ -1769,10 +3724,15 @@ func waitForResourceAccessCompletion(t *testing.T, st *store.Store, sender *fake
 	deadline := time.Now().Add(3 * time.Second)
 	var last store.FeishuResourceAccessRequest
 	var lastErr error
+	var lastResult store.WorkflowResult
+	var lastResultErr error
 	for time.Now().Before(deadline) {
 		last, lastErr = st.GetFeishuResourceAccessRequest(requestID, "feishu:cli_test")
+		lastResult, lastResultErr = st.GetWorkflowResult(requestID, "feishu:cli_test")
 		_, updates, _ := sender.snapshot()
-		if lastErr == nil && last.State == store.FeishuResourceAccessStateSucceeded && len(updates) > 0 && strings.Contains(updates[len(updates)-1].text, "权限已授予") {
+		if lastErr == nil && last.State == store.FeishuResourceAccessStateSucceeded &&
+			lastResultErr == nil && lastResult.State == store.WorkflowResultStateSucceeded &&
+			len(updates) > 0 && strings.Contains(updates[len(updates)-1].text, "权限已授予") {
 			return last
 		}
 		if lastErr == nil && (last.State == store.FeishuResourceAccessStateFailed || last.State == store.FeishuResourceAccessStateExpired || last.State == store.FeishuResourceAccessStateDenied) {
@@ -1780,7 +3740,7 @@ func waitForResourceAccessCompletion(t *testing.T, st *store.Store, sender *fake
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for resource access completion: request=%#v err=%v", last, lastErr)
+	t.Fatalf("timed out waiting for resource access completion: request=%#v err=%v result=%#v result_err=%v", last, lastErr, lastResult, lastResultErr)
 	return store.FeishuResourceAccessRequest{}
 }
 
