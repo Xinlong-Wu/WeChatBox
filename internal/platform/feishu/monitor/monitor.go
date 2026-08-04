@@ -117,7 +117,7 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 	}
 	if docsToolsEnabled(p.config.Tools) {
 		if resumer, ok := handler.(core.WorkflowResumer); ok {
-			worker, workerErr := newWorkflowContinuationWorker(p.store, resumer, sender, acc, tools)
+			worker, workerErr := newWorkflowContinuationWorker(p.store, resumer, sender, cards, acc, tools)
 			if workerErr != nil {
 				return fmt.Errorf("initialize feishu workflow continuation worker for account %s: %w", acc.Name, workerErr)
 			}

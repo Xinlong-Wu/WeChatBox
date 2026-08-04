@@ -730,7 +730,7 @@ func TestResourceAccessOAuthTokenErrorDoesNotExposeSupportInstructions(t *testin
 	}
 	resumer := &fakeWorkflowResumer{text: "oauth failure handled"}
 	resumeSender := &fakeWorkflowResumeTextSender{}
-	worker, err := newWorkflowContinuationWorker(st, resumer, resumeSender, store.Account{ID: "feishu:cli_test"}, nil)
+	worker, err := newWorkflowContinuationWorker(st, resumer, resumeSender, &fakeWorkflowResumeCardUpdater{}, store.Account{ID: "feishu:cli_test"}, nil)
 	if err != nil {
 		t.Fatalf("newWorkflowContinuationWorker returned error: %v", err)
 	}

@@ -35,6 +35,7 @@ type workflowResumeStore interface {
 	ListResumableWorkflowContinuations(accountID string, now time.Time, limit int) ([]store.WorkflowContinuation, error)
 	ClaimWorkflowContinuation(requestID, accountID, leaseToken string, now time.Time, leaseDuration time.Duration) (store.WorkflowContinuation, error)
 	GetWorkflowResult(requestID, accountID string) (store.WorkflowResult, error)
+	GetWorkflowCardReference(requestID, accountID string) (store.WorkflowCardReference, error)
 	RetryWorkflowContinuation(requestID, accountID, leaseToken string, availableAt time.Time, lastError string, now time.Time) error
 	CompleteWorkflowContinuation(requestID, accountID, leaseToken, state, lastError string, now time.Time) error
 }
@@ -43,10 +44,15 @@ type workflowResumeTextSender interface {
 	CreateTextWithUUID(ctx context.Context, chatID, text, uuid string) (string, error)
 }
 
+type workflowResumeCardUpdater interface {
+	UpdateByMessageID(ctx context.Context, messageID string, card Card) error
+}
+
 type workflowContinuationWorker struct {
 	store         workflowResumeStore
 	resumer       core.WorkflowResumer
 	sender        workflowResumeTextSender
+	cards         workflowResumeCardUpdater
 	account       store.Account
 	tools         []tooltypes.Tool
 	toolOptions   tooltypes.Options
@@ -59,7 +65,7 @@ type workflowContinuationWorker struct {
 	now           func() time.Time
 }
 
-func newWorkflowContinuationWorker(st workflowResumeStore, resumer core.WorkflowResumer, sender workflowResumeTextSender, account store.Account, tools []tooltypes.Tool) (*workflowContinuationWorker, error) {
+func newWorkflowContinuationWorker(st workflowResumeStore, resumer core.WorkflowResumer, sender workflowResumeTextSender, cards workflowResumeCardUpdater, account store.Account, tools []tooltypes.Tool) (*workflowContinuationWorker, error) {
 	if st == nil {
 		return nil, fmt.Errorf("workflow continuation store is required")
 	}
@@ -69,6 +75,9 @@ func newWorkflowContinuationWorker(st workflowResumeStore, resumer core.Workflow
 	if sender == nil {
 		return nil, fmt.Errorf("workflow resume sender is required")
 	}
+	if cards == nil {
+		return nil, fmt.Errorf("workflow resume card updater is required")
+	}
 	if strings.TrimSpace(account.ID) == "" {
 		return nil, fmt.Errorf("workflow resume account is required")
 	}
@@ -76,6 +85,7 @@ func newWorkflowContinuationWorker(st workflowResumeStore, resumer core.Workflow
 		store:         st,
 		resumer:       resumer,
 		sender:        sender,
+		cards:         cards,
 		account:       account,
 		tools:         append([]tooltypes.Tool(nil), tools...),
 		pollInterval:  defaultWorkflowResumePollInterval,
@@ -224,6 +234,7 @@ func (w *workflowContinuationWorker) handleFailure(ctx context.Context, continua
 		}
 		feishuLog.Error(ctx, "feishu workflow continuation exhausted request=%s account=%s session=%s attempts=%d error=%s",
 			shortRequestID(continuation.RequestID), continuation.AccountID, continuation.SessionID, continuation.Attempts, lastError)
+		w.updateTerminalFailureCard(ctx, continuation)
 		return
 	}
 	availableAt := now.Add(w.retryDelay(continuation.Attempts))
@@ -244,6 +255,32 @@ func (w *workflowContinuationWorker) handleFailure(ctx context.Context, continua
 	feishuLog.Warn(ctx, "scheduled feishu workflow continuation retry request=%s account=%s session=%s attempt=%d available_at=%s error=%s",
 		shortRequestID(continuation.RequestID), continuation.AccountID, continuation.SessionID,
 		continuation.Attempts, availableAt.Format(time.RFC3339), lastError)
+}
+
+func (w *workflowContinuationWorker) updateTerminalFailureCard(ctx context.Context, continuation store.WorkflowContinuation) {
+	reference, err := w.store.GetWorkflowCardReference(continuation.RequestID, continuation.AccountID)
+	if err != nil {
+		feishuLog.Warn(ctx, "resolve exhausted feishu workflow card failed request=%s account=%s: %v",
+			shortRequestID(continuation.RequestID), continuation.AccountID, err)
+		return
+	}
+	if reference.CardMessageID == "" {
+		feishuLog.Warn(ctx, "skip exhausted feishu workflow card update without original card request=%s account=%s kind=%s",
+			shortRequestID(continuation.RequestID), continuation.AccountID, reference.Kind)
+		return
+	}
+	card := statusCard{
+		title:    "原任务未自动继续",
+		template: "orange",
+		message:  "授权或操作结果已保存，但 LingoBridge 未能自动继续原任务。请在当前对话中重新发送原请求；已经生效的授权不会因此丢失。",
+	}
+	if err := w.cards.UpdateByMessageID(ctx, reference.CardMessageID, card); err != nil {
+		feishuLog.Warn(ctx, "update exhausted feishu workflow card failed request=%s account=%s kind=%s: %v",
+			shortRequestID(continuation.RequestID), continuation.AccountID, reference.Kind, err)
+		return
+	}
+	feishuLog.Info(ctx, "updated exhausted feishu workflow card request=%s account=%s kind=%s attempts=%d",
+		shortRequestID(continuation.RequestID), continuation.AccountID, reference.Kind, continuation.Attempts)
 }
 
 func (w *workflowContinuationWorker) currentTime() time.Time {

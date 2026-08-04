@@ -43,6 +43,16 @@ type WorkflowRequest struct {
 	UpdatedAt time.Time
 }
 
+// WorkflowCardReference identifies the original Feishu card attached to a
+// user-visible workflow request. CardMessageID is empty for workflows that do
+// not have a card or whose card was never bound successfully.
+type WorkflowCardReference struct {
+	RequestID     string
+	AccountID     string
+	Kind          string
+	CardMessageID string
+}
+
 // CreateWorkflowRequest allocates and persists one globally unique root request.
 func (s *Store) CreateWorkflowRequest(request WorkflowRequest) (WorkflowRequest, error) {
 	request, err := prepareWorkflowRequest(request)
@@ -85,6 +95,35 @@ func (s *Store) GetWorkflowRequest(id, accountID string) (WorkflowRequest, error
 		 FROM workflow_requests WHERE id=? AND account_id=?`,
 		strings.TrimSpace(id), strings.TrimSpace(accountID),
 	))
+}
+
+// GetWorkflowCardReference resolves the original card message for either a
+// tool approval or a Feishu resource-access workflow without exposing the
+// workflow-specific persistence model to asynchronous workers.
+func (s *Store) GetWorkflowCardReference(id, accountID string) (WorkflowCardReference, error) {
+	id = strings.TrimSpace(id)
+	accountID = strings.TrimSpace(accountID)
+	var reference WorkflowCardReference
+	err := s.db.QueryRow(
+		`SELECT workflow.id, workflow.account_id, workflow.kind,
+		 COALESCE(approval.card_message_id, access.card_message_id, '')
+		 FROM workflow_requests AS workflow
+		 LEFT JOIN tool_approvals AS approval
+		   ON approval.id=workflow.id AND approval.account_id=workflow.account_id
+		 LEFT JOIN feishu_resource_access_requests AS access
+		   ON access.id=workflow.id AND access.account_id=workflow.account_id
+		 WHERE workflow.id=? AND workflow.account_id=?`,
+		id,
+		accountID,
+	).Scan(&reference.RequestID, &reference.AccountID, &reference.Kind, &reference.CardMessageID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return WorkflowCardReference{}, ErrWorkflowRequestNotFound
+	}
+	if err != nil {
+		return WorkflowCardReference{}, fmt.Errorf("get workflow card reference: %w", err)
+	}
+	reference.CardMessageID = strings.TrimSpace(reference.CardMessageID)
+	return reference, nil
 }
 
 func prepareWorkflowRequest(request WorkflowRequest) (WorkflowRequest, error) {

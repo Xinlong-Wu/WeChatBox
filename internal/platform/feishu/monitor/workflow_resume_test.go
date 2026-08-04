@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -60,13 +61,32 @@ func (f *fakeWorkflowResumeTextSender) CreateTextWithUUID(_ context.Context, cha
 	return "om_resume", nil
 }
 
+type workflowResumeCardUpdateCall struct {
+	messageID string
+	cardJSON  string
+}
+
+type fakeWorkflowResumeCardUpdater struct {
+	calls []workflowResumeCardUpdateCall
+	err   error
+}
+
+func (f *fakeWorkflowResumeCardUpdater) UpdateByMessageID(_ context.Context, messageID string, card Card) error {
+	cardJSON, err := card.JSON()
+	if err != nil {
+		return err
+	}
+	f.calls = append(f.calls, workflowResumeCardUpdateCall{messageID: messageID, cardJSON: cardJSON})
+	return f.err
+}
+
 func TestWorkflowContinuationWorkerDeliversReadyResult(t *testing.T) {
 	st := openFeishuApprovalTestStore(t)
 	now := time.Date(2026, time.August, 3, 14, 0, 0, 0, time.UTC)
 	continuation := createReadyWorkflowForWorker(t, st, now)
 	resumer := &fakeWorkflowResumer{text: "authorization complete"}
 	sender := &fakeWorkflowResumeTextSender{}
-	worker, err := newWorkflowContinuationWorker(st, resumer, sender, store.Account{ID: continuation.AccountID}, nil)
+	worker, err := newWorkflowContinuationWorker(st, resumer, sender, &fakeWorkflowResumeCardUpdater{}, store.Account{ID: continuation.AccountID}, nil)
 	if err != nil {
 		t.Fatalf("newWorkflowContinuationWorker returned error: %v", err)
 	}
@@ -94,7 +114,7 @@ func TestWorkflowContinuationWorkerRetriesDeliveryWithStableUUID(t *testing.T) {
 	continuation := createReadyWorkflowForWorker(t, st, now)
 	resumer := &fakeWorkflowResumer{text: "stable delivery"}
 	sender := &fakeWorkflowResumeTextSender{errs: []error{errors.New("temporary send failure"), nil}}
-	worker, err := newWorkflowContinuationWorker(st, resumer, sender, store.Account{ID: continuation.AccountID}, nil)
+	worker, err := newWorkflowContinuationWorker(st, resumer, sender, &fakeWorkflowResumeCardUpdater{}, store.Account{ID: continuation.AccountID}, nil)
 	if err != nil {
 		t.Fatalf("newWorkflowContinuationWorker returned error: %v", err)
 	}
@@ -118,12 +138,70 @@ func TestWorkflowContinuationWorkerRetriesDeliveryWithStableUUID(t *testing.T) {
 	}
 }
 
+func TestWorkflowContinuationWorkerUpdatesOriginalCardAfterFinalFailure(t *testing.T) {
+	st := openFeishuApprovalTestStore(t)
+	now := time.Date(2026, time.August, 3, 14, 25, 0, 0, time.UTC)
+	continuation := createReadyApprovalWorkflowForWorker(t, st, now)
+	resumer := &fakeWorkflowResumer{errs: []error{errors.New("model unavailable")}}
+	sender := &fakeWorkflowResumeTextSender{}
+	cards := &fakeWorkflowResumeCardUpdater{}
+	worker, err := newWorkflowContinuationWorker(st, resumer, sender, cards, store.Account{ID: continuation.AccountID}, nil)
+	if err != nil {
+		t.Fatalf("newWorkflowContinuationWorker returned error: %v", err)
+	}
+	worker.now = func() time.Time { return now.Add(3 * time.Second) }
+	worker.maxAttempts = 1
+
+	worker.processAvailable(t.Context())
+	worker.processAvailable(t.Context())
+	failed, err := st.GetWorkflowContinuation(continuation.RequestID, continuation.AccountID)
+	if err != nil || failed.State != store.WorkflowContinuationStateFailed || failed.Attempts != 1 {
+		t.Fatalf("failed continuation = %#v err=%v", failed, err)
+	}
+	if len(resumer.requests) != 1 || len(sender.calls) != 0 {
+		t.Fatalf("resume requests/text sends = %d/%d, want 1/0", len(resumer.requests), len(sender.calls))
+	}
+	if len(cards.calls) != 1 || cards.calls[0].messageID != "om_card" {
+		t.Fatalf("card updates = %#v, want one update of original card", cards.calls)
+	}
+	if !strings.Contains(cards.calls[0].cardJSON, "授权或操作结果已保存") ||
+		!strings.Contains(cards.calls[0].cardJSON, "未能自动继续原任务") ||
+		strings.Contains(cards.calls[0].cardJSON, "授权失败") {
+		t.Fatalf("terminal failure card = %s", cards.calls[0].cardJSON)
+	}
+}
+
+func TestWorkflowContinuationWorkerKeepsFinalStateWhenCardUpdateFails(t *testing.T) {
+	st := openFeishuApprovalTestStore(t)
+	now := time.Date(2026, time.August, 3, 14, 27, 0, 0, time.UTC)
+	continuation := createReadyApprovalWorkflowForWorker(t, st, now)
+	resumer := &fakeWorkflowResumer{errs: []error{errors.New("model unavailable")}}
+	cards := &fakeWorkflowResumeCardUpdater{err: errors.New("card update unavailable")}
+	worker, err := newWorkflowContinuationWorker(st, resumer, &fakeWorkflowResumeTextSender{}, cards, store.Account{ID: continuation.AccountID}, nil)
+	if err != nil {
+		t.Fatalf("newWorkflowContinuationWorker returned error: %v", err)
+	}
+	worker.now = func() time.Time { return now.Add(3 * time.Second) }
+	worker.maxAttempts = 1
+
+	worker.processAvailable(t.Context())
+	worker.processAvailable(t.Context())
+	failed, err := st.GetWorkflowContinuation(continuation.RequestID, continuation.AccountID)
+	if err != nil || failed.State != store.WorkflowContinuationStateFailed || failed.Attempts != 1 {
+		t.Fatalf("failed continuation after card error = %#v err=%v", failed, err)
+	}
+	if len(resumer.requests) != 1 || len(cards.calls) != 1 {
+		t.Fatalf("resume/card calls = %d/%d, want no retry after terminal card error", len(resumer.requests), len(cards.calls))
+	}
+}
+
 func TestWorkflowContinuationWorkerCancelsArchivedSessionWithoutRetry(t *testing.T) {
 	st := openFeishuApprovalTestStore(t)
 	now := time.Date(2026, time.August, 3, 14, 30, 0, 0, time.UTC)
 	continuation := createReadyWorkflowForWorker(t, st, now)
 	resumer := &fakeWorkflowResumer{errs: []error{fmt.Errorf("load session: %w", store.ErrSessionNotFound)}}
-	worker, err := newWorkflowContinuationWorker(st, resumer, &fakeWorkflowResumeTextSender{}, store.Account{ID: continuation.AccountID}, nil)
+	cards := &fakeWorkflowResumeCardUpdater{}
+	worker, err := newWorkflowContinuationWorker(st, resumer, &fakeWorkflowResumeTextSender{}, cards, store.Account{ID: continuation.AccountID}, nil)
 	if err != nil {
 		t.Fatalf("newWorkflowContinuationWorker returned error: %v", err)
 	}
@@ -133,6 +211,9 @@ func TestWorkflowContinuationWorkerCancelsArchivedSessionWithoutRetry(t *testing
 	canceled, err := st.GetWorkflowContinuation(continuation.RequestID, continuation.AccountID)
 	if err != nil || canceled.State != store.WorkflowContinuationStateCanceled || canceled.Attempts != 1 || canceled.LastError == "" {
 		t.Fatalf("canceled continuation = %#v err=%v", canceled, err)
+	}
+	if len(cards.calls) != 0 {
+		t.Fatalf("canceled session card updates = %#v, want none", cards.calls)
 	}
 }
 
@@ -170,7 +251,7 @@ func TestOperationApprovalDuplicateCallbackResumesContinuationOnce(t *testing.T)
 
 	resumer := &fakeWorkflowResumer{text: "operation workflow resumed"}
 	resumeSender := &fakeWorkflowResumeTextSender{}
-	worker, err := newWorkflowContinuationWorker(st, resumer, resumeSender, store.Account{ID: "feishu:cli_test"}, nil)
+	worker, err := newWorkflowContinuationWorker(st, resumer, resumeSender, &fakeWorkflowResumeCardUpdater{}, store.Account{ID: "feishu:cli_test"}, nil)
 	if err != nil {
 		t.Fatalf("newWorkflowContinuationWorker returned error: %v", err)
 	}
@@ -239,7 +320,7 @@ func TestResourceApprovalDuplicateCallbackResumesContinuationOnce(t *testing.T) 
 
 	resumer := &fakeWorkflowResumer{text: "resource workflow resumed"}
 	resumeSender := &fakeWorkflowResumeTextSender{}
-	worker, err := newWorkflowContinuationWorker(st, resumer, resumeSender, store.Account{ID: "feishu:cli_test"}, nil)
+	worker, err := newWorkflowContinuationWorker(st, resumer, resumeSender, &fakeWorkflowResumeCardUpdater{}, store.Account{ID: "feishu:cli_test"}, nil)
 	if err != nil {
 		t.Fatalf("newWorkflowContinuationWorker returned error: %v", err)
 	}
@@ -306,5 +387,64 @@ func createReadyWorkflowForWorker(t *testing.T, st *store.Store, now time.Time) 
 	return continuation
 }
 
+func createReadyApprovalWorkflowForWorker(t *testing.T, st *store.Store, now time.Time) store.WorkflowContinuation {
+	t.Helper()
+	approval, err := st.CreateToolApproval(store.ToolApproval{
+		AccountID:       "feishu:cli_test",
+		ToolName:        "feishu_docs_append",
+		ActionKey:       "append",
+		ResourceType:    "docx",
+		ResourceToken:   "doxcn_resume_failure",
+		ActorOpenID:     "ou_requester",
+		ActorUserID:     "u_requester",
+		ChatID:          "oc_chat",
+		SourceMessageID: "om_source",
+		Payload:         `{}`,
+		CreatedAt:       now,
+		ExpiresAt:       now.Add(10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("CreateToolApproval returned error: %v", err)
+	}
+	if err := st.SetToolApprovalCardMessageID(approval.ID, approval.AccountID, "om_card", now.Add(time.Second)); err != nil {
+		t.Fatalf("SetToolApprovalCardMessageID returned error: %v", err)
+	}
+	continuation, err := st.CreateWorkflowContinuation(store.WorkflowContinuation{
+		RequestID:       approval.ID,
+		AccountID:       approval.AccountID,
+		Platform:        store.PlatformFeishu,
+		UserKey:         "feishu:ou_requester",
+		SessionID:       "session-work",
+		ChatID:          "oc_chat",
+		ChatIsGroup:     true,
+		SourceMessageID: "om_source",
+		ActorOpenID:     "ou_requester",
+		ActorUserID:     "u_requester",
+		OriginRevision:  6,
+		OriginTurnID:    "turn-origin",
+		ToolCallID:      "call-origin",
+		ToolName:        "feishu_docs_append",
+		CreatedAt:       now,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorkflowContinuation returned error: %v", err)
+	}
+	if _, _, err := st.CommitWorkflowContinuation(approval.ID, approval.AccountID, 7, now.Add(time.Second)); err != nil {
+		t.Fatalf("CommitWorkflowContinuation returned error: %v", err)
+	}
+	_, continuation, ready, err := st.StoreWorkflowResult(store.WorkflowResult{
+		RequestID: approval.ID,
+		AccountID: approval.AccountID,
+		State:     store.WorkflowResultStateSucceeded,
+		Payload:   json.RawMessage(`{"status":"succeeded"}`),
+		CreatedAt: now.Add(2 * time.Second),
+	})
+	if err != nil || !ready {
+		t.Fatalf("StoreWorkflowResult continuation=%#v ready=%t err=%v", continuation, ready, err)
+	}
+	return continuation
+}
+
 var _ core.WorkflowResumer = (*fakeWorkflowResumer)(nil)
 var _ workflowResumeTextSender = (*fakeWorkflowResumeTextSender)(nil)
+var _ workflowResumeCardUpdater = (*fakeWorkflowResumeCardUpdater)(nil)

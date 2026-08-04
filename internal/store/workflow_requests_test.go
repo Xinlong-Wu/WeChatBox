@@ -46,6 +46,74 @@ func TestWorkflowRequestUsesGloballyUniqueRootID(t *testing.T) {
 	}
 }
 
+func TestWorkflowCardReferenceResolvesOriginalApprovalCard(t *testing.T) {
+	st := openTestStore(t)
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	approval, err := st.CreateToolApproval(ToolApproval{
+		AccountID:       "feishu:cli_test",
+		ToolName:        "feishu_docs_append",
+		ActionKey:       "append",
+		ResourceType:    "docx",
+		ResourceToken:   "doxcn_reference",
+		ActorOpenID:     "ou_requester",
+		ChatID:          "oc_chat",
+		SourceMessageID: "om_source",
+		Payload:         `{}`,
+		CreatedAt:       now,
+		ExpiresAt:       now.Add(10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("CreateToolApproval returned error: %v", err)
+	}
+	if err := st.SetToolApprovalCardMessageID(approval.ID, approval.AccountID, "om_card", now.Add(time.Second)); err != nil {
+		t.Fatalf("SetToolApprovalCardMessageID returned error: %v", err)
+	}
+
+	reference, err := st.GetWorkflowCardReference(approval.ID, approval.AccountID)
+	if err != nil {
+		t.Fatalf("GetWorkflowCardReference returned error: %v", err)
+	}
+	if reference.RequestID != approval.ID || reference.AccountID != approval.AccountID ||
+		reference.Kind != WorkflowRequestKindToolApproval || reference.CardMessageID != "om_card" {
+		t.Fatalf("workflow card reference = %#v", reference)
+	}
+	if _, err := st.GetWorkflowCardReference(approval.ID, "feishu:other"); !errors.Is(err, ErrWorkflowRequestNotFound) {
+		t.Fatalf("cross-account card reference error = %v, want ErrWorkflowRequestNotFound", err)
+	}
+}
+
+func TestWorkflowCardReferenceResolvesOriginalResourceAccessCard(t *testing.T) {
+	st := openFeishuDocsTestStore(t)
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	request, err := st.CreateFeishuResourceAccessRequest(FeishuResourceAccessRequest{
+		AccountID:           "feishu:cli_test",
+		ActorOpenID:         "ou_requester",
+		ChatID:              "oc_chat",
+		SourceMessageID:     "om_source",
+		ResourceType:        "docx",
+		ResourceToken:       "doxcn_reference",
+		Permission:          FeishuResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+		CreatedAt:           now,
+		ExpiresAt:           now.Add(10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("CreateFeishuResourceAccessRequest returned error: %v", err)
+	}
+	if err := st.SetFeishuResourceAccessCardMessageID(request.ID, request.AccountID, "om_resource_card", now.Add(time.Second)); err != nil {
+		t.Fatalf("SetFeishuResourceAccessCardMessageID returned error: %v", err)
+	}
+
+	reference, err := st.GetWorkflowCardReference(request.ID, request.AccountID)
+	if err != nil {
+		t.Fatalf("GetWorkflowCardReference returned error: %v", err)
+	}
+	if reference.RequestID != request.ID || reference.AccountID != request.AccountID ||
+		reference.Kind != WorkflowRequestKindFeishuResourceAccess || reference.CardMessageID != "om_resource_card" {
+		t.Fatalf("resource workflow card reference = %#v", reference)
+	}
+}
+
 func TestWorkflowMigrationBackfillsApprovalsAndRenamesGrantSource(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	if _, err := config.EnsurePlatformDataDir(PlatformFeishu); err != nil {
