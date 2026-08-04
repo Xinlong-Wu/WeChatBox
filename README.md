@@ -385,6 +385,10 @@ is returned to the model as a structured `resource_authorization_required`
 tool error containing `required_tool`, `resource_type`, `resource_token`, and
 `permission`; the model can then call `feishu_docs_request_access` explicitly
 and retry the original tool after the asynchronous workflow completes.
+Bot-owned resources are accepted directly from the ownership registry and do
+not require a synthetic capability or grant row. Live verification may update
+the local capability verification timestamp or revoke an invalid local
+capability/grant, but the checker never changes Feishu collaborator permissions.
 
 Folder and document creation automatically run the same side-effect-free
 `folder/write` check on the actual parent folder before any operation approval
@@ -524,6 +528,8 @@ different user, bot, chat, tool, action, or resource requires a new operation
 card. During schema migration, legacy 24-hour tool-wide grants are cleared
 fail-closed because they cannot be safely promoted to this permanent exact
 scope without a new user decision.
+Permanent exact-scope operation grants are stored in
+`tool_approval_grants`; `tool_operation_grants` is not a schema table.
 
 Card-approved document creation and append run asynchronously and update the
 original card with the result; they do not send a second standalone
