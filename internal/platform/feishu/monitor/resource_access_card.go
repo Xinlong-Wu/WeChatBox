@@ -21,18 +21,21 @@ const (
 )
 
 type pendingResourceGrantCard struct {
-	request store.FeishuResourceAccessRequest
+	request     store.FeishuResourceAccessRequest
+	oauthStatus string
 }
 
 func (c pendingResourceGrantCard) JSON() (string, error) {
 	permissionLabel := resourceAccessPermissionLabel(c.request.Permission)
+	displayName := resourceAccessCardDisplayName(c.request)
 	lines := []string{
 		"机器人请求在当前飞书对话中使用以下资源：",
 		"",
-		"**权限**：" + permissionLabel,
+		"**资源名称**：" + escapeApprovalMarkdown(displayName),
 		"**资源类型**：" + escapeApprovalMarkdown(c.request.ResourceType),
-		"**资源 Token**：`" + escapeApprovalMarkdown(c.request.ResourceToken) + "`",
+		"**权限**：" + permissionLabel,
 		"**飞书协作者**：" + escapeApprovalMarkdown(resourceAccessSubjectLabel(c.request)),
+		"**OAuth 状态**：" + escapeApprovalMarkdown(resourceAccessOAuthStatusLabel(c.oauthStatus)),
 	}
 	if c.request.ResourceURL != "" {
 		lines = append(lines, "**资源链接**：[在飞书中打开]("+c.request.ResourceURL+")")
@@ -116,17 +119,27 @@ type pendingResourceAccessCard struct {
 
 func (c pendingResourceAccessCard) JSON() (string, error) {
 	permissionLabel := resourceAccessPermissionLabel(c.request.Permission)
+	displayName := resourceAccessCardDisplayName(c.request)
 	lines := []string{
 		"机器人需要由本次请求的飞书用户授权，才能为当前对话访问该资源。",
 		"",
-		"**权限**：" + permissionLabel,
+		"**资源名称**：" + escapeApprovalMarkdown(displayName),
 		"**资源类型**：" + escapeApprovalMarkdown(c.request.ResourceType),
-		"**资源 Token**：`" + escapeApprovalMarkdown(c.request.ResourceToken) + "`",
+		"**权限**：" + permissionLabel,
 		"**飞书协作者**：" + escapeApprovalMarkdown(resourceAccessSubjectLabel(c.request)),
 		"**LingoBridge 授权**：" + escapeApprovalMarkdown(resourceAccessGrantModeLabel(c.request)),
+		"**OAuth 状态**：" + escapeApprovalMarkdown(resourceAccessOAuthStatusLabel(resourceAccessOAuthStatusAuthorizationNeeded)),
+	}
+	if c.request.ResourceURL != "" {
+		lines = append(lines, "**资源链接**：[在飞书中打开]("+c.request.ResourceURL+")")
 	}
 	if c.request.Reason != "" {
 		lines = append(lines, "**用途**："+escapeApprovalMarkdown(c.request.Reason))
+	}
+	if c.request.GrantMode == store.FeishuResourceGrantModeOnce {
+		lines = append(lines, fmt.Sprintf("**本地有效期**：授权成功后 %d 分钟；到期只停止 LingoBridge 放行新操作，不撤销飞书协作者权限。", c.request.OnceDurationMinutes))
+	} else if c.request.GrantMode == store.FeishuResourceGrantModeAll {
+		lines = append(lines, "**本地有效期**：永久；仍只适用于当前用户、机器人账号、对话和这一精确资源。")
 	}
 	lines = append(lines,
 		"",
@@ -348,6 +361,28 @@ func resourceAccessGrantModeLabel(request store.FeishuResourceAccessRequest) str
 		return "永久允许"
 	default:
 		return "等待用户选择"
+	}
+}
+
+func resourceAccessCardDisplayName(request store.FeishuResourceAccessRequest) string {
+	if name := normalizeResourceDisplayName(request.ResourceDisplayName); name != "" {
+		return name
+	}
+	return fallbackResourceDisplayName(request.ResourceType, request.ResourceToken)
+}
+
+func resourceAccessOAuthStatusLabel(status string) string {
+	switch status {
+	case resourceAccessOAuthStatusCapabilityReady:
+		return "已有可核验的飞书资源权限，批准后无需 OAuth"
+	case resourceAccessOAuthStatusCredentialReady:
+		return "已保存可能可用的加密 OAuth 凭证，批准后将直接使用并在需要时静默刷新"
+	case resourceAccessOAuthStatusConfigurationMissing:
+		return "当前机器人账号未配置 OAuth，无法创建新的飞书协作者权限"
+	case resourceAccessOAuthStatusAuthorizationNeeded:
+		return "批准后需要在飞书官方页面完成 OAuth"
+	default:
+		return "批准后将核验是否需要 OAuth"
 	}
 }
 

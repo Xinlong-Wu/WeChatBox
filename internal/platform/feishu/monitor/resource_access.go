@@ -31,8 +31,14 @@ const (
 	defaultResourceAccessTTL        = 10 * time.Minute
 	resourceAccessCallbackTimeout   = 30 * time.Second
 	resourceAccessCardUpdateTimeout = 10 * time.Second
+	resourceAccessDisplayNameRunes  = 120
 
 	resourceAccessOAuthScope = "auth:user.id:read docs:permission.member:create docs:permission.member:update offline_access"
+
+	resourceAccessOAuthStatusCapabilityReady      = "capability_ready"
+	resourceAccessOAuthStatusCredentialReady      = "credential_ready"
+	resourceAccessOAuthStatusAuthorizationNeeded  = "authorization_needed"
+	resourceAccessOAuthStatusConfigurationMissing = "configuration_missing"
 )
 
 type resourceAccessStore interface {
@@ -40,6 +46,8 @@ type resourceAccessStore interface {
 	SaveFeishuBotResource(store.FeishuBotResource) (store.FeishuBotResource, error)
 	GetFeishuBotResource(accountID, resourceType, resourceToken string) (store.FeishuBotResource, error)
 	DefaultFeishuChatFolder(accountID, chatID string) (store.FeishuChatFolder, error)
+	GetFeishuChatFolder(accountID, chatID, folderToken string) (store.FeishuChatFolder, error)
+	GetFeishuChatDocument(accountID, chatID, documentToken string) (store.FeishuChatDocument, error)
 	CreateFeishuResourceAccessRequest(store.FeishuResourceAccessRequest) (store.FeishuResourceAccessRequest, error)
 	CreateWorkflowContinuation(store.WorkflowContinuation) (store.WorkflowContinuation, error)
 	CancelWorkflowContinuation(requestID, accountID, reason string, now time.Time) error
@@ -228,6 +236,10 @@ func (m *resourceAccessManager) RequestAccess(ctx context.Context, input feishut
 	if err != nil {
 		return feishutools.ResourceAccessResult{}, err
 	}
+	resourceDisplayName, err := m.resolveResourceDisplayName(chat, resourceType, resourceToken)
+	if err != nil {
+		return feishutools.ResourceAccessResult{}, err
+	}
 	subjectType, subjectID, supportedMessage := m.resourceGrantSubject(chat, resourceType)
 	now := m.currentTime()
 	request, err := m.store.CreateFeishuResourceAccessRequest(store.FeishuResourceAccessRequest{
@@ -239,6 +251,7 @@ func (m *resourceAccessManager) RequestAccess(ctx context.Context, input feishut
 		ResourceType:        resourceType,
 		ResourceToken:       resourceToken,
 		ResourceURL:         resourceURL,
+		ResourceDisplayName: resourceDisplayName,
 		Permission:          input.Permission,
 		Reason:              input.Reason,
 		OnceDurationMinutes: input.OnceDurationMinutes,
@@ -365,6 +378,11 @@ func (m *resourceAccessManager) RequestAccess(ctx context.Context, input feishut
 		result.Message = "当前机器人账号未配置 OAuth，且没有可复用的飞书资源能力；只能直接使用 Bot 自有资源或已经可以实时验证的授权。"
 		return result, nil
 	}
+	oauthStatus, err := m.resourceAccessOAuthDisplayStatus(actor, capabilityActive)
+	if err != nil {
+		m.failResourceAccessBestEffort(ctx, request.ID)
+		return feishutools.ResourceAccessResult{}, fmt.Errorf("inspect feishu resource OAuth availability: %w", err)
+	}
 	execution, err := trustedWorkflowExecutionContext(ctx, m.account.ID, feishutools.ResourceAccessToolName)
 	if err != nil {
 		m.failResourceAccessBestEffort(ctx, request.ID)
@@ -374,7 +392,7 @@ func (m *resourceAccessManager) RequestAccess(ctx context.Context, input feishut
 		m.failResourceAccessBestEffort(ctx, request.ID)
 		return feishutools.ResourceAccessResult{}, err
 	}
-	messageID, err := m.cards.Send(ctx, request.ChatID, pendingResourceGrantCard{request: request})
+	messageID, err := m.cards.Send(ctx, request.ChatID, pendingResourceGrantCard{request: request, oauthStatus: oauthStatus})
 	if err != nil {
 		m.failResourceAccessBestEffort(ctx, request.ID)
 		cancelWorkflowContinuationBestEffort(ctx, m.store, request.ID, request.AccountID, "resource access card send failed", m.currentTime())
@@ -1386,6 +1404,90 @@ func (m *resourceAccessManager) resolveResource(ctx context.Context, chat feishu
 		resourceURL = defaultFeishuResourceURL(resourceType, resourceToken)
 	}
 	return resourceType, resourceToken, resourceURL, nil
+}
+
+func (m *resourceAccessManager) resolveResourceDisplayName(chat feishutools.ChatContext, resourceType, resourceToken string) (string, error) {
+	resourceType = feishutools.NormalizeResourceType(resourceType)
+	resourceToken = strings.TrimSpace(resourceToken)
+	resource, err := m.store.GetFeishuBotResource(m.account.ID, resourceType, resourceToken)
+	if err == nil {
+		if name := normalizeResourceDisplayName(resource.Name); name != "" {
+			return name, nil
+		}
+	} else if !errors.Is(err, store.ErrFeishuBotResourceNotFound) {
+		return "", fmt.Errorf("resolve Bot-owned feishu resource display name: %w", err)
+	}
+
+	switch resourceType {
+	case "folder":
+		folder, folderErr := m.store.GetFeishuChatFolder(m.account.ID, chat.ChatID, resourceToken)
+		if folderErr == nil {
+			if name := normalizeResourceDisplayName(folder.Name); name != "" {
+				return name, nil
+			}
+		} else if !errors.Is(folderErr, store.ErrFeishuChatFolderNotFound) {
+			return "", fmt.Errorf("resolve chat-bound feishu folder display name: %w", folderErr)
+		}
+	case "docx":
+		document, documentErr := m.store.GetFeishuChatDocument(m.account.ID, chat.ChatID, resourceToken)
+		if documentErr == nil {
+			if name := normalizeResourceDisplayName(document.Title); name != "" {
+				return name, nil
+			}
+		} else if !errors.Is(documentErr, store.ErrFeishuChatDocumentNotFound) {
+			return "", fmt.Errorf("resolve chat-bound feishu document display name: %w", documentErr)
+		}
+	}
+	return fallbackResourceDisplayName(resourceType, resourceToken), nil
+}
+
+func (m *resourceAccessManager) resourceAccessOAuthDisplayStatus(actor feishutools.Actor, capabilityActive bool) (string, error) {
+	if capabilityActive {
+		return resourceAccessOAuthStatusCapabilityReady, nil
+	}
+	if !m.oauthEnabled() {
+		return resourceAccessOAuthStatusConfigurationMissing, nil
+	}
+	credential, err := m.store.GetFeishuUserOAuthCredential(m.account.ID, actor.OpenID, actor.UserID)
+	if err != nil {
+		if errors.Is(err, store.ErrFeishuUserOAuthCredentialNotFound) {
+			return resourceAccessOAuthStatusAuthorizationNeeded, nil
+		}
+		return "", err
+	}
+	now := m.currentTime()
+	metadataUsable := credential.Status == store.FeishuUserOAuthCredentialStatusActive &&
+		credential.ReauthorizeAt.After(now) &&
+		len(missingOAuthScopes(credential.Scopes, resourceAccessOAuthScope)) == 0 &&
+		((credential.AccessTokenCiphertext != "" && credential.AccessTokenExpiresAt.After(now)) ||
+			(credential.RefreshTokenCiphertext != "" && credential.RefreshTokenExpiresAt.After(now)))
+	if metadataUsable {
+		return resourceAccessOAuthStatusCredentialReady, nil
+	}
+	return resourceAccessOAuthStatusAuthorizationNeeded, nil
+}
+
+func normalizeResourceDisplayName(value string) string {
+	return truncateApprovalRunes(strings.TrimSpace(value), resourceAccessDisplayNameRunes)
+}
+
+func fallbackResourceDisplayName(resourceType, resourceToken string) string {
+	label := map[string]string{
+		"folder":  "飞书文件夹",
+		"docx":    "飞书文档",
+		"doc":     "飞书文档",
+		"sheet":   "飞书电子表格",
+		"bitable": "飞书多维表格",
+		"wiki":    "飞书知识库页面",
+		"file":    "飞书文件",
+	}[feishutools.NormalizeResourceType(resourceType)]
+	if label == "" {
+		label = "飞书资源"
+	}
+	if reference := shortResourceRef(resourceToken); reference != "" {
+		return label + "（" + reference + "）"
+	}
+	return label
 }
 
 type resourceAccessRootFolder struct {

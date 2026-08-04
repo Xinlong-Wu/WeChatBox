@@ -59,6 +59,7 @@ func TestFeishuResourceAccessOAuthLifecycleAndChatScopedGrant(t *testing.T) {
 		ResourceType:        "docx",
 		ResourceToken:       "doxcn_external",
 		ResourceURL:         "https://docs.feishu.cn/docx/doxcn_external",
+		ResourceDisplayName: "项目交付文档",
 		Permission:          FeishuResourcePermissionWrite,
 		Reason:              "append the approved plan",
 		OnceDurationMinutes: 30,
@@ -93,7 +94,8 @@ func TestFeishuResourceAccessOAuthLifecycleAndChatScopedGrant(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetFeishuResourceAccessRequest returned error: %v", err)
 	}
-	if stored.PKCEVerifier != "" || stored.OAuthStateHash != "" || stored.State != FeishuResourceAccessStateExecuting {
+	if stored.PKCEVerifier != "" || stored.OAuthStateHash != "" || stored.State != FeishuResourceAccessStateExecuting ||
+		stored.ResourceDisplayName != "项目交付文档" {
 		t.Fatalf("claimed stored request retained one-time values: %#v", stored)
 	}
 	if _, err := st.ClaimFeishuResourceAccessOAuth("state_hash", request.AccountID, now.Add(4*time.Second)); !errors.Is(err, ErrFeishuResourceAccessNotFound) {

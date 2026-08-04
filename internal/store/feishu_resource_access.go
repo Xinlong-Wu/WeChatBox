@@ -83,6 +83,7 @@ type FeishuResourceAccessRequest struct {
 	ResourceType        string
 	ResourceToken       string
 	ResourceURL         string
+	ResourceDisplayName string
 	Permission          string
 	Reason              string
 	OnceDurationMinutes int
@@ -219,12 +220,12 @@ func (s *Store) CreateFeishuResourceAccessRequest(request FeishuResourceAccessRe
 	_, err = tx.Exec(
 		`INSERT INTO feishu_resource_access_requests (
 			id, account_id, actor_open_id, actor_user_id, chat_id, source_message_id,
-			resource_type, resource_token, resource_url, permission, reason,
+			resource_type, resource_token, resource_url, resource_display_name, permission, reason,
 			once_duration_minutes, grant_mode, decision_at_ms,
 			subject_type, subject_id, grant_source, verified_permission,
 			card_message_id, oauth_state_hash, pkce_verifier, state,
 			created_at_ms, expires_at_ms, updated_at_ms
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, ?, ?, '', '', '', '', '', ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, ?, ?, '', '', '', '', '', ?, ?, ?, ?)`,
 		request.ID,
 		request.AccountID,
 		request.ActorOpenID,
@@ -234,6 +235,7 @@ func (s *Store) CreateFeishuResourceAccessRequest(request FeishuResourceAccessRe
 		request.ResourceType,
 		request.ResourceToken,
 		request.ResourceURL,
+		request.ResourceDisplayName,
 		request.Permission,
 		request.Reason,
 		request.OnceDurationMinutes,
@@ -1010,7 +1012,7 @@ func FeishuResourcePermissionSatisfies(granted, requested string) bool {
 }
 
 const feishuResourceAccessSelect = `SELECT id, account_id, actor_open_id, actor_user_id,
- chat_id, source_message_id, resource_type, resource_token, resource_url,
+ chat_id, source_message_id, resource_type, resource_token, resource_url, resource_display_name,
  permission, reason, once_duration_minutes, grant_mode, decision_at_ms,
  subject_type, subject_id, grant_source, verified_permission,
  card_message_id, oauth_state_hash, pkce_verifier, state,
@@ -1058,6 +1060,7 @@ func scanFeishuResourceAccessRequest(row feishuResourceAccessScanner) (FeishuRes
 		&request.ResourceType,
 		&request.ResourceToken,
 		&request.ResourceURL,
+		&request.ResourceDisplayName,
 		&request.Permission,
 		&request.Reason,
 		&request.OnceDurationMinutes,
@@ -1146,6 +1149,7 @@ func normalizeFeishuResourceAccessRequest(request FeishuResourceAccessRequest) F
 	request.ResourceType = strings.TrimSpace(request.ResourceType)
 	request.ResourceToken = strings.TrimSpace(request.ResourceToken)
 	request.ResourceURL = strings.TrimSpace(request.ResourceURL)
+	request.ResourceDisplayName = strings.TrimSpace(request.ResourceDisplayName)
 	request.Permission = strings.TrimSpace(request.Permission)
 	request.Reason = strings.TrimSpace(request.Reason)
 	request.GrantMode = strings.TrimSpace(request.GrantMode)

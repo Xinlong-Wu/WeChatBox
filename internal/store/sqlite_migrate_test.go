@@ -2,7 +2,7 @@ package store
 
 import "testing"
 
-func TestMigrateAddsFeishuResourceAccessDecisionColumnsAndRemovesLegacyConsumption(t *testing.T) {
+func TestMigrateAddsFeishuResourceAccessDisplayAndDecisionColumnsAndRemovesLegacyConsumption(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	st, err := Open(PlatformFeishu)
 	if err != nil {
@@ -16,7 +16,7 @@ func TestMigrateAddsFeishuResourceAccessDecisionColumnsAndRemovesLegacyConsumpti
 		st.Close()
 		t.Fatalf("add legacy consumed_at_ms: %v", err)
 	}
-	for _, column := range []string{"once_duration_minutes", "grant_mode", "decision_at_ms"} {
+	for _, column := range []string{"resource_display_name", "once_duration_minutes", "grant_mode", "decision_at_ms"} {
 		if _, err := st.db.Exec(`ALTER TABLE feishu_resource_access_requests DROP COLUMN ` + column); err != nil {
 			st.Close()
 			t.Fatalf("drop %s: %v", column, err)
@@ -54,7 +54,7 @@ func TestMigrateAddsFeishuResourceAccessDecisionColumnsAndRemovesLegacyConsumpti
 		t.Fatalf("inspect migrated schema: %v", err)
 	}
 	if columns["consumed_by_request_id"] || columns["consumed_at_ms"] ||
-		!columns["once_duration_minutes"] || !columns["grant_mode"] || !columns["decision_at_ms"] {
+		!columns["resource_display_name"] || !columns["once_duration_minutes"] || !columns["grant_mode"] || !columns["decision_at_ms"] {
 		t.Fatalf("migrated columns = %#v", columns)
 	}
 }

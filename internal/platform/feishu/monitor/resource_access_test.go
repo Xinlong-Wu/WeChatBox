@@ -57,7 +57,7 @@ func TestResourceAccessManagerGrantsBotRootWithoutCard(t *testing.T) {
 		t.Fatalf("Bot root cards = %#v, want none", cards)
 	}
 	request, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
-	if err != nil || request.State != store.FeishuResourceAccessStateSucceeded || request.GrantSource != store.FeishuResourceGrantSourceBotOwner {
+	if err != nil || request.State != store.FeishuResourceAccessStateSucceeded || request.GrantSource != store.FeishuResourceGrantSourceBotOwner || request.ResourceDisplayName != "Bot Root" {
 		t.Fatalf("stored Bot root request = %#v err=%v", request, err)
 	}
 	if _, err := st.GetFeishuBotResource("feishu:cli_test", "folder", "fld_bot_root"); err != nil {
@@ -73,6 +73,98 @@ func TestResourceAccessManagerGrantsBotRootWithoutCard(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("RequireResourceAccess returned error: %v", err)
+	}
+}
+
+func TestResourceAccessDisplayNameResolutionUsesTrustedMetadata(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("display-name resolution unexpectedly called Feishu API: %s", r.URL.Path)
+	}))
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
+	now := manager.currentTime()
+	if _, err := st.SaveFeishuBotResource(store.FeishuBotResource{
+		AccountID: "feishu:cli_test", ResourceType: "docx", ResourceToken: "doxcn_owned",
+		Name: "Bot 项目文档", CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("SaveFeishuBotResource returned error: %v", err)
+	}
+	if _, err := st.SaveFeishuChatFolder(store.FeishuChatFolder{
+		AccountID: "feishu:cli_test", ChatID: "oc_chat", FolderToken: "fld_bound", Name: "群聊交付目录",
+		ShareMemberType: "openchat", ShareMemberID: "oc_chat", ShareState: store.FeishuFolderShareStateSucceeded,
+		CreateRequestID: "req_folder_name", CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("SaveFeishuChatFolder returned error: %v", err)
+	}
+	if _, err := st.SaveFeishuChatDocument(store.FeishuChatDocument{
+		AccountID: "feishu:cli_test", ChatID: "oc_chat", DocumentToken: "doxcn_bound", FolderToken: "fld_bound",
+		Title: "群聊计划文档", SourceRequestID: "req_doc_name", CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("SaveFeishuChatDocument returned error: %v", err)
+	}
+	chat := feishutools.ChatContext{ChatID: "oc_chat", IsGroup: true}
+	tests := []struct {
+		name         string
+		resourceType string
+		token        string
+		want         string
+	}{
+		{name: "Bot ownership", resourceType: "docx", token: "doxcn_owned", want: "Bot 项目文档"},
+		{name: "chat folder", resourceType: "folder", token: "fld_bound", want: "群聊交付目录"},
+		{name: "chat document", resourceType: "docx", token: "doxcn_bound", want: "群聊计划文档"},
+		{name: "safe fallback", resourceType: "sheet", token: "sht_external", want: "飞书电子表格（" + shortResourceRef("sht_external") + "）"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := manager.resolveResourceDisplayName(chat, tt.resourceType, tt.token)
+			if err != nil || got != tt.want {
+				t.Fatalf("resolveResourceDisplayName = %q err=%v, want %q", got, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestResourceAccessOAuthDisplayStatusUsesMetadataWithoutRefreshing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("OAuth display status unexpectedly called Feishu API: %s", r.URL.Path)
+	}))
+	defer server.Close()
+	manager, st, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID: "cli_xxx", BaseURL: server.URL, CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	actor := feishutools.Actor{OpenID: "ou_requester", UserID: "u_requester"}
+	status, err := manager.resourceAccessOAuthDisplayStatus(actor, false)
+	if err != nil || status != resourceAccessOAuthStatusAuthorizationNeeded {
+		t.Fatalf("missing credential OAuth status = %q err=%v", status, err)
+	}
+	now := manager.currentTime()
+	credential, err := st.SaveFeishuUserOAuthCredential(store.FeishuUserOAuthCredential{
+		AccountID: "feishu:cli_test", ActorOpenID: actor.OpenID, ActorUserID: actor.UserID,
+		AccessTokenCiphertext: "v1.encrypted-access", AccessTokenExpiresAt: now.Add(time.Hour),
+		RefreshTokenCiphertext: "v1.encrypted-refresh", RefreshTokenExpiresAt: now.Add(30 * 24 * time.Hour),
+		Scopes: resourceAccessOAuthScope, AuthorizedAt: now, ReauthorizeAt: now.Add(365 * 24 * time.Hour),
+		Status: store.FeishuUserOAuthCredentialStatusActive, CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("SaveFeishuUserOAuthCredential returned error: %v", err)
+	}
+	status, err = manager.resourceAccessOAuthDisplayStatus(actor, false)
+	if err != nil || status != resourceAccessOAuthStatusCredentialReady {
+		t.Fatalf("stored credential OAuth status = %q err=%v", status, err)
+	}
+	unchanged, err := st.GetFeishuUserOAuthCredential("feishu:cli_test", actor.OpenID, actor.UserID)
+	if err != nil || unchanged.Version != credential.Version || unchanged.Status != credential.Status {
+		t.Fatalf("OAuth display inspection mutated credential = %#v err=%v", unchanged, err)
+	}
+	status, err = manager.resourceAccessOAuthDisplayStatus(actor, true)
+	if err != nil || status != resourceAccessOAuthStatusCapabilityReady {
+		t.Fatalf("capability OAuth status = %q err=%v", status, err)
+	}
+
+	disabled, _, _ := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
+	status, err = disabled.resourceAccessOAuthDisplayStatus(actor, false)
+	if err != nil || status != resourceAccessOAuthStatusConfigurationMissing {
+		t.Fatalf("disabled OAuth status = %q err=%v", status, err)
 	}
 }
 
@@ -385,6 +477,15 @@ func TestResourceAccessManagerApprovesPermanentGrantFromExistingCapabilityWithou
 	if err != nil || result.Status != feishutools.ResourceAccessStatusPending {
 		t.Fatalf("RequestAccess = %#v err=%v", result, err)
 	}
+	cards, _, _ := sender.snapshot()
+	if len(cards) != 1 || !strings.Contains(cards[0].text, "已有可核验的飞书资源权限") ||
+		!strings.Contains(cards[0].text, fallbackResourceDisplayName("docx", "doxcn_external")) {
+		t.Fatalf("initial resource authorization card = %#v", cards)
+	}
+	pending, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
+	if err != nil || pending.ResourceDisplayName != fallbackResourceDisplayName("docx", "doxcn_external") {
+		t.Fatalf("pending resource display context = %#v err=%v", pending, err)
+	}
 	event := resourceAccessCardEvent(result.RequestID, "ou_requester", "oc_chat", "om_card")
 	event.Event.Action.Value["action"] = resourceAccessCardActionApproveAll
 	response, err := manager.HandleCardAction(context.Background(), event)
@@ -450,6 +551,10 @@ func TestResourceAccessManagerUsesPersistedOAuthCredentialAfterApproval(t *testi
 	})
 	if err != nil || result.Status != feishutools.ResourceAccessStatusPending {
 		t.Fatalf("RequestAccess = %#v err=%v", result, err)
+	}
+	cards, _, _ := sender.snapshot()
+	if len(cards) != 1 || !strings.Contains(cards[0].text, "已保存可能可用的加密 OAuth 凭证") {
+		t.Fatalf("stored-credential resource card = %#v", cards)
 	}
 	event := resourceAccessCardEvent(result.RequestID, "ou_requester", "oc_chat", "om_card")
 	event.Event.Action.Value["action"] = resourceAccessCardActionApproveOnce
@@ -706,6 +811,16 @@ func TestResourceAccessOAuthTokenErrorDoesNotExposeSupportInstructions(t *testin
 		t.Fatalf("sent cards = %#v", cards)
 	}
 	oauthCard := approveResourceAccessAndWaitForOAuthCard(t, manager, st, sender, result.RequestID, resourceAccessCardActionApproveOnce)
+	for _, fragment := range []string{
+		fallbackResourceDisplayName("docx", "doxcn_external"),
+		"允许 30 分钟",
+		"授权成功后 30 分钟",
+		"批准后需要在飞书官方页面完成 OAuth",
+	} {
+		if !strings.Contains(oauthCard, fragment) {
+			t.Fatalf("OAuth handoff card lost resource context %q: %s", fragment, oauthCard)
+		}
+	}
 	state := resourceAccessCardState(t, oauthCard)
 	pending, err := st.GetFeishuResourceAccessRequest(result.RequestID, "feishu:cli_test")
 	if err != nil {
@@ -1304,19 +1419,20 @@ func TestResourceAccessRecoveryResumesApprovedPendingRequest(t *testing.T) {
 	}
 }
 
-func TestPendingResourceGrantCardContainsOnceAllAndCollaboratorScope(t *testing.T) {
+func TestPendingResourceGrantCardContainsResourceOAuthAndGrantContext(t *testing.T) {
 	raw, err := (pendingResourceGrantCard{request: store.FeishuResourceAccessRequest{
 		ID:                  "req_test",
 		ResourceType:        "folder",
 		ResourceToken:       "fld_external",
 		ResourceURL:         "https://docs.feishu.cn/drive/folder/fld_external",
+		ResourceDisplayName: "项目交付目录",
 		Permission:          store.FeishuResourcePermissionWrite,
 		Reason:              "写入项目交付物",
 		OnceDurationMinutes: 45,
 		SubjectType:         "openchat",
 		SubjectID:           "oc_chat",
 		ExpiresAt:           time.Date(2026, time.August, 1, 12, 10, 0, 0, time.UTC),
-	}}).JSON()
+	}, oauthStatus: resourceAccessOAuthStatusCredentialReady}).JSON()
 	if err != nil {
 		t.Fatalf("pendingResourceGrantCard.JSON returned error: %v", err)
 	}
@@ -1335,10 +1451,13 @@ func TestPendingResourceGrantCardContainsOnceAllAndCollaboratorScope(t *testing.
 	formElements, _ := form["elements"].([]any)
 	description, _ := formElements[0].(map[string]any)
 	content, _ := description["content"].(string)
-	for _, fragment := range []string{"写入（包含读取）", "当前群聊（openchat）", "允许 45 分钟", "永久允许", "不会移除或降低飞书中的 Bot/群聊协作者权限", "写入项目交付物"} {
+	for _, fragment := range []string{"项目交付目录", "在飞书中打开", "写入（包含读取）", "当前群聊（openchat）", "已保存可能可用的加密 OAuth 凭证", "允许 45 分钟", "永久允许", "不会移除或降低飞书中的 Bot/群聊协作者权限", "写入项目交付物"} {
 		if !strings.Contains(content, fragment) {
 			t.Fatalf("resource grant card description missing %q: %s", fragment, content)
 		}
+	}
+	if strings.Contains(content, "资源 Token") {
+		t.Fatalf("resource grant card exposed a visible resource token field: %s", content)
 	}
 	once := findCardElementByName(card, "Button_resource_once")
 	all := findCardElementByName(card, "Button_resource_all")
@@ -1355,6 +1474,8 @@ func TestPendingResourceAccessCardContainsOAuthHandoffForm(t *testing.T) {
 			ID:                  "req_test",
 			ResourceType:        "docx",
 			ResourceToken:       "doxcn_external",
+			ResourceURL:         "https://docs.feishu.cn/docx/doxcn_external",
+			ResourceDisplayName: "项目计划文档",
 			Permission:          store.FeishuResourcePermissionWrite,
 			Reason:              "创建项目计划文档",
 			OnceDurationMinutes: 30,
@@ -1403,10 +1524,13 @@ func TestPendingResourceAccessCardContainsOAuthHandoffForm(t *testing.T) {
 	markdown, _ := elements[1].(map[string]any)
 	markdownContent, _ := markdown["content"].(string)
 	if markdown["tag"] != "markdown" || markdown["element_id"] != "KNJPSduXTksKaRe28qq6" || markdown["text_size"] != "normal_v2" ||
-		!strings.Contains(markdownContent, "为了更好地为您提供服务") || !strings.Contains(markdownContent, "创建项目计划文档") ||
+		!strings.Contains(markdownContent, "为了更好地为您提供服务") || !strings.Contains(markdownContent, "项目计划文档") ||
+		!strings.Contains(markdownContent, "在飞书中打开") || !strings.Contains(markdownContent, "允许 30 分钟") ||
+		!strings.Contains(markdownContent, "授权成功后 30 分钟") || !strings.Contains(markdownContent, "飞书官方页面完成 OAuth") ||
+		!strings.Contains(markdownContent, "创建项目计划文档") ||
 		!strings.Contains(markdownContent, "点击下方“前往飞书官方授权页面”按钮") ||
 		!strings.Contains(markdownContent, "使用应用密钥加密保存 user_access_token 与 refresh_token") ||
-		!strings.Contains(markdownContent, "不会发送给大模型或写入日志") || strings.Contains(markdownContent, authURL) {
+		!strings.Contains(markdownContent, "不会发送给大模型或写入日志") || strings.Contains(markdownContent, "资源 Token") || strings.Contains(markdownContent, authURL) {
 		t.Fatalf("resource card description = %#v", markdown)
 	}
 	openButton, _ := elements[2].(map[string]any)

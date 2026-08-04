@@ -411,6 +411,15 @@ reauthorization is required does it update the same request and card with a
 link to Feishu's official OAuth page. The OAuth card contains a 1,000-character
 `oauth_result` input and a submit button for the complete callback URL or raw
 authorization code when LingoBridge has no browser-reachable callback listener.
+Both card stages show a server-resolved resource name, the Feishu resource
+link, requested read/write scope, exact collaborator, local `once`/`all`
+semantics, and whether an existing capability, stored OAuth credential, or new
+OAuth authorization will be used. Names come from the Bot ownership registry
+first, then the current-chat folder/document binding, with a resource-type plus
+hashed reference fallback; model input cannot replace trusted metadata. The raw
+resource token is not rendered as a separate visible card field. OAuth status
+inspection reads only credential metadata and does not decrypt or refresh a
+token.
 The whole workflow remains bound to the original Feishu user, account, chat,
 card message, and global request ID; the model cannot provide another
 `chat_id`.
@@ -536,8 +545,10 @@ success, or failure. OAuth state is stored only as a hash and cleared when
 either the HTTP callback or exact-context card submission claims it. The
 existing `pkce_verifier` storage column remains only to identify and reject
 in-flight requests created by older versions; new requests leave it empty, and
-any legacy value is cleared on claim. Verified user OAuth credentials are kept
-separately as authenticated ciphertext with their exact Feishu response
+any legacy value is cleared on claim. Resource-access requests also retain the
+server-resolved display name so the same trusted resource context survives the
+choice-card to OAuth-card transition and process recovery. Verified user OAuth
+credentials are kept separately as authenticated ciphertext with their exact Feishu response
 expiries, scopes, authorization time, refresh version, and mandatory
 reauthorization time. Access tokens are refreshed within five minutes of
 expiry; each successful refresh atomically replaces both the access token and

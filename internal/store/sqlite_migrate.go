@@ -160,6 +160,7 @@ func (s *Store) migrate() error {
 			resource_type TEXT NOT NULL,
 			resource_token TEXT NOT NULL,
 			resource_url TEXT NOT NULL DEFAULT '',
+			resource_display_name TEXT NOT NULL DEFAULT '',
 			permission TEXT NOT NULL,
 			reason TEXT NOT NULL DEFAULT '',
 			once_duration_minutes INTEGER NOT NULL DEFAULT 30,
@@ -250,6 +251,9 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if err := s.ensureFeishuResourceAccessDecisionColumns(); err != nil {
+		return err
+	}
+	if err := s.ensureFeishuResourceAccessDisplayColumns(); err != nil {
 		return err
 	}
 	if err := s.ensureWorkflowContinuationContextColumns(); err != nil {
@@ -574,6 +578,20 @@ func (s *Store) ensureFeishuResourceAccessDecisionColumns() error {
 		if _, err := s.db.Exec(`ALTER TABLE feishu_resource_access_requests ADD COLUMN decision_at_ms INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return fmt.Errorf("add feishu resource access decision timestamp column: %w", err)
 		}
+	}
+	return nil
+}
+
+func (s *Store) ensureFeishuResourceAccessDisplayColumns() error {
+	hasDisplayName, err := s.tableHasColumn("feishu_resource_access_requests", "resource_display_name")
+	if err != nil {
+		return fmt.Errorf("inspect feishu resource access display-name schema: %w", err)
+	}
+	if hasDisplayName {
+		return nil
+	}
+	if _, err := s.db.Exec(`ALTER TABLE feishu_resource_access_requests ADD COLUMN resource_display_name TEXT NOT NULL DEFAULT ''`); err != nil {
+		return fmt.Errorf("add feishu resource access display-name column: %w", err)
 	}
 	return nil
 }
