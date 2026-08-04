@@ -877,16 +877,9 @@ func (t docsTool) appendTextBlocks(ctx context.Context, documentID, content stri
 	if len(blocks) == 0 {
 		return nil
 	}
-	index := 0
-	childrenReq := larkdocx.NewGetDocumentBlockChildrenReqBuilder().
-		DocumentId(documentID).
-		BlockId(documentID).
-		DocumentRevisionId(-1).
-		PageSize(500).
-		Build()
-	children, err := t.client.Docx.DocumentBlockChildren.Get(ctx, childrenReq)
-	if err == nil && children != nil && children.Success() && children.Data != nil {
-		index = len(children.Data.Items)
+	index, err := t.docxTopLevelChildCount(ctx, documentID)
+	if err != nil {
+		return err
 	}
 	req := larkdocx.NewCreateDocumentBlockChildrenReqBuilder().
 		DocumentId(documentID).
@@ -905,6 +898,56 @@ func (t docsTool) appendTextBlocks(ctx context.Context, documentID, content stri
 		return fmt.Errorf("append feishu document code=%d msg=%s", resp.Code, resp.Msg)
 	}
 	return nil
+}
+
+func (t docsTool) docxTopLevelChildCount(ctx context.Context, documentID string) (int, error) {
+	const pageSize = 500
+
+	total := 0
+	pageToken := ""
+	seenPageTokens := make(map[string]struct{})
+	for {
+		builder := larkdocx.NewGetDocumentBlockChildrenReqBuilder().
+			DocumentId(documentID).
+			BlockId(documentID).
+			DocumentRevisionId(-1).
+			PageSize(pageSize)
+		if pageToken != "" {
+			builder.PageToken(pageToken)
+		}
+		resp, err := t.client.Docx.DocumentBlockChildren.Get(ctx, builder.Build())
+		if err != nil {
+			return 0, fmt.Errorf("resolve feishu document append position: %w", err)
+		}
+		if resp == nil {
+			return 0, fmt.Errorf("resolve feishu document append position: empty response")
+		}
+		if !resp.Success() {
+			return 0, fmt.Errorf("resolve feishu document append position code=%d msg=%s", resp.Code, resp.Msg)
+		}
+		if resp.Data == nil {
+			return 0, fmt.Errorf("resolve feishu document append position: empty response data")
+		}
+		total += len(resp.Data.Items)
+		if resp.Data.HasMore == nil || !*resp.Data.HasMore {
+			return total, nil
+		}
+		nextPageToken := ""
+		if resp.Data.PageToken != nil {
+			nextPageToken = strings.TrimSpace(*resp.Data.PageToken)
+		}
+		if nextPageToken == "" {
+			return 0, fmt.Errorf("resolve feishu document append position: response has more pages but no page token")
+		}
+		if nextPageToken == pageToken {
+			return 0, fmt.Errorf("resolve feishu document append position: page token did not advance")
+		}
+		if _, seen := seenPageTokens[nextPageToken]; seen {
+			return 0, fmt.Errorf("resolve feishu document append position: repeated page token")
+		}
+		seenPageTokens[nextPageToken] = struct{}{}
+		pageToken = nextPageToken
+	}
 }
 
 func textBlocks(content string) []*larkdocx.Block {

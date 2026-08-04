@@ -135,6 +135,169 @@ func TestDocsReadAndAppendExternalDocumentUseResourceAccessWithoutBinding(t *tes
 	}
 }
 
+func TestDocsAppendTextBlocksUsesSinglePageChildCount(t *testing.T) {
+	const documentToken = "doxcnsinglepage123"
+	var getCalls, postCalls int
+	var appendIndex int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/oauth/v3/token" || r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200,
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodGet:
+			getCalls++
+			if got := r.URL.Query().Get("page_size"); got != "500" {
+				t.Fatalf("page_size = %q, want 500", got)
+			}
+			if got := r.URL.Query().Get("page_token"); got != "" {
+				t.Fatalf("first page_token = %q, want empty", got)
+			}
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{
+					"items":    []any{map[string]any{"block_id": "block_1"}, map[string]any{"block_id": "block_2"}},
+					"has_more": false,
+				},
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodPost:
+			postCalls++
+			var body struct {
+				Index *int `json:"index"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode append request: %v", err)
+			}
+			if body.Index == nil {
+				t.Fatal("append request index is nil")
+			}
+			appendIndex = *body.Index
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"children": []any{}}})
+		default:
+			t.Fatalf("unexpected path: %s method=%s", r.URL.Path, r.Method)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	if err := (docsTool{client: client}).appendTextBlocks(context.Background(), documentToken, "new paragraph"); err != nil {
+		t.Fatalf("appendTextBlocks returned error: %v", err)
+	}
+	if getCalls != 1 || postCalls != 1 || appendIndex != 2 {
+		t.Fatalf("get_calls=%d post_calls=%d append_index=%d, want 1/1/2", getCalls, postCalls, appendIndex)
+	}
+}
+
+func TestDocsAppendTextBlocksUsesAllChildPages(t *testing.T) {
+	const documentToken = "doxcnmultipage123"
+	var getCalls, postCalls int
+	var appendIndex int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/oauth/v3/token" || r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200,
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodGet:
+			getCalls++
+			switch r.URL.Query().Get("page_token") {
+			case "":
+				writeJSON(t, w, map[string]any{
+					"code": 0,
+					"msg":  "ok",
+					"data": map[string]any{
+						"items":      []any{map[string]any{"block_id": "block_1"}, map[string]any{"block_id": "block_2"}},
+						"has_more":   true,
+						"page_token": "page-2",
+					},
+				})
+			case "page-2":
+				writeJSON(t, w, map[string]any{
+					"code": 0,
+					"msg":  "ok",
+					"data": map[string]any{
+						"items": []any{
+							map[string]any{"block_id": "block_3"},
+							map[string]any{"block_id": "block_4"},
+							map[string]any{"block_id": "block_5"},
+						},
+						"has_more": false,
+					},
+				})
+			default:
+				t.Fatalf("unexpected page_token: %q", r.URL.Query().Get("page_token"))
+			}
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodPost:
+			postCalls++
+			var body struct {
+				Index *int `json:"index"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode append request: %v", err)
+			}
+			if body.Index == nil {
+				t.Fatal("append request index is nil")
+			}
+			appendIndex = *body.Index
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok", "data": map[string]any{"children": []any{}}})
+		default:
+			t.Fatalf("unexpected path: %s method=%s", r.URL.Path, r.Method)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	if err := (docsTool{client: client}).appendTextBlocks(context.Background(), documentToken, "new paragraph"); err != nil {
+		t.Fatalf("appendTextBlocks returned error: %v", err)
+	}
+	if getCalls != 2 || postCalls != 1 || appendIndex != 5 {
+		t.Fatalf("get_calls=%d post_calls=%d append_index=%d, want 2/1/5", getCalls, postCalls, appendIndex)
+	}
+}
+
+func TestDocsAppendTextBlocksDoesNotWriteWhenChildLookupFails(t *testing.T) {
+	const documentToken = "doxcnlookupfailure123"
+	var postCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/oauth/v3/token" || r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "ok", "tenant_access_token": "tenant-token", "expire": 7200,
+			})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodGet:
+			writeJSON(t, w, map[string]any{"code": 99991672, "msg": "lookup denied"})
+		case r.URL.Path == "/open-apis/docx/v1/documents/"+documentToken+"/blocks/"+documentToken+"/children" && r.Method == http.MethodPost:
+			postCalls++
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok"})
+		default:
+			t.Fatalf("unexpected path: %s method=%s", r.URL.Path, r.Method)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	err := (docsTool{client: client}).appendTextBlocks(context.Background(), documentToken, "must not append")
+	if err == nil || !strings.Contains(err.Error(), "resolve feishu document append position") || !strings.Contains(err.Error(), "lookup denied") {
+		t.Fatalf("appendTextBlocks error = %v", err)
+	}
+	if postCalls != 0 {
+		t.Fatalf("append POST calls = %d, want 0 after failed child lookup", postCalls)
+	}
+}
+
 func TestDocsAppendToolReturnsPendingOperationApproval(t *testing.T) {
 	expiresAt := time.Date(2026, time.August, 1, 12, 10, 0, 0, time.UTC)
 	approver := &fakeApprovalRequester{result: OperationApprovalResult{
