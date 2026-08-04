@@ -313,6 +313,30 @@ func (s *Store) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_feishu_remote_operations_account_state
 		 ON feishu_remote_operations(account_id, state, updated_at_ms)`,
+		`CREATE TABLE IF NOT EXISTS feishu_docx_append_operations (
+			request_id TEXT PRIMARY KEY,
+			account_id TEXT NOT NULL,
+			chat_id TEXT NOT NULL,
+			actor_open_id TEXT NOT NULL DEFAULT '',
+			actor_user_id TEXT NOT NULL DEFAULT '',
+			document_token TEXT NOT NULL,
+			client_token TEXT NOT NULL,
+			insertion_index INTEGER NOT NULL,
+			payload_hash TEXT NOT NULL,
+			envelope_hash TEXT NOT NULL,
+			envelope_ciphertext TEXT NOT NULL,
+			state TEXT NOT NULL,
+			remote_call_started_at_ms INTEGER NOT NULL DEFAULT 0,
+			remote_result_at_ms INTEGER NOT NULL DEFAULT 0,
+			execution_owner_id TEXT NOT NULL DEFAULT '',
+			execution_token TEXT NOT NULL DEFAULT '',
+			execution_lease_expires_at_ms INTEGER NOT NULL DEFAULT 0,
+			last_error_category TEXT NOT NULL DEFAULT '',
+			created_at_ms INTEGER NOT NULL,
+			updated_at_ms INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_feishu_docx_append_operations_account_state
+		 ON feishu_docx_append_operations(account_id, state, updated_at_ms)`,
 	}
 
 	for _, q := range queries {
@@ -345,6 +369,9 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if err := s.ensureWorkflowContinuationContextColumns(); err != nil {
+		return err
+	}
+	if err := s.ensureFeishuDocxAppendExecutionColumns(); err != nil {
 		return err
 	}
 	if err := s.migrateFeishuResourceCapabilities(); err != nil {
@@ -724,6 +751,30 @@ func (s *Store) ensureWorkflowContinuationContextColumns() error {
 	}
 	if _, err := s.db.Exec(`ALTER TABLE workflow_continuations ADD COLUMN chat_is_group INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return fmt.Errorf("add workflow continuation chat type column: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ensureFeishuDocxAppendExecutionColumns() error {
+	columns := []struct {
+		name       string
+		definition string
+	}{
+		{name: "execution_owner_id", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "execution_token", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "execution_lease_expires_at_ms", definition: "INTEGER NOT NULL DEFAULT 0"},
+	}
+	for _, column := range columns {
+		hasColumn, err := s.tableHasColumn("feishu_docx_append_operations", column.name)
+		if err != nil {
+			return fmt.Errorf("inspect feishu docx append %s schema: %w", column.name, err)
+		}
+		if hasColumn {
+			continue
+		}
+		if _, err := s.db.Exec(`ALTER TABLE feishu_docx_append_operations ADD COLUMN ` + column.name + ` ` + column.definition); err != nil {
+			return fmt.Errorf("add feishu docx append %s column: %w", column.name, err)
+		}
 	}
 	return nil
 }

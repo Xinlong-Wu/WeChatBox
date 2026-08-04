@@ -135,7 +135,12 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) (runErr error)
 	sender := &sdkSender{client: restClient}
 	var cards CardService
 	var operationApprovals feishutools.OperationApprovalService
+	var docxAppendCipher *feishutools.DocxAppendEnvelopeCipher
 	if docsToolsEnabled(p.config.Tools) {
+		docxAppendCipher, err = feishutools.NewDocxAppendEnvelopeCipher(creds.AppSecret, acc.ID)
+		if err != nil {
+			return fmt.Errorf("initialize feishu docx append recovery encryption for account %s: %w", acc.Name, err)
+		}
 		cards, err = newCardService(sender)
 		if err != nil {
 			return fmt.Errorf("initialize feishu cards for account %s: %w", acc.Name, err)
@@ -164,7 +169,7 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) (runErr error)
 		}
 		operationApprovals = approvals
 	}
-	tools := newFeishuTools(restClient, p.store, acc.ID, p.config.Tools, operationApprovals, resourceAccess)
+	tools := newFeishuTools(restClient, p.store, acc.ID, p.config.Tools, operationApprovals, resourceAccess, docxAppendCipher, runtimeLease.ownerID)
 	if approvals != nil {
 		if err := registerApprovalExecutors(approvals, tools); err != nil {
 			return fmt.Errorf("register feishu tool approval executors for account %s: %w", acc.Name, err)
@@ -172,6 +177,9 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) (runErr error)
 		if err := approvals.recoverPersistedApprovals(lifecycleCtx); err != nil {
 			return fmt.Errorf("recover feishu tool approvals for account %s: %w", acc.Name, err)
 		}
+	}
+	if err := feishutools.RecoverDocxAppendOperations(lifecycleCtx, tools); err != nil {
+		return fmt.Errorf("recover feishu docx append operations for account %s: %w", acc.Name, err)
 	}
 	if docsToolsEnabled(p.config.Tools) {
 		cardWorker, workerErr := newFeishuCardDeliveryWorker(p.store, cards, resourceAccess, acc)
@@ -258,10 +266,10 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) (runErr error)
 	return runClient(lifecycleCtx, wsClient, oauthServer)
 }
 
-func newFeishuTools(client *lark.Client, st *store.Store, accountID string, cfg feishutools.Config, approvals feishutools.OperationApprovalService, resourceAccess feishutools.ResourceAccessController) []tooltypes.Tool {
+func newFeishuTools(client *lark.Client, st *store.Store, accountID string, cfg feishutools.Config, approvals feishutools.OperationApprovalService, resourceAccess feishutools.ResourceAccessController, appendCipher *feishutools.DocxAppendEnvelopeCipher, appendExecutionOwner string) []tooltypes.Tool {
 	tools := feishutools.NewChatHistoryTools(client, cfg)
 	tools = append(tools, feishutools.NewDocsResourceAccessTools(resourceAccess, cfg)...)
-	tools = append(tools, feishutools.NewDocsTools(client, st, accountID, cfg, approvals, resourceAccess)...)
+	tools = append(tools, feishutools.NewDocsTools(client, st, accountID, cfg, approvals, resourceAccess, appendCipher, appendExecutionOwner)...)
 	tools = append(tools, feishutools.NewDocsFolderTools(client, st, accountID, cfg, resourceAccess)...)
 	tools = append(tools, feishutools.NewLiteLLMAccountTools(client, cfg)...)
 	return tools

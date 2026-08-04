@@ -415,9 +415,37 @@ already-claimed candidates return `outcome_unknown`. Both
 `feishu_docs_create` and `feishu_docs_folder_create` accept a retry containing
 only the returned `request_id`; this repairs or re-runs reconciliation and
 never repeats the create API after `remote_started`. If initial document text
-was requested but its append result cannot be proven after recovery, the tool
-returns the created document with an explicit warning instead of guessing and
-appending it again.
+was requested, its append uses the same durable append path described below.
+Older or interrupted create requests that do not have an append ledger still
+return the created document with an explicit warning instead of guessing and
+appending the text again.
+
+Docx block insertion uses a separate durable
+`feishu_docx_append_operations` ledger. Before the first append mutation,
+LingoBridge reads the top-level child count once, freezes the exact insertion
+index, `client_token`, and serialized block request, and stores the request
+envelope as account-scoped authenticated ciphertext. The logical payload hash
+binds the request to the exact account, actor, chat, document, and block
+content; replaying the same request ID with a different scope, document, or
+content fails closed. An atomic `prepared` to `remote_started` claim allows
+only one first caller across Store instances. Every first call and recovery
+also requires the caller's live account runtime lease and holds a bounded,
+random execution-token lease. A new account runtime owner may take over an
+interrupted call, while a stale owner cannot reclaim it or persist a late
+result; same-owner concurrent recoveries are rejected by CAS. Taking over
+`remote_started` first promotes it to `outcome_unknown`, because the previous
+owner may already have reached Feishu. In-process reconciliation and startup
+recovery always decrypt and reuse the same frozen request instead of reading a
+new child count. Once any response is uncertain, later rejection cannot prove
+that the first request did not mutate the document, so the ledger remains
+`outcome_unknown` and retains its ciphertext for safe same-token recovery.
+Definite success or a definite first-call rejection clears the encrypted
+envelope. Startup also reconciles direct append/create workflows when the
+append ledger reached a terminal state immediately before a process crash.
+Every direct append/create workflow state write uses the same atomic ledger
+mapping, so a stale caller cannot overwrite a ledger-authoritative terminal
+state. Legacy requests without an append ledger retain their caller-provided
+state, and tool-approval workflows remain independently managed.
 
 When a new local grant is required, LingoBridge first sends a Card V2 choice
 with **允许 N 分钟**, **永久允许**, and **拒绝**. A temporary `once` grant starts
@@ -594,7 +622,12 @@ bound to the current trusted chat or an external Docx with a live scoped
 Pending operation and resource-access requests survive process restarts in the
 Feishu platform SQLite database. The document payload is retained only while
 operation authorization is pending/executing and is cleared on denial, expiry,
-success, or failure. OAuth state is verified by its hash. Before handoff
+success, or failure. A nonterminal Docx append additionally retains only its
+authenticated encrypted request envelope; terminal append states clear that
+ciphertext while keeping non-sensitive hashes and frozen request metadata for
+idempotency checks. Mutable runtime-owner, execution-token, and lease metadata
+is kept outside the encrypted envelope and cleared when an attempt becomes
+recoverable or terminal. OAuth state is verified by its hash. Before handoff
 delivery is confirmed, the original state is temporarily stored only as
 authenticated ciphertext; delivery success clears that ciphertext, and either
 the HTTP callback or exact-context card submission clears the remaining hash.
@@ -1083,12 +1116,13 @@ internal/platform/feishu/   # Feishu account config schema and frontend support 
 internal/platform/feishu/definition/ # Feishu account/runtime definition assembly
 internal/platform/feishu/monitor/ # Feishu long-connection monitor, message/text-stream adapter, cards/callback routing, resource workflow/recovery, OAuth credentials, permission guard, approvals, and event hooks
 internal/platform/feishu/idempotency/ # Deterministic, namespaced Feishu idempotency-key helpers
-internal/platform/feishu/tools/ # Feishu platform-level LLM tool adapters and shared Docs/folder services, authorization contracts, remote-create reconciliation, and LiteLLM invitations
+internal/platform/feishu/secure/ # Shared account-scoped authenticated-encryption primitive for Feishu sensitive state
+internal/platform/feishu/tools/ # Feishu platform-level LLM tool adapters and shared Docs/folder services, authorization contracts, durable append/create recovery, and LiteLLM invitations
 internal/platform/github/   # GitHub account/runtime definition, App auth, PR polling, review prompt construction, and MCP review tool guards
 internal/core/              # Middle layer: scoped platform config/data APIs, tool orchestration, commands, sessions, LLM orchestration
 internal/tools/             # Shared tool interfaces, provider-neutral spec/call/result types, and runtime-owned execution context
 internal/mcp/               # Global MCP host/client sessions and MCP tool adapters exposed through tools.Provider
-internal/store/             # Platform-scoped SQLite accounts/sessions/preferences/cursors/tool approvals, resource capabilities/grants, encrypted Feishu OAuth credentials and durable refresh attempts, JSONL history, and media persistence
+internal/store/             # Platform-scoped SQLite accounts/sessions/preferences/cursors/tool approvals, resource capabilities/grants, encrypted Feishu OAuth credentials, durable refresh/create/append operations, JSONL history, and media persistence
 internal/llm/               # Backend provider adapters: OpenAI-compatible and Anthropic APIs
 internal/session/           # Session manager backed by the scoped store
 internal/commands/          # Shared in-chat slash commands

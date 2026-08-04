@@ -33,20 +33,55 @@ func (t *docsService) recoverDocumentCreate(ctx context.Context, actor Actor, ch
 	workflow, workflowErr := t.store.GetWorkflowRequest(requestID, t.accountID)
 	out, err := t.continueDocumentCreate(ctx, operation, parent, nil)
 	if err != nil {
-		return writeOutput{}, err
-	}
-	recoveredState := store.WorkflowRequestStatePartial
-	if out.Status == "created" && operation.InitialContentRequested {
-		if workflowErr != nil || workflow.State != store.WorkflowRequestStateSucceeded {
-			out.Warning = "文档创建已恢复，但初始正文是否追加完成无法由创建账本确认；请先检查文档，需要时使用 feishu_docs_append，服务不会猜测并重复追加。"
+		if out.DocumentID == "" {
+			return out, err
+		}
+		if operation.InitialContentRequested {
+			reconciled, managed, reconcileErr := t.store.ReconcileFeishuDocxAppendWorkflowState(requestID, t.accountID, t.currentTime())
+			if reconcileErr != nil {
+				feishuToolsLog.Warn(ctx, "reconcile recovered feishu document initial-content workflow failed account=%s request=%s error_type=%T",
+					t.accountID, shortToolRequestID(requestID), reconcileErr)
+			}
+			appendOperation, appendErr := t.store.GetFeishuDocxAppendOperation(requestID, t.accountID)
+			if appendErr == nil && appendOperation.State == store.FeishuDocxAppendOperationStateSucceeded {
+				return out, nil
+			}
+			if reconcileErr == nil && !managed && reconciled.Kind == store.WorkflowRequestKindFeishuDocsCreate && reconciled.State != store.WorkflowRequestStatePartial {
+				t.updateWorkflowBestEffort(ctx, requestID, store.WorkflowRequestStatePartial)
+			} else if reconcileErr != nil && workflowErr == nil && workflow.Kind == store.WorkflowRequestKindFeishuDocsCreate && workflow.State != store.WorkflowRequestStatePartial {
+				t.updateWorkflowBestEffort(ctx, requestID, store.WorkflowRequestStatePartial)
+			}
+		} else if workflowErr == nil && workflow.Kind == store.WorkflowRequestKindFeishuDocsCreate && workflow.State != store.WorkflowRequestStatePartial {
+			t.updateWorkflowBestEffort(ctx, requestID, store.WorkflowRequestStatePartial)
+		}
+		if errors.Is(err, errDocxAppendOutcomeUnknown) {
+			out.Warning = docxInitialContentOutcomeUnknownMessage(out)
 		} else {
-			recoveredState = store.WorkflowRequestStateSucceeded
+			out.Warning = fmt.Sprintf("文档已创建，但初始正文后续处理失败：%v。请勿重复创建，可稍后继续处理。", err)
+		}
+		return out, nil
+	}
+	if out.Status == "created" && operation.InitialContentRequested {
+		reconciled, managed, reconcileErr := t.store.ReconcileFeishuDocxAppendWorkflowState(requestID, t.accountID, t.currentTime())
+		if reconcileErr != nil {
+			feishuToolsLog.Warn(ctx, "reconcile recovered feishu document initial-content workflow failed account=%s request=%s error_type=%T",
+				t.accountID, shortToolRequestID(requestID), reconcileErr)
+		}
+		appendOperation, appendErr := t.store.GetFeishuDocxAppendOperation(requestID, t.accountID)
+		appendSucceeded := appendErr == nil && appendOperation.State == store.FeishuDocxAppendOperationStateSucceeded
+		workflowSucceeded := reconcileErr == nil && managed && reconciled.State == store.WorkflowRequestStateSucceeded
+		if !appendSucceeded && !workflowSucceeded {
+			out.Warning = "文档创建已恢复，但初始正文是否追加完成无法由创建账本确认；请先检查文档，需要时使用 feishu_docs_append，服务不会猜测并重复追加。"
+			if reconcileErr == nil && !managed && reconciled.Kind == store.WorkflowRequestKindFeishuDocsCreate && reconciled.State != store.WorkflowRequestStatePartial {
+				t.updateWorkflowBestEffort(ctx, requestID, store.WorkflowRequestStatePartial)
+			}
 		}
 	} else if out.Status == "created" {
-		recoveredState = store.WorkflowRequestStateSucceeded
-	}
-	if workflowErr == nil && workflow.Kind == store.WorkflowRequestKindFeishuDocsCreate && workflow.State != recoveredState {
-		t.updateWorkflowBestEffort(ctx, requestID, recoveredState)
+		if workflowErr == nil && workflow.Kind == store.WorkflowRequestKindFeishuDocsCreate && workflow.State != store.WorkflowRequestStateSucceeded {
+			t.updateWorkflowBestEffort(ctx, requestID, store.WorkflowRequestStateSucceeded)
+		}
+	} else if workflowErr == nil && workflow.Kind == store.WorkflowRequestKindFeishuDocsCreate && workflow.State != store.WorkflowRequestStatePartial {
+		t.updateWorkflowBestEffort(ctx, requestID, store.WorkflowRequestStatePartial)
 	}
 	return out, nil
 }
@@ -76,7 +111,7 @@ func (t *docsService) continueDocumentCreate(ctx context.Context, operation stor
 	}
 	out := documentOutputFromRemoteOperation(operation)
 	out.Status = "created"
-	if payload != nil && strings.TrimSpace(payload.Content) != "" {
+	if operation.InitialContentRequested && payload != nil && strings.TrimSpace(payload.Content) != "" {
 		authorized, err := requireResourceAccess(ctx, t.resourceAccess, t.accountID, ResourceAccessRequirement{
 			ResourceType:  "docx",
 			ResourceToken: operation.RemoteResourceToken,
@@ -86,6 +121,28 @@ func (t *docsService) continueDocumentCreate(ctx context.Context, operation stor
 			return out, fmt.Errorf("authorize initial feishu document content: %w", err)
 		}
 		if err := t.appendTextBlocks(ctx, operation.RequestID, authorized, payload.Content); err != nil {
+			return out, err
+		}
+	} else if operation.InitialContentRequested && payload == nil {
+		appendOperation, err := t.store.GetFeishuDocxAppendOperation(operation.RequestID, operation.AccountID)
+		if err != nil {
+			if errors.Is(err, store.ErrFeishuDocxAppendOperationNotFound) {
+				return out, nil
+			}
+			return out, fmt.Errorf("load initial feishu document append ledger: %w", err)
+		}
+		authorized, err := requireResourceAccess(ctx, t.resourceAccess, t.accountID, ResourceAccessRequirement{
+			ResourceType:  "docx",
+			ResourceToken: operation.RemoteResourceToken,
+			Permission:    ResourcePermissionWrite,
+		})
+		if err != nil {
+			return out, fmt.Errorf("authorize recovered initial feishu document content: %w", err)
+		}
+		if err := validateRecoveredDocxAppendAccess(appendOperation, authorized); err != nil {
+			return out, err
+		}
+		if err := t.continueDocxAppendOperation(ctx, appendOperation, true); err != nil {
 			return out, err
 		}
 	}

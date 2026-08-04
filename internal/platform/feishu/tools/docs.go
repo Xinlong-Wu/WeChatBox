@@ -51,14 +51,17 @@ type docsService struct {
 	cfg                   Config
 	approvals             OperationApprovalService
 	resourceAccess        ResourceAccessGuard
+	appendCipher          *DocxAppendEnvelopeCipher
+	appendExecutionOwner  string
 	remoteReconcileDelays []time.Duration
 	now                   func() time.Time
 }
 
 // NewDocsTools returns Feishu document tools for tool-capable LLM providers.
-func NewDocsTools(client *lark.Client, st *store.Store, accountID string, cfg Config, approvals OperationApprovalService, resourceAccess ResourceAccessGuard) []tooltypes.Tool {
+func NewDocsTools(client *lark.Client, st *store.Store, accountID string, cfg Config, approvals OperationApprovalService, resourceAccess ResourceAccessGuard, appendCipher *DocxAppendEnvelopeCipher, appendExecutionOwner string) []tooltypes.Tool {
 	cfg = NormalizeConfig(cfg)
 	accountID = strings.TrimSpace(accountID)
+	appendExecutionOwner = strings.TrimSpace(appendExecutionOwner)
 	if client == nil || st == nil || st.PlatformID() != store.PlatformFeishu || accountID == "" || !cfg.Docs.Enabled || resourceAccess == nil {
 		return nil
 	}
@@ -69,6 +72,8 @@ func NewDocsTools(client *lark.Client, st *store.Store, accountID string, cfg Co
 		cfg:                   cfg,
 		approvals:             approvals,
 		resourceAccess:        resourceAccess,
+		appendCipher:          appendCipher,
+		appendExecutionOwner:  appendExecutionOwner,
 		remoteReconcileDelays: copyRemoteCreateReconciliationDelays(),
 		now:                   time.Now,
 	}
@@ -77,7 +82,7 @@ func NewDocsTools(client *lark.Client, st *store.Store, accountID string, cfg Co
 		docsTool{name: readToolName, spec: docsReadSpec(), service: service},
 	}
 	if cfg.Docs.AllowWrite {
-		if approvals != nil && resourceAccess != nil {
+		if approvals != nil && resourceAccess != nil && appendCipher != nil && appendExecutionOwner != "" {
 			tools = append(tools, docsTool{name: createToolName, spec: docsCreateSpec(), service: service})
 			tools = append(tools, docsTool{name: appendToolName, spec: docsAppendSpec(), service: service})
 		}
@@ -552,26 +557,34 @@ var (
 )
 
 func (t *docsService) executeApprovedCreate(ctx context.Context, requestID string, payload json.RawMessage) (OperationApprovalExecution, error) {
+	args, err := t.parseApprovedCreatePayload(payload)
+	if err != nil {
+		return OperationApprovalExecution{}, err
+	}
 	operation, operationErr := t.store.GetFeishuRemoteOperation(requestID, t.accountID)
 	if operationErr == nil {
+		payloadHash, hashErr := documentCreatePayloadHash(args)
+		if hashErr != nil {
+			return OperationApprovalExecution{}, hashErr
+		}
+		if operation.OperationKind != store.FeishuRemoteOperationKindDocumentCreate || operation.PayloadHash != payloadHash ||
+			operation.ChatID != args.ChatID || operation.ActorOpenID != args.ActorOpenID || operation.ActorUserID != args.ActorUserID ||
+			operation.ParentResourceToken != args.FolderToken || operation.RequestedName != args.Title {
+			return OperationApprovalExecution{}, store.ErrFeishuRemoteOperationConflict
+		}
 		actor := Actor{OpenID: operation.ActorOpenID, UserID: operation.ActorUserID}
 		chat := ChatContext{ChatID: operation.ChatID}
 		executionCtx := WithActor(ctx, actor)
 		executionCtx = WithChatContext(executionCtx, chat)
-		out, err := t.recoverDocumentCreate(
-			executionCtx,
-			actor,
-			chat,
-			requestID,
-		)
+		parent, accessErr := t.validateDocumentCreateAccess(executionCtx, args)
+		if accessErr != nil {
+			return OperationApprovalExecution{}, fmt.Errorf("revalidate approved document target access: %w", accessErr)
+		}
+		out, err := t.continueDocumentCreate(executionCtx, operation, parent, &args)
 		return approvedDocumentCreateExecution(out, requestID, err)
 	}
 	if !errors.Is(operationErr, store.ErrFeishuRemoteOperationNotFound) {
 		return OperationApprovalExecution{}, fmt.Errorf("load approved document recovery ledger: %w", operationErr)
-	}
-	args, err := t.parseApprovedCreatePayload(payload)
-	if err != nil {
-		return OperationApprovalExecution{}, err
 	}
 	executionCtx := WithActor(ctx, Actor{OpenID: args.ActorOpenID, UserID: args.ActorUserID})
 	executionCtx = WithChatContext(executionCtx, ChatContext{ChatID: args.ChatID})
@@ -763,23 +776,7 @@ func (t *docsService) validateDocumentCreateAccess(ctx context.Context, payload 
 
 func (t *docsService) createDocument(ctx context.Context, requestID string, payload approvedCreatePayload, parent AuthorizedResource) (writeOutput, error) {
 	args := payload.createArgs
-	payloadHash, err := remoteOperationPayloadHash(struct {
-		OperationKind string `json:"operation_kind"`
-		ChatID        string `json:"chat_id"`
-		ActorOpenID   string `json:"actor_open_id,omitempty"`
-		ActorUserID   string `json:"actor_user_id,omitempty"`
-		FolderToken   string `json:"folder_token"`
-		Title         string `json:"title"`
-		Content       string `json:"content"`
-	}{
-		OperationKind: store.FeishuRemoteOperationKindDocumentCreate,
-		ChatID:        payload.ChatID,
-		ActorOpenID:   payload.ActorOpenID,
-		ActorUserID:   payload.ActorUserID,
-		FolderToken:   args.FolderToken,
-		Title:         args.Title,
-		Content:       args.Content,
-	})
+	payloadHash, err := documentCreatePayloadHash(payload)
 	if err != nil {
 		return writeOutput{}, err
 	}
@@ -807,6 +804,27 @@ func (t *docsService) createDocument(ctx context.Context, requestID string, payl
 		return writeOutput{}, fmt.Errorf("prepare feishu document remote operation: %w", err)
 	}
 	return t.continueDocumentCreate(ctx, operation, parent, &payload)
+}
+
+func documentCreatePayloadHash(payload approvedCreatePayload) (string, error) {
+	args := payload.createArgs
+	return remoteOperationPayloadHash(struct {
+		OperationKind string `json:"operation_kind"`
+		ChatID        string `json:"chat_id"`
+		ActorOpenID   string `json:"actor_open_id,omitempty"`
+		ActorUserID   string `json:"actor_user_id,omitempty"`
+		FolderToken   string `json:"folder_token"`
+		Title         string `json:"title"`
+		Content       string `json:"content"`
+	}{
+		OperationKind: store.FeishuRemoteOperationKindDocumentCreate,
+		ChatID:        payload.ChatID,
+		ActorOpenID:   payload.ActorOpenID,
+		ActorUserID:   payload.ActorUserID,
+		FolderToken:   args.FolderToken,
+		Title:         args.Title,
+		Content:       args.Content,
+	})
 }
 
 func (t *docsService) authorizeDocumentAccess(ctx context.Context, chat ChatContext, documentToken, permission string) (AuthorizedResource, store.FeishuChatDocument, bool, error) {
@@ -1023,71 +1041,7 @@ func (t *docsService) appendDocument(ctx context.Context, requestID string, payl
 }
 
 func (t *docsService) appendTextBlocks(ctx context.Context, requestID string, document AuthorizedResource, content string) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	blocks := textBlocks(content)
-	if len(blocks) == 0 {
-		return nil
-	}
-	requestID = strings.TrimSpace(requestID)
-	if requestID == "" {
-		return fmt.Errorf("append feishu document: stable workflow request id is required")
-	}
-	documentID := strings.TrimSpace(document.ResourceToken)
-	if documentID == "" || !authorizedResourcePermits(document, "docx", documentID, ResourcePermissionWrite) {
-		return fmt.Errorf("append feishu document: authorized docx/write resource is required")
-	}
-	index, err := t.docxTopLevelChildCount(ctx, document)
-	if err != nil {
-		return err
-	}
-	req := larkdocx.NewCreateDocumentBlockChildrenReqBuilder().
-		DocumentId(documentID).
-		BlockId(documentID).
-		DocumentRevisionId(-1).
-		ClientToken(docxAppendClientToken(requestID)).
-		Body(larkdocx.NewCreateDocumentBlockChildrenReqBodyBuilder().
-			Children(blocks).
-			Index(index).
-			Build()).
-		Build()
-	resp, callErr := t.client.Docx.DocumentBlockChildren.Create(ctx, req)
-	if callErr == nil && resp != nil && resp.Success() {
-		return nil
-	}
-	firstErr := docxAppendResponseError(resp, callErr)
-	if !retryableDocxAppendFailure(resp, callErr) {
-		return firstErr
-	}
-	httpStatus := 0
-	responseCode := 0
-	if resp != nil {
-		responseCode = resp.Code
-		if resp.ApiResp != nil {
-			httpStatus = resp.ApiResp.StatusCode
-		}
-	}
-	operationContextEnded := ctx.Err() != nil
-	feishuToolsLog.Warn(ctx, "retrying idempotent feishu document append after uncertain response account=%s request=%s document_ref=%s attempt=1 http_status=%d code=%d operation_context_ended=%t error_type=%T",
-		t.accountID, shortToolRequestID(requestID), hashString(documentID), httpStatus, responseCode, operationContextEnded, callErr)
-	retryCtx, cancelRetry := context.WithTimeout(feishuidempotency.RetryContext(ctx), docxAppendReconciliationTimeout)
-	defer cancelRetry()
-	resp, callErr = t.client.Docx.DocumentBlockChildren.Create(retryCtx, req)
-	if callErr == nil && resp != nil && resp.Success() {
-		return nil
-	}
-	retryHTTPStatus := 0
-	retryResponseCode := 0
-	if resp != nil {
-		retryResponseCode = resp.Code
-		if resp.ApiResp != nil {
-			retryHTTPStatus = resp.ApiResp.StatusCode
-		}
-	}
-	feishuToolsLog.Warn(ctx, "feishu document append outcome remains unknown after idempotent retry account=%s request=%s document_ref=%s retry_http_status=%d retry_code=%d retry_error_type=%T",
-		t.accountID, shortToolRequestID(requestID), hashString(documentID), retryHTTPStatus, retryResponseCode, callErr)
-	return fmt.Errorf("%w after same-token reconciliation request", errDocxAppendOutcomeUnknown)
+	return t.executeDocxAppend(ctx, requestID, document, content)
 }
 
 func docxAppendOutcomeUnknownOutput(requestID, documentToken string) writeOutput {
@@ -1378,6 +1332,23 @@ func searchResultKey(result searchResult) string {
 }
 
 func (t *docsService) updateWorkflowBestEffort(ctx context.Context, requestID, state string) {
+	workflow, reconciled, reconcileErr := t.store.ReconcileFeishuDocxAppendWorkflowState(requestID, t.accountID, t.currentTime())
+	if reconcileErr == nil {
+		if reconciled {
+			if workflow.State != state {
+				feishuToolsLog.Debug(ctx, "ignored stale feishu document workflow state in favor of append ledger request=%s account=%s requested_state=%s ledger_state=%s",
+					shortToolRequestID(requestID), t.accountID, state, workflow.State)
+			}
+			return
+		}
+		if workflow.Kind == store.WorkflowRequestKindToolApproval {
+			return
+		}
+	} else {
+		feishuToolsLog.Warn(ctx, "reconcile feishu document workflow with append ledger failed request=%s account=%s requested_state=%s: %v",
+			shortToolRequestID(requestID), t.accountID, state, reconcileErr)
+		return
+	}
 	if err := t.store.UpdateWorkflowRequestState(requestID, t.accountID, state, t.currentTime()); err != nil {
 		feishuToolsLog.Warn(ctx, "update feishu document workflow failed request=%s account=%s state=%s: %v", shortToolRequestID(requestID), t.accountID, state, err)
 	}

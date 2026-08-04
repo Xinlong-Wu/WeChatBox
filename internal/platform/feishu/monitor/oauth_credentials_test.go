@@ -127,6 +127,65 @@ func TestFeishuOAuthCredentialCipherAuthenticatesIdentityAndAccount(t *testing.T
 	}
 }
 
+func TestFeishuOAuthCredentialCipherDecryptsLegacyCiphertextVector(t *testing.T) {
+	const legacyCiphertext = "v1.AAECAwQFBgcICQoL9YXWUekCP_2QNRPOm3q4fynKjkKt8MryMXvnsNjkVkqQUXiTLerXaw"
+	identity := feishuOAuthIdentity{OpenID: "ou_requester", UserID: "u_requester"}
+	cipherValue, err := newFeishuOAuthCredentialCipher("app-secret", "feishu:cli_test")
+	if err != nil {
+		t.Fatalf("newFeishuOAuthCredentialCipher returned error: %v", err)
+	}
+	plaintext, err := cipherValue.Decrypt(identity, "access_token", legacyCiphertext)
+	if err != nil || plaintext != "legacy-user-access-token" {
+		t.Fatalf("Decrypt legacy ciphertext = %q err=%v", plaintext, err)
+	}
+	if _, err := cipherValue.Decrypt(identity, "refresh_token", legacyCiphertext); err == nil {
+		t.Fatal("legacy ciphertext decrypted under a different token field")
+	}
+	if _, err := cipherValue.Decrypt(feishuOAuthIdentity{OpenID: "ou_other"}, "access_token", legacyCiphertext); err == nil {
+		t.Fatal("legacy ciphertext decrypted under a different user identity")
+	}
+	otherAccountCipher, err := newFeishuOAuthCredentialCipher("app-secret", "feishu:cli_other")
+	if err != nil {
+		t.Fatalf("new other account cipher: %v", err)
+	}
+	if _, err := otherAccountCipher.Decrypt(identity, "access_token", legacyCiphertext); err == nil {
+		t.Fatal("legacy ciphertext decrypted under a different account")
+	}
+	otherSecretCipher, err := newFeishuOAuthCredentialCipher("other-app-secret", "feishu:cli_test")
+	if err != nil {
+		t.Fatalf("new other secret cipher: %v", err)
+	}
+	if _, err := otherSecretCipher.Decrypt(identity, "access_token", legacyCiphertext); err == nil {
+		t.Fatal("legacy ciphertext decrypted with a different application secret")
+	}
+}
+
+func TestFeishuOAuthCredentialCipherDecryptsLegacyRefreshAttemptVector(t *testing.T) {
+	const legacyCiphertext = "v1.DA0ODxAREhMUFRYXR_Oq2nu6twJLmdflLv1m0JN8UbJcHSGWbN0RUtrvnGHMFbOyG_7cG_dtmA"
+	attempt := store.FeishuOAuthRefreshAttempt{
+		ID:          "refresh_legacy",
+		AccountID:   "feishu:cli_test",
+		ActorOpenID: "ou_requester",
+		ActorUserID: "u_requester",
+	}
+	cipherValue, err := newFeishuOAuthCredentialCipher("app-secret", attempt.AccountID)
+	if err != nil {
+		t.Fatalf("newFeishuOAuthCredentialCipher returned error: %v", err)
+	}
+	plaintext, err := cipherValue.DecryptRefreshAttempt(attempt, "refresh_token", legacyCiphertext)
+	if err != nil || plaintext != "legacy-staged-refresh-token" {
+		t.Fatalf("DecryptRefreshAttempt legacy ciphertext = %q err=%v", plaintext, err)
+	}
+	changed := attempt
+	changed.ID = "refresh_other"
+	if _, err := cipherValue.DecryptRefreshAttempt(changed, "refresh_token", legacyCiphertext); err == nil {
+		t.Fatal("legacy refresh ciphertext decrypted under a different attempt")
+	}
+	if _, err := cipherValue.DecryptRefreshAttempt(attempt, "access_token", legacyCiphertext); err == nil {
+		t.Fatal("legacy refresh ciphertext decrypted under a different token field")
+	}
+}
+
 func TestFeishuOAuthCredentialCipherAuthenticatesRefreshAttemptContext(t *testing.T) {
 	cipherValue, err := newFeishuOAuthCredentialCipher("app-secret", "feishu:cli_test")
 	if err != nil {

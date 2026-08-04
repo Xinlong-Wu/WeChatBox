@@ -2,15 +2,8 @@ package monitor
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/hkdf"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -21,6 +14,7 @@ import (
 	"github.com/larksuite/oapi-sdk-go/v3/core/accesstoken"
 	"github.com/larksuite/oapi-sdk-go/v3/core/accesstoken/refreshtoken"
 
+	feishusecure "lingobridge/internal/platform/feishu/secure"
 	"lingobridge/internal/store"
 )
 
@@ -44,7 +38,7 @@ var (
 
 type feishuOAuthCredentialCipher struct {
 	accountID string
-	aead      cipher.AEAD
+	cipher    *feishusecure.AccountCipher
 }
 
 type feishuOAuthIdentity struct {
@@ -125,19 +119,11 @@ func newFeishuOAuthCredentialCipher(secret, accountID string) (*feishuOAuthCrede
 	if secret == "" || accountID == "" {
 		return nil, fmt.Errorf("feishu OAuth credential secret and account are required")
 	}
-	key, err := hkdf.Key(sha256.New, []byte(secret), []byte(accountID), feishuOAuthCredentialKeyInfo, 32)
-	if err != nil {
-		return nil, fmt.Errorf("derive feishu OAuth credential key: %w", err)
-	}
-	block, err := aes.NewCipher(key)
+	accountCipher, err := feishusecure.NewAccountCipher(secret, accountID, feishuOAuthCredentialKeyInfo)
 	if err != nil {
 		return nil, fmt.Errorf("create feishu OAuth credential cipher: %w", err)
 	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("create feishu OAuth credential AEAD: %w", err)
-	}
-	return &feishuOAuthCredentialCipher{accountID: accountID, aead: aead}, nil
+	return &feishuOAuthCredentialCipher{accountID: accountID, cipher: accountCipher}, nil
 }
 
 func (c *feishuOAuthCredentialCipher) Encrypt(identity feishuOAuthIdentity, field, plaintext string) (string, error) {
@@ -153,20 +139,18 @@ func (c *feishuOAuthCredentialCipher) EncryptRefreshAttempt(attempt store.Feishu
 }
 
 func (c *feishuOAuthCredentialCipher) encrypt(plaintext string, additionalData []byte) (string, error) {
-	if c == nil || c.aead == nil {
+	if c == nil || c.cipher == nil {
 		return "", ErrFeishuUserOAuthCredentialUnavailable
 	}
 	plaintext = strings.TrimSpace(plaintext)
 	if plaintext == "" {
 		return "", nil
 	}
-	nonce := make([]byte, c.aead.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return "", fmt.Errorf("generate feishu OAuth credential nonce: %w", err)
+	ciphertext, err := c.cipher.Encrypt([]byte(plaintext), additionalData)
+	if err != nil {
+		return "", fmt.Errorf("encrypt feishu OAuth credential: %w", err)
 	}
-	sealed := c.aead.Seal(nil, nonce, []byte(plaintext), additionalData)
-	encoded := append(nonce, sealed...)
-	return feishuOAuthCredentialCipherVersion + "." + base64.RawURLEncoding.EncodeToString(encoded), nil
+	return ciphertext, nil
 }
 
 func (c *feishuOAuthCredentialCipher) Decrypt(identity feishuOAuthIdentity, field, ciphertext string) (string, error) {
@@ -182,23 +166,10 @@ func (c *feishuOAuthCredentialCipher) DecryptRefreshAttempt(attempt store.Feishu
 }
 
 func (c *feishuOAuthCredentialCipher) decrypt(ciphertext string, additionalData []byte) (string, error) {
-	if c == nil || c.aead == nil {
+	if c == nil || c.cipher == nil {
 		return "", ErrFeishuUserOAuthCredentialUnavailable
 	}
-	version, encoded, ok := strings.Cut(strings.TrimSpace(ciphertext), ".")
-	if !ok || version != feishuOAuthCredentialCipherVersion || encoded == "" {
-		return "", fmt.Errorf("unsupported feishu OAuth credential ciphertext")
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(encoded)
-	if err != nil {
-		return "", fmt.Errorf("decode feishu OAuth credential ciphertext: %w", err)
-	}
-	if len(raw) <= c.aead.NonceSize() {
-		return "", fmt.Errorf("invalid feishu OAuth credential ciphertext")
-	}
-	nonce := raw[:c.aead.NonceSize()]
-	sealed := raw[c.aead.NonceSize():]
-	plain, err := c.aead.Open(nil, nonce, sealed, additionalData)
+	plain, err := c.cipher.Decrypt(ciphertext, additionalData)
 	if err != nil {
 		return "", fmt.Errorf("decrypt feishu OAuth credential: %w", err)
 	}

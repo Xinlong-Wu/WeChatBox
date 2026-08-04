@@ -226,3 +226,65 @@ func TestMigrateCreatesFeishuRemoteOperationSchema(t *testing.T) {
 		t.Fatalf("remote operation index count = %d, want 1", indexCount)
 	}
 }
+
+func TestMigrateCreatesFeishuDocxAppendOperationSchema(t *testing.T) {
+	st := openFeishuDocsTestStore(t)
+	rows, err := st.db.Query(`PRAGMA table_info(feishu_docx_append_operations)`)
+	if err != nil {
+		t.Fatalf("inspect docx append operation schema: %v", err)
+	}
+	defer rows.Close()
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatalf("scan docx append operation schema: %v", err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate docx append operation schema: %v", err)
+	}
+	for _, name := range []string{
+		"request_id", "account_id", "chat_id", "actor_open_id", "actor_user_id",
+		"document_token", "client_token", "insertion_index", "payload_hash", "envelope_hash",
+		"envelope_ciphertext", "state", "remote_call_started_at_ms", "remote_result_at_ms",
+		"execution_owner_id", "execution_token", "execution_lease_expires_at_ms",
+		"last_error_category", "created_at_ms", "updated_at_ms",
+	} {
+		if !columns[name] {
+			t.Fatalf("feishu_docx_append_operations missing column %q: %#v", name, columns)
+		}
+	}
+	var indexCount int
+	if err := st.db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?`,
+		"idx_feishu_docx_append_operations_account_state",
+	).Scan(&indexCount); err != nil {
+		t.Fatalf("inspect docx append operation index: %v", err)
+	}
+	if indexCount != 1 {
+		t.Fatalf("docx append operation index count = %d, want 1", indexCount)
+	}
+}
+
+func TestMigrateAddsFeishuDocxAppendExecutionColumns(t *testing.T) {
+	st := openFeishuDocsTestStore(t)
+	for _, column := range []string{"execution_owner_id", "execution_token", "execution_lease_expires_at_ms"} {
+		if _, err := st.db.Exec(`ALTER TABLE feishu_docx_append_operations DROP COLUMN ` + column); err != nil {
+			t.Fatalf("drop docx append execution column %q: %v", column, err)
+		}
+	}
+	if err := st.migrate(); err != nil {
+		t.Fatalf("migrate legacy docx append schema: %v", err)
+	}
+	for _, column := range []string{"execution_owner_id", "execution_token", "execution_lease_expires_at_ms"} {
+		hasColumn, err := st.tableHasColumn("feishu_docx_append_operations", column)
+		if err != nil || !hasColumn {
+			t.Fatalf("migrated docx append column %q present=%t err=%v", column, hasColumn, err)
+		}
+	}
+}

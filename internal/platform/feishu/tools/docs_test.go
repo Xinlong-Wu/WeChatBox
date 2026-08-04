@@ -20,6 +20,8 @@ import (
 	tooltypes "lingobridge/internal/tools"
 )
 
+const testDocxAppendExecutionOwner = "runtime_test"
+
 type fakeApprovalRequester struct {
 	request OperationApprovalRequest
 	result  OperationApprovalResult
@@ -47,21 +49,21 @@ func TestDocsToolConfigDefaultsAndRegistration(t *testing.T) {
 
 	client := &lark.Client{}
 	st := openDocsFolderTestStore(t)
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil, nil); len(got) != 0 {
+	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil, nil, nil, ""); len(got) != 0 {
 		t.Fatalf("disabled tools = %d, want 0", len(got))
 	}
 	cfg.Docs.Enabled = true
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil, nil); len(got) != 0 {
+	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil, nil, nil, ""); len(got) != 0 {
 		t.Fatalf("docs tools without resource access guard = %d, want 0", len(got))
 	}
 	cfg.Docs.AllowWrite = true
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil, nil); len(got) != 0 {
+	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil, nil, nil, ""); len(got) != 0 {
 		t.Fatalf("write tools without approval or resource access workflow = %d, want 0", len(got))
 	}
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, &fakeApprovalRequester{}, nil); len(got) != 0 {
+	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, &fakeApprovalRequester{}, nil, nil, ""); len(got) != 0 {
 		t.Fatalf("write tools without resource access workflow = %d, want 0", len(got))
 	}
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, &fakeApprovalRequester{result: OperationApprovalResult{Status: OperationApprovalStatusGranted}}, grantedResourceAccessController("req_access")); len(got) != 4 {
+	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, &fakeApprovalRequester{result: OperationApprovalResult{Status: OperationApprovalStatusGranted}}, grantedResourceAccessController("req_access"), newTestDocxAppendCipher(t), testDocxAppendExecutionOwner); len(got) != 4 {
 		t.Fatalf("write tools with approval workflow = %d, want four tools", len(got))
 	} else {
 		sharedService := got[0].(docsTool).service
@@ -347,7 +349,8 @@ func TestDocsAppendApprovedExecutionTreatsTwoLostMutationResponsesAsOutcomeUnkno
 		lark.WithHttpClient(server.Client()),
 	)
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
-	_, tools, _ := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
+	st, tools, _ := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
+	seedDocsCreateApprovalWorkflow(t, st, "req_append_lost_both")
 	executor := findDocsTool(t, tools, appendToolName).(OperationApprovalExecutor)
 
 	result, err := executor.ExecuteApproved(context.Background(), "req_append_lost_both", json.RawMessage(
@@ -751,7 +754,8 @@ func TestDocsAppendApprovedExecutionRevalidatesAndAppends(t *testing.T) {
 		lark.WithHttpClient(server.Client()),
 	)
 	cfg := Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}
-	_, tools, access := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
+	st, tools, access := newDocsToolsForTest(t, client, cfg, &fakeApprovalRequester{})
+	seedDocsCreateApprovalWorkflow(t, st, "req_append_approved")
 	executor := findDocsTool(t, tools, appendToolName).(OperationApprovalExecutor)
 	result, err := executor.ExecuteApproved(context.Background(), "req_append_approved", json.RawMessage(
 		`{"document_token":"doxcnapproved12345","content":"approved paragraph","chat_id":"oc_chat","actor_open_id":"ou_requester"}`,
@@ -1378,7 +1382,7 @@ func TestDocsCreateApprovedExecutionReportsUnknownInitialContentWithoutRepeatAdv
 	}
 }
 
-func TestDocsCreateApprovedExecutionRecoveryDoesNotRepeatInitialContentAppend(t *testing.T) {
+func TestDocsCreateApprovedExecutionRecoveryReusesCompletedInitialContentLedger(t *testing.T) {
 	const documentToken = "doxcnrestart123"
 	var createCalls, appendCalls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1425,8 +1429,8 @@ func TestDocsCreateApprovedExecutionRecoveryDoesNotRepeatInitialContentAppend(t 
 	if err != nil {
 		t.Fatalf("recovered ExecuteApproved returned error: %v", err)
 	}
-	if !recovered.Warning || !strings.Contains(recovered.Message, "初始正文") {
-		t.Fatalf("recovered result = %#v, want conservative initial-content warning", recovered)
+	if recovered.Warning || !strings.Contains(recovered.Message, "飞书文档已创建") {
+		t.Fatalf("recovered result = %#v, want completed ledger replay without warning", recovered)
 	}
 	if createCalls != 1 || appendCalls != 1 {
 		t.Fatalf("remote calls after recovery create=%d append=%d, want 1/1", createCalls, appendCalls)
@@ -1503,7 +1507,7 @@ func TestDocsCreateRequiresAndRevalidatesFolderAccess(t *testing.T) {
 		t.Fatalf("seed folder: %v", err)
 	}
 	access := grantedResourceAccessController("req_access")
-	tools := NewDocsTools(&lark.Client{}, st, "feishu:cli_test", cfg, approver, access)
+	tools := NewDocsTools(&lark.Client{}, st, "feishu:cli_test", cfg, approver, access, newTestDocxAppendCipher(t), testDocxAppendExecutionOwner)
 	tool := findDocsTool(t, tools, createToolName)
 
 	access.err = NewResourceAuthorizationRequiredError(ResourceAccessRequirement{
@@ -1555,8 +1559,9 @@ func newDocsToolsForTest(t *testing.T, client *lark.Client, cfg Config, approver
 	}); err != nil {
 		t.Fatalf("seed Feishu chat folder: %v", err)
 	}
+	acquireTestDocxAppendRuntimeLease(t, st, testDocxAppendExecutionOwner, time.Now().UTC())
 	access := grantedResourceAccessController("req_access")
-	return st, NewDocsTools(client, st, "feishu:cli_test", cfg, approver, access), access
+	return st, NewDocsTools(client, st, "feishu:cli_test", cfg, approver, access, newTestDocxAppendCipher(t), testDocxAppendExecutionOwner), access
 }
 
 func seedDocsCreateApprovalWorkflow(t *testing.T, st *store.Store, requestID string) {
@@ -1574,8 +1579,28 @@ func seedDocsCreateApprovalWorkflow(t *testing.T, st *store.Store, requestID str
 
 func authorizedDocForTest(token string) AuthorizedResource {
 	return AuthorizedResource{
+		AccountID:           "feishu:cli_test",
+		ActorOpenID:         "ou_requester",
+		ActorUserID:         "u_requester",
+		ChatID:              "oc_chat",
 		ResourceType:        "docx",
 		ResourceToken:       token,
 		EffectivePermission: ResourcePermissionWrite,
+	}
+}
+
+func newTestDocxAppendCipher(t *testing.T) *DocxAppendEnvelopeCipher {
+	t.Helper()
+	cipher, err := NewDocxAppendEnvelopeCipher("test-app-secret", "feishu:cli_test")
+	if err != nil {
+		t.Fatalf("NewDocxAppendEnvelopeCipher returned error: %v", err)
+	}
+	return cipher
+}
+
+func acquireTestDocxAppendRuntimeLease(t *testing.T, st *store.Store, ownerID string, now time.Time) {
+	t.Helper()
+	if _, err := st.AcquireFeishuAccountRuntimeLease("feishu:cli_test", ownerID, now, 24*time.Hour); err != nil {
+		t.Fatalf("AcquireFeishuAccountRuntimeLease returned error: %v", err)
 	}
 }

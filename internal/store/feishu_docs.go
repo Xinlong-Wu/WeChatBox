@@ -293,6 +293,9 @@ func (s *Store) DeleteFeishuDocsData(accountID string) error {
 	if _, err := tx.Exec(`DELETE FROM feishu_remote_operations WHERE account_id=?`, accountID); err != nil {
 		return fmt.Errorf("delete feishu remote operations: %w", err)
 	}
+	if _, err := tx.Exec(`DELETE FROM feishu_docx_append_operations WHERE account_id=?`, accountID); err != nil {
+		return fmt.Errorf("delete feishu docx append operations: %w", err)
+	}
 	if _, err := tx.Exec(`DELETE FROM feishu_chat_documents WHERE account_id=?`, accountID); err != nil {
 		return fmt.Errorf("delete feishu chat documents: %w", err)
 	}

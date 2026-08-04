@@ -68,6 +68,9 @@ func (s *Store) CreateWorkflowRequest(request WorkflowRequest) (WorkflowRequest,
 }
 
 // UpdateWorkflowRequestState updates the lifecycle state of one root request.
+// For Feishu direct document create/append workflows that already own an
+// append ledger, the ledger-derived state wins atomically over a stale caller's
+// requested state. Workflows without a ledger retain the requested state.
 func (s *Store) UpdateWorkflowRequestState(id, accountID, state string, now time.Time) error {
 	id = strings.TrimSpace(id)
 	accountID = strings.TrimSpace(accountID)
@@ -76,12 +79,18 @@ func (s *Store) UpdateWorkflowRequestState(id, accountID, state string, now time
 		return fmt.Errorf("workflow request id, account_id, and valid state are required")
 	}
 	now = normalizedWorkflowTime(now)
+	query := `UPDATE workflow_requests SET state=?, updated_at_ms=? WHERE id=? AND account_id=?`
+	args := []any{state, now.UnixMilli(), id, accountID}
+	if s.platformID == PlatformFeishu {
+		query = `UPDATE workflow_requests
+			 SET state=` + feishuDocxAppendWorkflowStateExpression + `, updated_at_ms=?
+			 WHERE id=? AND account_id=?`
+		args = feishuDocxAppendWorkflowStateArgs(state)
+		args = append(args, now.UnixMilli(), id, accountID)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	result, err := s.db.Exec(
-		`UPDATE workflow_requests SET state=?, updated_at_ms=? WHERE id=? AND account_id=?`,
-		state, now.UnixMilli(), id, accountID,
-	)
+	result, err := s.db.Exec(query, args...)
 	if err != nil {
 		return fmt.Errorf("update workflow request: %w", err)
 	}
