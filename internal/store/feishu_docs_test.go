@@ -137,9 +137,6 @@ func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
 	refreshAttemptIDs := map[string]string{}
 	remoteOperationIDs := map[string]string{}
 	for _, accountID := range []string{"feishu:first", "feishu:second"} {
-		if _, err := st.AcquireFeishuAccountRuntimeLease(accountID, "runtime-"+accountID, now, time.Minute); err != nil {
-			t.Fatalf("AcquireFeishuAccountRuntimeLease returned error: %v", err)
-		}
 		if _, err := st.EnqueueFeishuCardDelivery(FeishuCardDelivery{
 			AccountID:     accountID,
 			RequestID:     "req-card-" + accountID,
@@ -321,12 +318,6 @@ func TestDeleteFeishuDocsDataRemovesOnlyMatchingAccount(t *testing.T) {
 	}
 	if _, err := st.GetFeishuOAuthRefreshAttempt(refreshAttemptIDs["feishu:second"], "feishu:second"); err != nil {
 		t.Fatalf("other account OAuth refresh attempt was deleted: %v", err)
-	}
-	if _, err := st.GetFeishuAccountRuntimeLease("feishu:first"); !errors.Is(err, ErrFeishuAccountRuntimeLeaseNotFound) {
-		t.Fatalf("deleted account runtime lease error = %v, want ErrFeishuAccountRuntimeLeaseNotFound", err)
-	}
-	if lease, err := st.GetFeishuAccountRuntimeLease("feishu:second"); err != nil || lease.OwnerID != "runtime-feishu:second" {
-		t.Fatalf("other account runtime lease = %#v err=%v", lease, err)
 	}
 	if _, err := st.GetFeishuCardDeliveryByKey(
 		"feishu:first", "req-card-feishu:first", FeishuCardDeliveryPurposeResourceTerminal, FeishuCardDeliveryRevisionTerminal,

@@ -1776,7 +1776,7 @@ func TestConfigureP2PChatCreatedSendsCommandOutput(t *testing.T) {
 	}
 }
 
-func TestFeishuAccountRuntimeShutdownWaitsForInFlightCustomEvent(t *testing.T) {
+func TestFeishuRuntimeShutdownWaitsForInFlightCustomEvent(t *testing.T) {
 	runtimeCtx, cancelRuntime := context.WithCancel(context.Background())
 	sender := &blockingSendTextSender{
 		fakeSender: &fakeSender{},
@@ -1804,13 +1804,11 @@ func TestFeishuAccountRuntimeShutdownWaitsForInFlightCustomEvent(t *testing.T) {
 
 	shutdownDone := make(chan struct{})
 	go func() {
-		_, _ = shutdownFeishuAccountRuntime(
+		shutdownFeishuRuntime(
 			cancelRuntime,
 			nil,
 			nil,
 			b,
-			nil,
-			nil,
 			nil,
 			nil,
 		)
@@ -2150,7 +2148,7 @@ func TestPlatformRunRequiresStoreForDocumentResources(t *testing.T) {
 		fakeProcessor:       &fakeProcessor{},
 		fakeWorkflowResumer: &fakeWorkflowResumer{},
 	})
-	if err == nil || !strings.Contains(err.Error(), "runtime lease requires a Feishu store") {
+	if err == nil || !strings.Contains(err.Error(), "Docs tools require a Feishu store") {
 		t.Fatalf("Run error = %v, want missing Feishu runtime store", err)
 	}
 }
@@ -2174,91 +2172,6 @@ func TestPlatformRunRequiresWorkflowResumerBeforeDocsStartup(t *testing.T) {
 	}
 }
 
-func TestPlatformRunHeldAccountLeaseSkipsStartupRecovery(t *testing.T) {
-	activeStore, recoveringStore := openSharedFeishuApprovalTestStores(t)
-	now := time.Now().UTC()
-	if _, err := activeStore.AcquireFeishuAccountRuntimeLease("feishu:cli_xxx", "runtime_active", now, time.Minute); err != nil {
-		t.Fatalf("acquire active runtime lease: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := activeStore.ReleaseFeishuAccountRuntimeLease("feishu:cli_xxx", "runtime_active"); err != nil {
-			t.Errorf("release active runtime lease: %v", err)
-		}
-	})
-	activeApproval, err := activeStore.CreateToolApproval(store.ToolApproval{
-		AccountID:       "feishu:cli_xxx",
-		ToolName:        "feishu_docs_create",
-		ActionKey:       "create",
-		ResourceType:    "folder",
-		ResourceToken:   "fld_token",
-		SupportsAll:     true,
-		ActorOpenID:     "ou_requester",
-		ActorUserID:     "u_requester",
-		ChatID:          "oc_chat",
-		SourceMessageID: "om_source",
-		Payload:         `{"title":"Quarterly plan"}`,
-		CreatedAt:       now,
-		ExpiresAt:       now.Add(10 * time.Minute),
-	})
-	if err != nil {
-		t.Fatalf("CreateToolApproval returned error: %v", err)
-	}
-	if err := activeStore.SetToolApprovalCardMessageID(activeApproval.ID, activeApproval.AccountID, "om_card", now); err != nil {
-		t.Fatalf("SetToolApprovalCardMessageID returned error: %v", err)
-	}
-	if _, err := activeStore.DecideToolApproval(
-		activeApproval.ID,
-		"feishu:cli_xxx",
-		store.ToolApprovalDecisionApprove,
-		store.ToolApprovalMatch{
-			ActorOpenID:   "ou_requester",
-			ActorUserID:   "u_requester",
-			ChatID:        "oc_chat",
-			CardMessageID: "om_card",
-		},
-		now.Add(time.Second),
-	); err != nil {
-		t.Fatalf("DecideToolApproval returned error: %v", err)
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/oauth/v3/token", "/open-apis/auth/v3/tenant_access_token/internal":
-			writeJSON(t, w, map[string]any{
-				"code":                0,
-				"msg":                 "ok",
-				"tenant_access_token": "tenant-token",
-				"expire":              7200,
-			})
-		case "/open-apis/bot/v3/info":
-			writeJSON(t, w, map[string]any{
-				"code": 0,
-				"msg":  "ok",
-				"bot":  map[string]any{"open_id": "ou_bot"},
-			})
-		default:
-			t.Fatalf("unexpected path: %s", r.URL.Path)
-		}
-	}))
-	defer server.Close()
-	acc := store.Account{ID: "feishu:cli_xxx", Name: "fsbot", Platform: store.PlatformFeishu}
-	err = NewPlatform(recoveringStore, acc, feishu.Config{
-		Accounts: map[string]feishu.AccountConfig{
-			"fsbot": {AppID: "cli_xxx", AppSecret: "secret", BaseURL: server.URL},
-		},
-		Tools: feishutools.Config{Docs: feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true}},
-	}, logging.Info).Run(t.Context(), &fakeWorkflowResumeHandler{
-		fakeProcessor:       &fakeProcessor{},
-		fakeWorkflowResumer: &fakeWorkflowResumer{},
-	})
-	if !errors.Is(err, store.ErrFeishuAccountRuntimeLeaseHeld) {
-		t.Fatalf("Run error = %v, want ErrFeishuAccountRuntimeLeaseHeld", err)
-	}
-	approval, loadErr := activeStore.GetToolApproval(activeApproval.ID, "feishu:cli_xxx")
-	if loadErr != nil || approval.State != store.ToolApprovalStateExecuting {
-		t.Fatalf("active approval after rejected second runtime = %#v err=%v, want executing", approval, loadErr)
-	}
-}
 func TestFeishuSDKLogLevel(t *testing.T) {
 	tests := []struct {
 		level logging.Level

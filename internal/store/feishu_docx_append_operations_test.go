@@ -17,7 +17,6 @@ func TestFeishuDocxAppendOperationLifecycleFreezesEnvelopeAndClearsTerminalPaylo
 	st := openFeishuDocsTestStore(t)
 	now := time.Date(2026, time.August, 4, 18, 0, 0, 0, time.UTC)
 	seedFeishuDocxAppendWorkflow(t, st, "req_append_ledger", WorkflowRequestKindFeishuDocsAppend, now)
-	acquireFeishuDocxAppendRuntimeLease(t, st, testFeishuDocxAppendExecutionOwner, now)
 	want := FeishuDocxAppendOperation{
 		RequestID:          "req_append_ledger",
 		AccountID:          "feishu:cli_test",
@@ -98,7 +97,6 @@ func TestFeishuDocxAppendOperationFailureClearsProtectedEnvelope(t *testing.T) {
 	st := openFeishuDocsTestStore(t)
 	now := time.Date(2026, time.August, 4, 18, 15, 0, 0, time.UTC)
 	seedFeishuDocxAppendWorkflow(t, st, "req_append_failed", WorkflowRequestKindFeishuDocsAppend, now)
-	acquireFeishuDocxAppendRuntimeLease(t, st, testFeishuDocxAppendExecutionOwner, now)
 	operation := testFeishuDocxAppendOperation("req_append_failed", now)
 	if _, _, err := st.PrepareFeishuDocxAppendOperation(operation); err != nil {
 		t.Fatalf("PrepareFeishuDocxAppendOperation returned error: %v", err)
@@ -117,7 +115,6 @@ func TestFeishuDocxAppendOperationOutcomeUnknownCannotBecomeFailed(t *testing.T)
 	st := openFeishuDocsTestStore(t)
 	now := time.Date(2026, time.August, 4, 18, 20, 0, 0, time.UTC)
 	seedFeishuDocxAppendWorkflow(t, st, "req_append_unknown_not_failed", WorkflowRequestKindFeishuDocsAppend, now)
-	acquireFeishuDocxAppendRuntimeLease(t, st, testFeishuDocxAppendExecutionOwner, now)
 	operation := testFeishuDocxAppendOperation("req_append_unknown_not_failed", now)
 	if _, _, err := st.PrepareFeishuDocxAppendOperation(operation); err != nil {
 		t.Fatalf("PrepareFeishuDocxAppendOperation returned error: %v", err)
@@ -141,10 +138,9 @@ func TestFeishuDocxAppendOperationOutcomeUnknownCannotBecomeFailed(t *testing.T)
 }
 
 func TestFeishuDocxAppendOperationConcurrentStartHasSingleCaller(t *testing.T) {
-	first, second := openSharedFeishuRuntimeLeaseStores(t)
+	first, second := openSharedFeishuTestStores(t)
 	now := time.Date(2026, time.August, 4, 18, 30, 0, 0, time.UTC)
 	seedFeishuDocxAppendWorkflow(t, first, "req_append_concurrent", WorkflowRequestKindFeishuDocsAppend, now)
-	acquireFeishuDocxAppendRuntimeLease(t, first, testFeishuDocxAppendExecutionOwner, now)
 	operation := testFeishuDocxAppendOperation("req_append_concurrent", now)
 	if _, _, err := first.PrepareFeishuDocxAppendOperation(operation); err != nil {
 		t.Fatalf("PrepareFeishuDocxAppendOperation returned error: %v", err)
@@ -183,24 +179,17 @@ func TestFeishuDocxAppendOperationConcurrentStartHasSingleCaller(t *testing.T) {
 	}
 }
 
-func TestFeishuDocxAppendOperationStartRequiresLiveAccountRuntimeLease(t *testing.T) {
+func TestFeishuDocxAppendOperationStartDoesNotRequireAccountRuntimeLease(t *testing.T) {
 	st := openFeishuDocsTestStore(t)
 	now := time.Date(2026, time.August, 4, 18, 32, 0, 0, time.UTC)
-	seedFeishuDocxAppendWorkflow(t, st, "req_append_runtime_lease", WorkflowRequestKindFeishuDocsAppend, now)
-	operation := testFeishuDocxAppendOperation("req_append_runtime_lease", now)
+	seedFeishuDocxAppendWorkflow(t, st, "req_append_execution_owner", WorkflowRequestKindFeishuDocsAppend, now)
+	operation := testFeishuDocxAppendOperation("req_append_execution_owner", now)
 	if _, _, err := st.PrepareFeishuDocxAppendOperation(operation); err != nil {
 		t.Fatalf("PrepareFeishuDocxAppendOperation returned error: %v", err)
 	}
-	withoutLease, claimed, err := st.StartFeishuDocxAppendOperation(operation.RequestID, operation.AccountID, "runtime_missing", "execution_missing", now.Add(time.Second), time.Minute)
-	if err != nil || claimed || withoutLease.State != FeishuDocxAppendOperationStatePrepared {
-		t.Fatalf("start without runtime lease = %#v claimed=%t err=%v", withoutLease, claimed, err)
-	}
-	if _, err := st.AcquireFeishuAccountRuntimeLease(operation.AccountID, "runtime_live", now.Add(2*time.Second), time.Minute); err != nil {
-		t.Fatalf("AcquireFeishuAccountRuntimeLease returned error: %v", err)
-	}
-	withLease, claimed, err := st.StartFeishuDocxAppendOperation(operation.RequestID, operation.AccountID, "runtime_live", "execution_live", now.Add(3*time.Second), time.Minute)
-	if err != nil || !claimed || withLease.State != FeishuDocxAppendOperationStateRemoteStarted || withLease.ExecutionToken != "execution_live" {
-		t.Fatalf("start with live runtime lease = %#v claimed=%t err=%v", withLease, claimed, err)
+	started, claimed, err := st.StartFeishuDocxAppendOperation(operation.RequestID, operation.AccountID, "runtime_independent", "execution_first", now.Add(time.Second), time.Minute)
+	if err != nil || !claimed || started.State != FeishuDocxAppendOperationStateRemoteStarted || started.ExecutionOwnerID != "runtime_independent" || started.ExecutionToken != "execution_first" {
+		t.Fatalf("start without account runtime lease = %#v claimed=%t err=%v", started, claimed, err)
 	}
 }
 
@@ -209,9 +198,6 @@ func TestFeishuDocxAppendOperationRecoveryClaimFencesStaleOwner(t *testing.T) {
 	now := time.Date(2026, time.August, 4, 18, 35, 0, 0, time.UTC)
 	seedFeishuDocxAppendWorkflow(t, st, "req_append_recovery_fence", WorkflowRequestKindFeishuDocsAppend, now)
 	operation := testFeishuDocxAppendOperation("req_append_recovery_fence", now)
-	if _, err := st.AcquireFeishuAccountRuntimeLease(operation.AccountID, "runtime_old", now, time.Minute); err != nil {
-		t.Fatalf("acquire old runtime lease: %v", err)
-	}
 	if _, _, err := st.PrepareFeishuDocxAppendOperation(operation); err != nil {
 		t.Fatalf("PrepareFeishuDocxAppendOperation returned error: %v", err)
 	}
@@ -222,30 +208,28 @@ func TestFeishuDocxAppendOperationRecoveryClaimFencesStaleOwner(t *testing.T) {
 	if err != nil || claimed || blocked.ExecutionToken != "execution_old" || blocked.State != FeishuDocxAppendOperationStateRemoteStarted {
 		t.Fatalf("same-owner live recovery claim = %#v claimed=%t err=%v", blocked, claimed, err)
 	}
-	if err := st.ReleaseFeishuAccountRuntimeLease(operation.AccountID, "runtime_old"); err != nil {
-		t.Fatalf("release old runtime lease: %v", err)
-	}
-	if _, err := st.AcquireFeishuAccountRuntimeLease(operation.AccountID, "runtime_new", now.Add(3*time.Second), time.Minute); err != nil {
-		t.Fatalf("acquire new runtime lease: %v", err)
+	blocked, claimed, err = st.ClaimFeishuDocxAppendOperationRecovery(operation.RequestID, operation.AccountID, "runtime_new", "execution_new", now.Add(3*time.Second), time.Minute)
+	if err != nil || claimed || blocked.ExecutionToken != "execution_old" || blocked.State != FeishuDocxAppendOperationStateRemoteStarted {
+		t.Fatalf("different-owner live recovery claim = %#v claimed=%t err=%v", blocked, claimed, err)
 	}
 
-	takenOver, claimed, err := st.ClaimFeishuDocxAppendOperationRecovery(operation.RequestID, operation.AccountID, "runtime_new", "execution_new", now.Add(3*time.Second), time.Minute)
+	takenOver, claimed, err := st.ClaimFeishuDocxAppendOperationRecovery(operation.RequestID, operation.AccountID, "runtime_new", "execution_new", now.Add(62*time.Second), time.Minute)
 	if err != nil || !claimed || takenOver.State != FeishuDocxAppendOperationStateOutcomeUnknown || takenOver.ExecutionOwnerID != "runtime_new" || takenOver.ExecutionToken != "execution_new" {
 		t.Fatalf("new-owner recovery claim = %#v claimed=%t err=%v", takenOver, claimed, err)
 	}
-	staleClaim, claimed, err := st.ClaimFeishuDocxAppendOperationRecovery(operation.RequestID, operation.AccountID, "runtime_old", "execution_stale", now.Add(4*time.Second), time.Minute)
+	staleClaim, claimed, err := st.ClaimFeishuDocxAppendOperationRecovery(operation.RequestID, operation.AccountID, "runtime_old", "execution_stale", now.Add(63*time.Second), time.Minute)
 	if err != nil || claimed || staleClaim.ExecutionOwnerID != "runtime_new" || staleClaim.ExecutionToken != "execution_new" {
 		t.Fatalf("stale runtime recovery claim = %#v claimed=%t err=%v, want current owner preserved", staleClaim, claimed, err)
 	}
-	stale, err := st.MarkFeishuDocxAppendOperationSucceeded(operation.RequestID, operation.AccountID, "execution_old", now.Add(4*time.Second))
+	stale, err := st.MarkFeishuDocxAppendOperationSucceeded(operation.RequestID, operation.AccountID, "execution_old", now.Add(64*time.Second))
 	if !errors.Is(err, ErrFeishuDocxAppendOperationNotReady) || stale.State != FeishuDocxAppendOperationStateOutcomeUnknown || stale.ExecutionToken != "execution_new" || stale.EnvelopeCiphertext == "" {
 		t.Fatalf("stale owner success = %#v err=%v, want fenced recoverable operation", stale, err)
 	}
-	stale, err = st.MarkFeishuDocxAppendOperationFailed(operation.RequestID, operation.AccountID, "execution_old", "late_rejection", now.Add(4*time.Second))
+	stale, err = st.MarkFeishuDocxAppendOperationFailed(operation.RequestID, operation.AccountID, "execution_old", "late_rejection", now.Add(64*time.Second))
 	if !errors.Is(err, ErrFeishuDocxAppendOperationNotReady) || stale.State != FeishuDocxAppendOperationStateOutcomeUnknown || stale.ExecutionToken != "execution_new" || stale.EnvelopeCiphertext == "" {
 		t.Fatalf("stale owner failure = %#v err=%v, want fenced recoverable operation", stale, err)
 	}
-	completed, err := st.MarkFeishuDocxAppendOperationSucceeded(operation.RequestID, operation.AccountID, "execution_new", now.Add(5*time.Second))
+	completed, err := st.MarkFeishuDocxAppendOperationSucceeded(operation.RequestID, operation.AccountID, "execution_new", now.Add(65*time.Second))
 	if err != nil || completed.State != FeishuDocxAppendOperationStateSucceeded || completed.EnvelopeCiphertext != "" || completed.ExecutionOwnerID != "" || completed.ExecutionToken != "" || !completed.ExecutionLeaseUntil.IsZero() {
 		t.Fatalf("new owner completion = %#v err=%v", completed, err)
 	}
@@ -255,7 +239,6 @@ func TestFeishuDocxAppendOperationRecoveryLeaseAllowsSameOwnerTakeoverAfterExpir
 	st := openFeishuDocsTestStore(t)
 	now := time.Date(2026, time.August, 4, 18, 40, 0, 0, time.UTC)
 	seedFeishuDocxAppendWorkflow(t, st, "req_append_recovery_lease", WorkflowRequestKindFeishuDocsAppend, now)
-	acquireFeishuDocxAppendRuntimeLease(t, st, "runtime_same", now)
 	operation := testFeishuDocxAppendOperation("req_append_recovery_lease", now)
 	if _, _, err := st.PrepareFeishuDocxAppendOperation(operation); err != nil {
 		t.Fatalf("PrepareFeishuDocxAppendOperation returned error: %v", err)
@@ -319,7 +302,6 @@ func TestReconcileFeishuDocxAppendWorkflowStateUsesCurrentLedgerAndSkipsToolAppr
 	st := openFeishuDocsTestStore(t)
 	now := time.Date(2026, time.August, 4, 18, 55, 0, 0, time.UTC)
 	seedFeishuDocxAppendWorkflow(t, st, "req_create_reconcile", WorkflowRequestKindFeishuDocsCreate, now)
-	acquireFeishuDocxAppendRuntimeLease(t, st, testFeishuDocxAppendExecutionOwner, now)
 	operation := testFeishuDocxAppendOperation("req_create_reconcile", now)
 	if _, _, err := st.PrepareFeishuDocxAppendOperation(operation); err != nil {
 		t.Fatalf("PrepareFeishuDocxAppendOperation returned error: %v", err)
@@ -372,7 +354,6 @@ func TestReconcileFeishuDocxAppendWorkflowStateUsesCurrentLedgerAndSkipsToolAppr
 func TestUpdateWorkflowRequestStatePreservesDocxAppendLedgerAuthorityAndLegacyCompatibility(t *testing.T) {
 	st := openFeishuDocsTestStore(t)
 	now := time.Date(2026, time.August, 4, 19, 0, 0, 0, time.UTC)
-	acquireFeishuDocxAppendRuntimeLease(t, st, testFeishuDocxAppendExecutionOwner, now)
 
 	type ledgerCase struct {
 		name     string
@@ -501,12 +482,5 @@ func testFeishuDocxAppendOperation(requestID string, now time.Time) FeishuDocxAp
 		EnvelopeHash:       "envelope-hash",
 		EnvelopeCiphertext: "v1.encrypted-envelope",
 		CreatedAt:          now,
-	}
-}
-
-func acquireFeishuDocxAppendRuntimeLease(t *testing.T, st *Store, ownerID string, now time.Time) {
-	t.Helper()
-	if _, err := st.AcquireFeishuAccountRuntimeLease("feishu:cli_test", ownerID, now, 24*time.Hour); err != nil {
-		t.Fatalf("AcquireFeishuAccountRuntimeLease returned error: %v", err)
 	}
 }

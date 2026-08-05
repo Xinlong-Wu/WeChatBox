@@ -95,7 +95,7 @@ func TestFeishuRemoteOperationLifecycleAndIdempotentReplay(t *testing.T) {
 }
 
 func TestFeishuRemoteOperationConcurrentStartHasSingleCaller(t *testing.T) {
-	first, second := openSharedFeishuRuntimeLeaseStores(t)
+	first, second := openSharedFeishuTestStores(t)
 	now := time.Date(2026, time.August, 4, 15, 30, 0, 0, time.UTC)
 	request, err := first.CreateWorkflowRequest(WorkflowRequest{
 		ID:        "req_remote_concurrent",
@@ -229,7 +229,7 @@ func TestFeishuRemoteOperationSuccessRejectsResourceClaimedByAnotherRequest(t *t
 }
 
 func TestFeishuRemoteOperationConcurrentSuccessHasSingleResourceClaimant(t *testing.T) {
-	first, second := openSharedFeishuRuntimeLeaseStores(t)
+	first, second := openSharedFeishuTestStores(t)
 	now := time.Date(2026, time.August, 4, 16, 30, 0, 0, time.UTC)
 	const (
 		accountID     = "feishu:cli_test"

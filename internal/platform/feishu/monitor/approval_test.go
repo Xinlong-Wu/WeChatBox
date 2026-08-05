@@ -593,22 +593,22 @@ func TestApprovalManagerLeaseOwnershipLossPreservesAdmittedExecutionForRecovery(
 	case <-time.After(200 * time.Millisecond):
 		releaseExecutor()
 		<-tasksDone
-		t.Fatal("admitted approval execution ignored account lease ownership loss")
+		t.Fatal("admitted approval execution ignored runtime ownership cancellation")
 	}
 	preserved, err := st.GetToolApproval(pending.RequestID, manager.account.ID)
 	if err != nil || preserved.State != store.ToolApprovalStateExecuting || preserved.Payload == "" {
-		t.Fatalf("approval after lease ownership loss = %#v err=%v, want recoverable executing payload", preserved, err)
+		t.Fatalf("approval after runtime ownership cancellation = %#v err=%v, want recoverable executing payload", preserved, err)
 	}
 	workflow, err := st.GetWorkflowRequest(pending.RequestID, manager.account.ID)
 	if err != nil || workflow.State != store.WorkflowRequestStateExecuting {
-		t.Fatalf("workflow after lease ownership loss = %#v err=%v, want executing", workflow, err)
+		t.Fatalf("workflow after runtime ownership cancellation = %#v err=%v, want executing", workflow, err)
 	}
 	if result, err := st.GetWorkflowResult(pending.RequestID, manager.account.ID); !errors.Is(err, store.ErrWorkflowResultNotFound) {
-		t.Fatalf("workflow result after lease ownership loss = %#v err=%v, want none", result, err)
+		t.Fatalf("workflow result after runtime ownership cancellation = %#v err=%v, want none", result, err)
 	}
 	_, updates, messages := sender.snapshot()
 	if len(updates) != 0 || len(messages) != 0 {
-		t.Fatalf("terminal outputs after lease ownership loss = updates:%#v messages:%#v", updates, messages)
+		t.Fatalf("terminal outputs after runtime ownership cancellation = updates:%#v messages:%#v", updates, messages)
 	}
 }
 
@@ -1166,134 +1166,6 @@ func TestApprovalManagerRecoveryToleratesExecutingApprovalResolvedAfterListing(t
 	}
 }
 
-func TestApprovalManagerRecoveryDoesNotFailApprovalExecutingInAnotherRuntime(t *testing.T) {
-	activeStore, recoveringStore := openSharedFeishuApprovalTestStores(t)
-	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
-	activeLease, err := acquireFeishuAccountRuntimeLease(activeStore, "feishu:cli_test", feishuAccountRuntimeLeaseOptions{
-		OwnerID:           "runtime_active",
-		TTL:               30 * time.Second,
-		HeartbeatInterval: 10 * time.Second,
-		Now:               func() time.Time { return now },
-	})
-	if err != nil {
-		t.Fatalf("acquire active runtime lease: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := activeLease.release(); err != nil && !errors.Is(err, store.ErrFeishuAccountRuntimeLeaseLost) {
-			t.Errorf("release active runtime lease: %v", err)
-		}
-	})
-	activeManager := newTestApprovalManager(t, activeStore, &fakeApprovalSender{})
-	executor := &blockingApprovalExecutor{
-		started: make(chan struct{}),
-		release: make(chan struct{}),
-	}
-	t.Cleanup(func() { close(executor.release) })
-	if err := activeManager.registerExecutor(executor); err != nil {
-		t.Fatalf("registerExecutor returned error: %v", err)
-	}
-	pending := requestTestApproval(t, activeManager)
-	response, err := activeManager.HandleCardAction(
-		t.Context(),
-		approvalCardEvent(pending.RequestID, approvalCardActionApproveOnce, "ou_requester", "oc_chat", "om_card", ""),
-	)
-	if err != nil || response == nil {
-		t.Fatalf("HandleCardAction response = %#v err=%v", response, err)
-	}
-	select {
-	case <-executor.started:
-	case <-time.After(time.Second):
-		t.Fatal("active runtime executor did not start")
-	}
-	beforeRecovery, err := activeStore.GetToolApproval(pending.RequestID, "feishu:cli_test")
-	if err != nil || beforeRecovery.State != store.ToolApprovalStateExecuting {
-		t.Fatalf("approval before second runtime recovery = %#v err=%v, want executing", beforeRecovery, err)
-	}
-
-	if _, err := acquireFeishuAccountRuntimeLease(recoveringStore, "feishu:cli_test", feishuAccountRuntimeLeaseOptions{
-		OwnerID:           "runtime_recovering",
-		TTL:               30 * time.Second,
-		HeartbeatInterval: 10 * time.Second,
-		Now:               func() time.Time { return now.Add(time.Second) },
-	}); !errors.Is(err, store.ErrFeishuAccountRuntimeLeaseHeld) {
-		t.Fatalf("second runtime lease error = %v, want ErrFeishuAccountRuntimeLeaseHeld", err)
-	}
-	afterRecovery, err := activeStore.GetToolApproval(pending.RequestID, "feishu:cli_test")
-	if err != nil {
-		t.Fatalf("GetToolApproval after second runtime recovery returned error: %v", err)
-	}
-	if afterRecovery.State != store.ToolApprovalStateExecuting {
-		t.Fatalf("second runtime recovery changed live approval state to %q, want %q", afterRecovery.State, store.ToolApprovalStateExecuting)
-	}
-}
-
-func TestApprovalManagerRecoveryRunsAfterExpiredAccountRuntimeLeaseTakeover(t *testing.T) {
-	activeStore, recoveringStore := openSharedFeishuApprovalTestStores(t)
-	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
-	activeLease, err := acquireFeishuAccountRuntimeLease(activeStore, "feishu:cli_test", feishuAccountRuntimeLeaseOptions{
-		OwnerID:           "runtime_expired",
-		TTL:               30 * time.Second,
-		HeartbeatInterval: 10 * time.Second,
-		Now:               func() time.Time { return now },
-	})
-	if err != nil {
-		t.Fatalf("acquire active runtime lease: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := activeLease.release(); err != nil && !errors.Is(err, store.ErrFeishuAccountRuntimeLeaseLost) {
-			t.Errorf("release expired runtime lease: %v", err)
-		}
-	})
-	activeManager := newTestApprovalManager(t, activeStore, &fakeApprovalSender{})
-	if err := activeManager.registerExecutor(&fakeApprovalExecutor{name: "feishu_docs_create"}); err != nil {
-		t.Fatalf("registerExecutor returned error: %v", err)
-	}
-	pending := requestTestApproval(t, activeManager)
-	if _, err := activeStore.DecideToolApproval(
-		pending.RequestID,
-		"feishu:cli_test",
-		store.ToolApprovalDecisionApprove,
-		store.ToolApprovalMatch{
-			ActorOpenID:   "ou_requester",
-			ActorUserID:   "u_requester",
-			ChatID:        "oc_chat",
-			CardMessageID: "om_card",
-		},
-		now.Add(time.Second),
-	); err != nil {
-		t.Fatalf("DecideToolApproval returned error: %v", err)
-	}
-
-	takeoverNow := now.Add(31 * time.Second)
-	recoveringLease, err := acquireFeishuAccountRuntimeLease(recoveringStore, "feishu:cli_test", feishuAccountRuntimeLeaseOptions{
-		OwnerID:           "runtime_takeover",
-		TTL:               30 * time.Second,
-		HeartbeatInterval: 10 * time.Second,
-		Now:               func() time.Time { return takeoverNow },
-	})
-	if err != nil {
-		t.Fatalf("acquire expired runtime lease takeover: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := recoveringLease.release(); err != nil && !errors.Is(err, store.ErrFeishuAccountRuntimeLeaseLost) {
-			t.Errorf("release takeover runtime lease: %v", err)
-		}
-	})
-	if err := activeLease.release(); !errors.Is(err, store.ErrFeishuAccountRuntimeLeaseLost) {
-		t.Fatalf("expired owner release error = %v, want ErrFeishuAccountRuntimeLeaseLost", err)
-	}
-
-	recoveringManager := newTestApprovalManager(t, recoveringStore, &fakeApprovalSender{})
-	recoveringManager.now = func() time.Time { return takeoverNow }
-	if err := recoveringManager.recoverPersistedApprovals(t.Context()); err != nil {
-		t.Fatalf("recoverPersistedApprovals returned error: %v", err)
-	}
-	recovered, err := activeStore.GetToolApproval(pending.RequestID, "feishu:cli_test")
-	if err != nil || recovered.State != store.ToolApprovalStateFailed {
-		t.Fatalf("approval after expired lease takeover recovery = %#v err=%v, want failed", recovered, err)
-	}
-}
-
 func TestApprovalManagerRecoverySharesTerminalCardTimeoutBudget(t *testing.T) {
 	st := openFeishuApprovalTestStore(t)
 	sender := &fakeApprovalSender{
@@ -1533,30 +1405,6 @@ func openFeishuApprovalTestStore(t *testing.T) *store.Store {
 		}
 	})
 	return st
-}
-
-func openSharedFeishuApprovalTestStores(t *testing.T) (*store.Store, *store.Store) {
-	t.Helper()
-	t.Setenv("HOME", t.TempDir())
-	first, err := store.Open(store.PlatformFeishu)
-	if err != nil {
-		t.Fatalf("open first shared store: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := first.Close(); err != nil {
-			t.Errorf("close first shared store: %v", err)
-		}
-	})
-	second, err := store.Open(store.PlatformFeishu)
-	if err != nil {
-		t.Fatalf("open second shared store: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := second.Close(); err != nil {
-			t.Errorf("close second shared store: %v", err)
-		}
-	})
-	return first, second
 }
 
 func newTestApprovalManager(t *testing.T, st *store.Store, sender *fakeApprovalSender) *operationApprovalService {

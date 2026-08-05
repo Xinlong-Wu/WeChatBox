@@ -162,7 +162,7 @@ func (m *resourceAccessManager) preserveResourceAccessAfterOwnershipLoss(
 	if !feishuRuntimeOwnershipLost(m.baseContext()) && !errors.Is(cause, errFeishuResourceAccessOwnershipLost) {
 		return false
 	}
-	feishuLog.Warn(ctx, "preserving feishu resource authorization after account lease ownership loss request=%s account=%s user=%s chat=%s type=%s resource_ref=%s phase=%s error_type=%T",
+	feishuLog.Warn(ctx, "preserving feishu resource authorization after runtime ownership cancellation request=%s account=%s user=%s chat=%s type=%s resource_ref=%s phase=%s error_type=%T",
 		shortRequestID(request.ID), request.AccountID, resourceAccessActorID(request), request.ChatID,
 		request.ResourceType, shortResourceRef(request.ResourceToken), phase, cause)
 	return true

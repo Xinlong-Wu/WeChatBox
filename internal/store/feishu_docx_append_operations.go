@@ -176,12 +176,7 @@ func (s *Store) StartFeishuDocxAppendOperation(requestID, accountID, executionOw
 		`UPDATE feishu_docx_append_operations
 		 SET state=?, remote_call_started_at_ms=?, execution_owner_id=?, execution_token=?,
 		 execution_lease_expires_at_ms=?, last_error_category='', updated_at_ms=?
-		 WHERE request_id=? AND account_id=? AND state=?
-		 AND EXISTS (
-		  SELECT 1 FROM feishu_account_runtime_leases AS runtime
-		  WHERE runtime.account_id=feishu_docx_append_operations.account_id
-		  AND runtime.owner_id=? AND runtime.lease_expires_at_ms>?
-		 )`,
+		 WHERE request_id=? AND account_id=? AND state=?`,
 		FeishuDocxAppendOperationStateRemoteStarted,
 		now.UnixMilli(),
 		executionOwnerID,
@@ -191,8 +186,6 @@ func (s *Store) StartFeishuDocxAppendOperation(requestID, accountID, executionOw
 		requestID,
 		accountID,
 		FeishuDocxAppendOperationStatePrepared,
-		executionOwnerID,
-		now.UnixMilli(),
 	)
 	s.mu.Unlock()
 	if err != nil {
@@ -235,12 +228,7 @@ func (s *Store) ClaimFeishuDocxAppendOperationRecovery(requestID, accountID, exe
 		 last_error_category=CASE WHEN state=? AND last_error_category='' THEN 'interrupted_append_attempt' ELSE last_error_category END,
 		 updated_at_ms=?
 		 WHERE request_id=? AND account_id=? AND state IN (?, ?)
-		 AND (execution_token='' OR execution_owner_id<>? OR execution_lease_expires_at_ms<=?)
-		 AND EXISTS (
-		  SELECT 1 FROM feishu_account_runtime_leases AS runtime
-		  WHERE runtime.account_id=feishu_docx_append_operations.account_id
-		  AND runtime.owner_id=? AND runtime.lease_expires_at_ms>?
-		 )`,
+		 AND (execution_token='' OR execution_lease_expires_at_ms<=?)`,
 		FeishuDocxAppendOperationStateOutcomeUnknown,
 		executionOwnerID,
 		executionToken,
@@ -251,9 +239,6 @@ func (s *Store) ClaimFeishuDocxAppendOperationRecovery(requestID, accountID, exe
 		accountID,
 		FeishuDocxAppendOperationStateRemoteStarted,
 		FeishuDocxAppendOperationStateOutcomeUnknown,
-		executionOwnerID,
-		now.UnixMilli(),
-		executionOwnerID,
 		now.UnixMilli(),
 	)
 	s.mu.Unlock()

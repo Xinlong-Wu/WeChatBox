@@ -255,13 +255,7 @@ func (s *Store) migrate() error {
 			created_at_ms INTEGER NOT NULL,
 			updated_at_ms INTEGER NOT NULL
 		)`,
-		`CREATE TABLE IF NOT EXISTS feishu_account_runtime_leases (
-			account_id TEXT PRIMARY KEY,
-			owner_id TEXT NOT NULL,
-			acquired_at_ms INTEGER NOT NULL,
-			heartbeat_at_ms INTEGER NOT NULL,
-			lease_expires_at_ms INTEGER NOT NULL
-		)`,
+		`DROP TABLE IF EXISTS feishu_account_runtime_leases`,
 		`CREATE TABLE IF NOT EXISTS feishu_card_deliveries (
 			id TEXT PRIMARY KEY,
 			account_id TEXT NOT NULL,

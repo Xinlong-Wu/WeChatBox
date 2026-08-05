@@ -441,12 +441,12 @@ binds the request to the exact account, actor, chat, document, and block
 content; replaying the same request ID with a different scope, document, or
 content fails closed. An atomic `prepared` to `remote_started` claim allows
 only one first caller across Store instances. Every first call and recovery
-also requires the caller's live account runtime lease and holds a bounded,
-random execution-token lease. A new account runtime owner may take over an
-interrupted call, while a stale owner cannot reclaim it or persist a late
-result; same-owner concurrent recoveries are rejected by CAS. Taking over
+holds a bounded, random execution-token lease under an independent runtime
+owner ID. No caller, including a different runtime owner, may take over before
+that operation lease expires. After expiry, one recovery caller can take over,
+while the stale execution token cannot persist a late result. Taking over
 `remote_started` first promotes it to `outcome_unknown`, because the previous
-owner may already have reached Feishu. In-process reconciliation and startup
+caller may already have reached Feishu. In-process reconciliation and startup
 recovery always decrypt and reuse the same frozen request instead of reading a
 new child count. Once any response is uncertain, later rejection cannot prove
 that the first request did not mutate the document, so the ledger remains
@@ -547,8 +547,8 @@ credential and staged-refresh ciphertext unreadable, causes affected
 credentials to fail closed, and requires the user to complete OAuth again.
 Sanitized terminal refresh attempts are retained for 30 days for bounded audit
 and then deleted in batches of 500. Cleanup runs once after startup recovery and
-every 24 hours while the account Runtime holds its single-active lease. Prepared
-or staged attempts are never retention-deleted. A terminal row that still
+every 24 hours in each active account runtime. Prepared or staged attempts are
+never retention-deleted. A terminal row that still
 contains access- or refresh-token ciphertext is also retained and logged as an
 unsafe anomaly instead of being deleted.
 LingoBridge updates the original card with the terminal result and does not send a separate
@@ -988,7 +988,7 @@ account removes the config entry and clears that account's sync cursor. Feishu
 account deletion also removes its chat-bound document/folder metadata,
 Bot-resource records, Feishu-side resource capabilities, local resource-access
 requests/grants, encrypted user OAuth credentials and their refresh-attempt
-records, account runtime lease, pending/completed tool approvals, reusable
+records, pending/completed tool approvals, reusable
 approval grants, pending/completed card-delivery outbox rows, durable remote
 create-operation rows, and their global workflow request rows.
 Sessions and media are left intact because current history records are not
@@ -1066,25 +1066,17 @@ tasks to exit, and returns an interrupted continuation lease to `ready` without
 charging an attempt. Results that become ready while the worker is stopping are
 picked up after restart.
 
-Each Feishu Bot account also uses a durable account-level runtime lease. Only
-one active LingoBridge runtime may start recovery, workers, callbacks, and the
-long connection for the same `account_id`; a second runtime exits before it can
-change workflow state. The active runtime renews a 30-second lease every 10
-seconds and keeps renewing while admitted background work drains during normal
-shutdown. After a crash, another runtime can take over after the lease expires,
-and an old owner cannot renew or release the replacement's lease. Competing
-processes or machines must open the same Feishu SQLite database for this
-single-active guarantee; separate local database files cannot coordinate the
-account lease. Normal lifecycle cancellation is deliberately distinct from
-lease ownership loss: orderly shutdown keeps ownership-bound admitted work
-alive until it drains, while a lost lease cancels approval/resource side-effect
-contexts and leaves their durable `executing` state for the replacement runtime
-to recover. This narrows the stale-owner overlap window; remote APIs that have
-already accepted a request still rely on their operation ledger, stable
-idempotency token, or conservative live verification for final reconciliation.
-Independent same-token append reconciliation is also bounded by this ownership
-context: normal shutdown may finish an already admitted retry, but a lost
-account lease prevents the stale runtime from issuing the reconciliation call.
+Feishu account runtimes deliberately have no account-level single-active lock.
+Every configured runtime starts its recovery, workers, callbacks, and long
+connection immediately, even when another process or another entry in the same
+process uses the same `account_id`. This avoids stale-lease delays during fast
+restart, but it also means LingoBridge does not promise global exactly-once
+event handling or startup recovery across duplicate runtimes. Workflow-specific
+CAS, card/continuation claims, stable idempotency tokens, remote-operation
+ledgers, and append execution leases still protect their own state transitions,
+but they are not an account-wide coordination mechanism. Normal shutdown closes
+new callback admission and lets already-admitted work drain before the runtime
+exits.
 
 The resumed turn receives a runtime-generated workflow-result event with a
 per-turn attestation in the system prompt. The event payload is treated as data,

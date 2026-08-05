@@ -130,30 +130,47 @@ func TestMigrateCreatesFeishuOAuthRefreshAttemptSchema(t *testing.T) {
 	}
 }
 
-func TestMigrateCreatesFeishuAccountRuntimeLeaseSchema(t *testing.T) {
-	st := openFeishuDocsTestStore(t)
-	rows, err := st.db.Query(`PRAGMA table_info(feishu_account_runtime_leases)`)
+func TestMigrateRemovesLegacyFeishuAccountRuntimeLeaseSchema(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	legacy, err := Open(PlatformFeishu)
 	if err != nil {
-		t.Fatalf("inspect account runtime lease schema: %v", err)
+		t.Fatalf("open seed store: %v", err)
 	}
-	defer rows.Close()
-	columns := map[string]bool{}
-	for rows.Next() {
-		var cid, notNull, primaryKey int
-		var name, columnType string
-		var defaultValue interface{}
-		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
-			t.Fatalf("scan account runtime lease schema: %v", err)
+	if _, err := legacy.db.Exec(`CREATE TABLE feishu_account_runtime_leases (
+		account_id TEXT PRIMARY KEY,
+		owner_id TEXT NOT NULL,
+		acquired_at_ms INTEGER NOT NULL,
+		heartbeat_at_ms INTEGER NOT NULL,
+		lease_expires_at_ms INTEGER NOT NULL
+	)`); err != nil {
+		legacy.Close()
+		t.Fatalf("create legacy account runtime lease table: %v", err)
+	}
+	if _, err := legacy.db.Exec(`INSERT INTO feishu_account_runtime_leases VALUES ('feishu:cli_test', 'runtime_old', 1, 1, 2)`); err != nil {
+		legacy.Close()
+		t.Fatalf("seed legacy account runtime lease: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close seed store: %v", err)
+	}
+
+	st, err := Open(PlatformFeishu)
+	if err != nil {
+		t.Fatalf("open migrated store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Errorf("close migrated store: %v", err)
 		}
-		columns[name] = true
+	})
+	var count int
+	if err := st.db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='feishu_account_runtime_leases'`,
+	).Scan(&count); err != nil {
+		t.Fatalf("inspect legacy account runtime lease schema: %v", err)
 	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate account runtime lease schema: %v", err)
-	}
-	for _, name := range []string{"account_id", "owner_id", "acquired_at_ms", "heartbeat_at_ms", "lease_expires_at_ms"} {
-		if !columns[name] {
-			t.Fatalf("account runtime lease schema missing %q: %#v", name, columns)
-		}
+	if count != 0 {
+		t.Fatalf("legacy account runtime lease table count = %d, want 0", count)
 	}
 }
 

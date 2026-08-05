@@ -46,7 +46,7 @@ func TestFeishuRuntimeDrainContextIsImmediatelyCanceledAfterOwnershipLoss(t *tes
 	drainCtx, cancelDrain := feishuRuntimeDrainContext(runtimeCtx)
 	defer cancelDrain()
 	if drainCtx.Err() == nil {
-		t.Fatal("drain context remained usable after account lease ownership was already lost")
+		t.Fatal("drain context remained usable after runtime ownership was already canceled")
 	}
 }
 

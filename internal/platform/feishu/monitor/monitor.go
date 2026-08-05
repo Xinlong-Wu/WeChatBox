@@ -54,7 +54,7 @@ func NewPlatform(st *store.Store, acc store.Account, cfg feishu.Config, level lo
 	return &Platform{store: st, account: acc, config: cfg, level: level}
 }
 
-func (p *Platform) Run(ctx context.Context, handler core.Handler) (runErr error) {
+func (p *Platform) Run(ctx context.Context, handler core.Handler) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -62,37 +62,21 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) (runErr error)
 	defer cancelOwnership()
 	lifecycleCtx, cancelLifecycle := context.WithCancel(withFeishuRuntimeOwnership(ctx, ownershipCtx))
 	var (
-		approvals         *operationApprovalService
-		resourceAccess    *resourceAccessManager
-		continuationDone  <-chan struct{}
-		cardDeliveryDone  <-chan struct{}
-		messageBot        *bot
-		runtimeLease      *feishuAccountRuntimeLease
-		leaseHeartbeat    *feishuAccountRuntimeHeartbeat
-		leaseHeartbeatErr error
+		approvals        *operationApprovalService
+		resourceAccess   *resourceAccessManager
+		continuationDone <-chan struct{}
+		cardDeliveryDone <-chan struct{}
+		messageBot       *bot
 	)
 	defer func() {
-		var releaseErr error
-		leaseHeartbeatErr, releaseErr = shutdownFeishuAccountRuntime(
+		shutdownFeishuRuntime(
 			cancelLifecycle,
 			continuationDone,
 			cardDeliveryDone,
 			messageBot,
 			approvals,
 			resourceAccess,
-			leaseHeartbeat,
-			runtimeLease,
 		)
-		if releaseErr != nil && runtimeLease != nil {
-			feishuLog.Warn(context.Background(), "release feishu account runtime lease failed account=%s owner_ref=%s: %v",
-				runtimeLease.accountID, shortResourceRef(runtimeLease.ownerID), releaseErr)
-		}
-		if leaseHeartbeatErr != nil {
-			feishuLog.Error(context.Background(), "feishu account runtime lease heartbeat failed account=%s: %v", p.account.ID, leaseHeartbeatErr)
-			if ctx.Err() == nil && (runErr == nil || errors.Is(runErr, context.Canceled)) {
-				runErr = fmt.Errorf("maintain feishu account runtime lease for account %s: %w", p.account.Name, leaseHeartbeatErr)
-			}
-		}
 	}()
 
 	acc := p.account
@@ -121,22 +105,16 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) (runErr error)
 	if err != nil {
 		return fmt.Errorf("resolve feishu bot identity for account %s: %w", acc.Name, err)
 	}
-	if p.store == nil {
-		return fmt.Errorf("feishu account runtime lease requires a Feishu store")
+	if docsEnabled && p.store == nil {
+		return fmt.Errorf("feishu Docs tools require a Feishu store")
 	}
-	runtimeLease, err = acquireFeishuAccountRuntimeLease(p.store, acc.ID, feishuAccountRuntimeLeaseOptions{})
-	if err != nil {
-		if errors.Is(err, store.ErrFeishuAccountRuntimeLeaseHeld) {
-			return fmt.Errorf("feishu account %s is already active in another LingoBridge runtime: %w", acc.Name, err)
+	appendExecutionOwner := ""
+	if docsOperationApprovalRequired(p.config.Tools) {
+		appendExecutionOwner, err = newFeishuRuntimeExecutionOwnerID()
+		if err != nil {
+			return fmt.Errorf("generate feishu Docs runtime execution owner for account %s: %w", acc.Name, err)
 		}
-		return fmt.Errorf("acquire feishu account runtime lease for account %s: %w", acc.Name, err)
 	}
-	leaseHeartbeat = runtimeLease.startHeartbeat(func() {
-		// A lost account lease is not an orderly shutdown. Cancel both ordinary
-		// runtime work and ownership-bound admitted side effects immediately.
-		cancelOwnership()
-		cancelLifecycle()
-	})
 	sender := &sdkSender{client: restClient}
 	var cards CardService
 	var operationApprovals feishutools.OperationApprovalService
@@ -174,7 +152,7 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) (runErr error)
 		}
 		operationApprovals = approvals
 	}
-	toolRuntime := newFeishuToolRuntime(restClient, p.store, acc.ID, p.config.Tools, operationApprovals, resourceAccess, docxAppendCipher, runtimeLease.ownerID)
+	toolRuntime := newFeishuToolRuntime(restClient, p.store, acc.ID, p.config.Tools, operationApprovals, resourceAccess, docxAppendCipher, appendExecutionOwner)
 	tools := toolRuntime.Tools()
 	if approvals != nil {
 		if err := registerApprovalExecutors(approvals, tools); err != nil {

@@ -125,7 +125,7 @@ func TestFeishuCardDeliveryNewRevisionWaitsForClaimedOlderUpdate(t *testing.T) {
 }
 
 func TestFeishuCardDeliveryConcurrentClaimHasSingleOwnerAndExpiredTakeover(t *testing.T) {
-	first, second := openSharedFeishuRuntimeLeaseStores(t)
+	first, second := openSharedFeishuTestStores(t)
 	now := time.Date(2026, time.August, 4, 11, 30, 0, 0, time.UTC)
 	delivery, err := first.EnqueueFeishuCardDelivery(FeishuCardDelivery{
 		AccountID:     "feishu:cli_test",

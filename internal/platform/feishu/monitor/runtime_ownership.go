@@ -9,9 +9,9 @@ import (
 
 type feishuRuntimeOwnershipContextKey struct{}
 
-// withFeishuRuntimeOwnership records the account-lease ownership context in
-// the runtime context. Lifecycle cancellation may be ignored while admitted
-// work drains; ownership cancellation must never be ignored.
+// withFeishuRuntimeOwnership records the side-effect lifetime in the runtime
+// context. Lifecycle cancellation may be ignored while admitted work drains;
+// explicit runtime ownership cancellation must never be ignored.
 func withFeishuRuntimeOwnership(ctx, ownership context.Context) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
@@ -65,8 +65,8 @@ func (c feishuRuntimeDrainValueContext) Value(key any) any {
 }
 
 // feishuRuntimeDrainContext detaches from ordinary lifecycle cancellation so
-// already-admitted work can drain, while retaining cancellation when the
-// account lease itself is lost.
+// already-admitted work can drain while retaining explicit runtime ownership
+// cancellation.
 func feishuRuntimeDrainContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -74,8 +74,8 @@ func feishuRuntimeDrainContext(ctx context.Context) (context.Context, context.Ca
 	ownership := feishuRuntimeOwnershipContext(ctx)
 	// Return ownership.Done directly rather than forwarding cancellation through
 	// context.AfterFunc. AfterFunc callbacks run asynchronously, leaving a small
-	// interval in which a caller could start a remote side effect after the
-	// account lease owner had already been replaced.
+	// interval in which a caller could start a remote side effect after runtime
+	// ownership had already been canceled.
 	return feishuRuntimeDrainValueContext{
 		values:    context.WithoutCancel(ctx),
 		ownership: ownership,

@@ -122,7 +122,6 @@ func TestDocsAppendRestartReusesFrozenRequestAfterLostResponses(t *testing.T) {
 		lark.WithHttpClient(server.Client()),
 	)
 	st := openDocsFolderTestStore(t)
-	acquireTestDocxAppendRuntimeLease(t, st, testDocxAppendExecutionOwner, time.Now().UTC())
 	if _, err := st.CreateWorkflowRequest(store.WorkflowRequest{
 		ID:        requestID,
 		AccountID: "feishu:cli_test",
@@ -454,7 +453,6 @@ func TestDocsAppendFirstUncertainThenRejectedRemainsOutcomeUnknown(t *testing.T)
 		lark.WithHttpClient(server.Client()),
 	)
 	st := openDocsFolderTestStore(t)
-	acquireTestDocxAppendRuntimeLease(t, st, testDocxAppendExecutionOwner, time.Now().UTC())
 	if _, err := st.CreateWorkflowRequest(store.WorkflowRequest{
 		ID:        requestID,
 		AccountID: "feishu:cli_test",
@@ -524,7 +522,6 @@ func TestDocsAppendLaterRecoveryRejectionRemainsOutcomeUnknown(t *testing.T) {
 		lark.WithHttpClient(server.Client()),
 	)
 	st := openDocsFolderTestStore(t)
-	acquireTestDocxAppendRuntimeLease(t, st, testDocxAppendExecutionOwner, time.Now().UTC())
 	if _, err := st.CreateWorkflowRequest(store.WorkflowRequest{
 		ID:        requestID,
 		AccountID: "feishu:cli_test",
@@ -586,7 +583,6 @@ func TestDocsAppendConcurrentRecoveryHasSingleRemoteCaller(t *testing.T) {
 		lark.WithHttpClient(server.Client()),
 	)
 	firstStore := openDocsFolderTestStore(t)
-	acquireTestDocxAppendRuntimeLease(t, firstStore, testDocxAppendExecutionOwner, time.Now().UTC())
 	secondStore, err := store.Open(store.PlatformFeishu)
 	if err != nil {
 		t.Fatalf("open second Feishu store: %v", err)
@@ -689,9 +685,6 @@ func TestDocsAppendLateRejectionAfterTakeoverSuccessUsesSucceededLedger(t *testi
 	}); err != nil {
 		t.Fatalf("seed append workflow: %v", err)
 	}
-	if _, err := st.AcquireFeishuAccountRuntimeLease("feishu:cli_test", "runtime_old", now, time.Minute); err != nil {
-		t.Fatalf("acquire old runtime lease: %v", err)
-	}
 	operation := store.FeishuDocxAppendOperation{
 		RequestID: requestID, AccountID: "feishu:cli_test", ChatID: "oc_chat",
 		ActorOpenID: "ou_requester", ActorUserID: "u_requester",
@@ -706,20 +699,14 @@ func TestDocsAppendLateRejectionAfterTakeoverSuccessUsesSucceededLedger(t *testi
 	if err != nil || !claimed {
 		t.Fatalf("start old append execution = %#v claimed=%t err=%v", started, claimed, err)
 	}
-	if err := st.ReleaseFeishuAccountRuntimeLease("feishu:cli_test", "runtime_old"); err != nil {
-		t.Fatalf("release old runtime lease: %v", err)
-	}
-	if _, err := st.AcquireFeishuAccountRuntimeLease("feishu:cli_test", "runtime_new", now.Add(2*time.Second), time.Minute); err != nil {
-		t.Fatalf("acquire replacement runtime lease: %v", err)
-	}
-	if _, claimed, err := st.ClaimFeishuDocxAppendOperationRecovery(requestID, "feishu:cli_test", "runtime_new", "execution_new", now.Add(3*time.Second), time.Minute); err != nil || !claimed {
+	if _, claimed, err := st.ClaimFeishuDocxAppendOperationRecovery(requestID, "feishu:cli_test", "runtime_new", "execution_new", now.Add(62*time.Second), time.Minute); err != nil || !claimed {
 		t.Fatalf("claim replacement append execution claimed=%t err=%v", claimed, err)
 	}
-	if _, err := st.MarkFeishuDocxAppendOperationSucceeded(requestID, "feishu:cli_test", "execution_new", now.Add(4*time.Second)); err != nil {
+	if _, err := st.MarkFeishuDocxAppendOperationSucceeded(requestID, "feishu:cli_test", "execution_new", now.Add(63*time.Second)); err != nil {
 		t.Fatalf("complete replacement append execution: %v", err)
 	}
 
-	service := &docsService{store: st, accountID: "feishu:cli_test", now: func() time.Time { return now.Add(5 * time.Second) }}
+	service := &docsService{store: st, accountID: "feishu:cli_test", now: func() time.Time { return now.Add(64 * time.Second) }}
 	if err := service.recordDocxAppendFailure(context.Background(), started, "execution_old", "remote_rejected", errors.New("late rejection")); err != nil {
 		t.Fatalf("late rejection after authoritative success returned %v, want success", err)
 	}
@@ -740,7 +727,6 @@ func TestDocsWorkflowBestEffortDoesNotDowngradeSucceededAppendLedger(t *testing.
 	if _, err := st.CreateWorkflowRequest(seedFeishuWorkflow); err != nil {
 		t.Fatalf("seed append workflow: %v", err)
 	}
-	acquireTestDocxAppendRuntimeLease(t, st, testDocxAppendExecutionOwner, now)
 	operation := store.FeishuDocxAppendOperation{
 		RequestID: requestID, AccountID: "feishu:cli_test", ChatID: "oc_chat",
 		ActorOpenID: "ou_requester", ActorUserID: "u_requester",
@@ -773,7 +759,6 @@ func TestDocsCreateFailedInitialAppendRecoveryKeepsWorkflowPartial(t *testing.T)
 	const requestID = "req_create_failed_initial_append"
 	st := openDocsFolderTestStore(t)
 	now := time.Date(2026, time.August, 4, 20, 15, 0, 0, time.UTC)
-	acquireTestDocxAppendRuntimeLease(t, st, testDocxAppendExecutionOwner, now)
 	if _, err := st.CreateWorkflowRequest(store.WorkflowRequest{
 		ID: requestID, AccountID: "feishu:cli_test", Kind: store.WorkflowRequestKindFeishuDocsCreate,
 		State: store.WorkflowRequestStateExecuting, CreatedAt: now,
@@ -846,7 +831,6 @@ func TestDocsCreateRequestIDRecoveryReturnsCreatedDocumentWhenInitialAppendRemai
 	)
 	st := openDocsFolderTestStore(t)
 	now := time.Date(2026, time.August, 4, 20, 20, 0, 0, time.UTC)
-	acquireTestDocxAppendRuntimeLease(t, st, testDocxAppendExecutionOwner, time.Now().UTC())
 	if _, err := st.CreateWorkflowRequest(store.WorkflowRequest{
 		ID: requestID, AccountID: "feishu:cli_test", Kind: store.WorkflowRequestKindFeishuDocsCreate,
 		State: store.WorkflowRequestStatePartial, CreatedAt: now,
@@ -929,7 +913,6 @@ func TestDocsCreateRecoveryDoesNotDowngradeConcurrentAppendSuccess(t *testing.T)
 	)
 	st := openDocsFolderTestStore(t)
 	now := time.Date(2026, time.August, 4, 20, 25, 0, 0, time.UTC)
-	acquireTestDocxAppendRuntimeLease(t, st, testDocxAppendExecutionOwner, now)
 	if _, err := st.CreateWorkflowRequest(store.WorkflowRequest{
 		ID: requestID, AccountID: "feishu:cli_test", Kind: store.WorkflowRequestKindFeishuDocsCreate,
 		State: store.WorkflowRequestStateExecuting, CreatedAt: now,
@@ -1143,7 +1126,6 @@ func TestDocsAppendRecoveryCipherMismatchKeepsNonterminalLedgerAndPartialWorkflo
 	)
 	st := openDocsFolderTestStore(t)
 	now := time.Date(2026, time.August, 4, 19, 30, 0, 0, time.UTC)
-	acquireTestDocxAppendRuntimeLease(t, st, "runtime_old", now)
 	if _, err := st.CreateWorkflowRequest(store.WorkflowRequest{
 		ID:        requestID,
 		AccountID: "feishu:cli_test",

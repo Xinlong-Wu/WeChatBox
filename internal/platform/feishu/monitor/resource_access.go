@@ -32,7 +32,7 @@ const (
 
 var (
 	errFeishuResourceAccessCompletionDeferred = errors.New("feishu resource access local completion pending recovery")
-	errFeishuResourceAccessOwnershipLost      = errors.New("feishu resource access account lease ownership lost; recovery required")
+	errFeishuResourceAccessOwnershipLost      = errors.New("feishu resource access runtime ownership ended; recovery required")
 )
 
 type resourceAccessOAuthConfig struct {

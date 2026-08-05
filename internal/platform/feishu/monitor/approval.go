@@ -473,10 +473,10 @@ func (m *operationApprovalService) handleApprovalDecisionError(ctx context.Conte
 }
 
 func (m *operationApprovalService) executeApproved(approval store.ToolApproval, executor feishutools.OperationApprovalExecutor, callbackToken string) {
-	// An admitted approval task is tracked by the runtime task group and the
-	// account lease is held until it drains. Do not turn lifecycle cancellation
-	// into a false operation failure during orderly shutdown. Lease ownership
-	// loss is different and must cancel the side effect immediately.
+	// An admitted approval task is tracked by the runtime task group. Do not turn
+	// lifecycle cancellation into a false operation failure during orderly
+	// shutdown. Explicit runtime ownership cancellation still stops the side
+	// effect immediately.
 	drainCtx, cancelDrain := feishuRuntimeDrainContext(m.baseContext())
 	ctx, cancel := context.WithTimeout(drainCtx, m.approvedExecutionTimeout())
 	result, err := executor.ExecuteApproved(ctx, approval.ID, json.RawMessage(approval.Payload))
@@ -484,7 +484,7 @@ func (m *operationApprovalService) executeApproved(approval store.ToolApproval, 
 	cancelDrain()
 	completedAt := m.currentTime()
 	if feishuRuntimeOwnershipLost(m.baseContext()) {
-		feishuLog.Warn(m.baseContext(), "preserving executing feishu tool approval after account lease ownership loss request=%s account=%s tool=%s user=%s chat=%s error_type=%T",
+		feishuLog.Warn(m.baseContext(), "preserving executing feishu tool approval after runtime ownership cancellation request=%s account=%s tool=%s user=%s chat=%s error_type=%T",
 			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID, err)
 		return
 	}
@@ -516,7 +516,7 @@ func (m *operationApprovalService) executeApproved(approval store.ToolApproval, 
 		return
 	}
 	if feishuRuntimeOwnershipLost(m.baseContext()) {
-		feishuLog.Warn(m.baseContext(), "deferred feishu tool approval terminal publication after account lease ownership loss request=%s account=%s tool=%s state=%s",
+		feishuLog.Warn(m.baseContext(), "deferred feishu tool approval terminal publication after runtime ownership cancellation request=%s account=%s tool=%s state=%s",
 			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, completedState)
 		return
 	}

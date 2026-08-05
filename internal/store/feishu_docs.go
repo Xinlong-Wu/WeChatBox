@@ -314,9 +314,6 @@ func (s *Store) DeleteFeishuDocsData(accountID string) error {
 	if _, err := tx.Exec(`DELETE FROM feishu_user_oauth_credentials WHERE account_id=?`, accountID); err != nil {
 		return fmt.Errorf("delete feishu user oauth credentials: %w", err)
 	}
-	if _, err := tx.Exec(`DELETE FROM feishu_account_runtime_leases WHERE account_id=?`, accountID); err != nil {
-		return fmt.Errorf("delete feishu account runtime lease: %w", err)
-	}
 	if _, err := tx.Exec(`DELETE FROM feishu_resource_access_requests WHERE account_id=?`, accountID); err != nil {
 		return fmt.Errorf("delete feishu resource access requests: %w", err)
 	}

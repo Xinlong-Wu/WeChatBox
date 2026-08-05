@@ -14,8 +14,8 @@ import (
 
 func (m *resourceAccessManager) completeApprovedResourceAccessFromCard(request store.FeishuResourceAccessRequest) {
 	// Approval callbacks reserve a background task before recording the durable
-	// decision. Orderly shutdown must let that admitted mutation drain while the
-	// account lease is still renewed; ownership loss still cancels immediately.
+	// decision. Orderly shutdown must let that admitted mutation drain; explicit
+	// runtime ownership cancellation still stops it immediately.
 	drainCtx, cancelDrain := feishuRuntimeDrainContext(m.baseContext())
 	defer cancelDrain()
 	ctx, cancel := context.WithTimeout(drainCtx, resourceAccessCallbackTimeout)

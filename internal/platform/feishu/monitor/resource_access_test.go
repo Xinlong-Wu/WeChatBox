@@ -2750,10 +2750,10 @@ func TestResourceAccessManagerLeaseOwnershipLossPreservesVerifiedMutationForReco
 
 	preserved, err := st.GetFeishuResourceAccessRequest(request.ID, request.AccountID)
 	if err != nil || preserved.State != store.FeishuResourceAccessStateExecuting {
-		t.Fatalf("request after lease ownership loss = %#v err=%v, want executing", preserved, err)
+		t.Fatalf("request after runtime ownership cancellation = %#v err=%v, want executing", preserved, err)
 	}
 	if workflowResult, err := st.GetWorkflowResult(request.ID, request.AccountID); !errors.Is(err, store.ErrWorkflowResultNotFound) {
-		t.Fatalf("workflow result after lease ownership loss = %#v err=%v, want none", workflowResult, err)
+		t.Fatalf("workflow result after runtime ownership cancellation = %#v err=%v, want none", workflowResult, err)
 	}
 	_, updates, _ := sender.snapshot()
 	if len(updates) != 0 || mutationCalls.Load() != 1 || verifyCalls.Load() != 0 {

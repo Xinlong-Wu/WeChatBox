@@ -1565,7 +1565,6 @@ func newDocsToolsForTest(t *testing.T, client *lark.Client, cfg Config, approver
 	}); err != nil {
 		t.Fatalf("seed Feishu chat folder: %v", err)
 	}
-	acquireTestDocxAppendRuntimeLease(t, st, testDocxAppendExecutionOwner, time.Now().UTC())
 	access := grantedResourceAccessController("req_access")
 	return st, NewDocsRuntime(client, st, "feishu:cli_test", cfg, approver, access, newTestDocxAppendCipher(t), testDocxAppendExecutionOwner).Tools(), access
 }
@@ -1602,11 +1601,4 @@ func newTestDocxAppendCipher(t *testing.T) *DocxAppendEnvelopeCipher {
 		t.Fatalf("NewDocxAppendEnvelopeCipher returned error: %v", err)
 	}
 	return cipher
-}
-
-func acquireTestDocxAppendRuntimeLease(t *testing.T, st *store.Store, ownerID string, now time.Time) {
-	t.Helper()
-	if _, err := st.AcquireFeishuAccountRuntimeLease("feishu:cli_test", ownerID, now, 24*time.Hour); err != nil {
-		t.Fatalf("AcquireFeishuAccountRuntimeLease returned error: %v", err)
-	}
 }
