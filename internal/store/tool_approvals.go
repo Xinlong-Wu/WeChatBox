@@ -291,6 +291,103 @@ func (s *Store) CompleteToolApproval(id, accountID, state string, now time.Time)
 	return nil
 }
 
+// CompleteToolApprovalWithResult atomically publishes an executing approval's
+// terminal state, its model-visible workflow result, the continuation-ready
+// transition, and the terminal card outbox. Repeating the exact committed
+// terminal result is idempotent; a different state or payload is rejected.
+func (s *Store) CompleteToolApprovalWithResult(
+	id, accountID, state string,
+	workflowResult WorkflowResult,
+	now time.Time,
+) (WorkflowResult, WorkflowContinuation, bool, error) {
+	id = strings.TrimSpace(id)
+	accountID = strings.TrimSpace(accountID)
+	state = strings.TrimSpace(state)
+	now = normalizedApprovalTime(now)
+	if id == "" || accountID == "" {
+		return WorkflowResult{}, WorkflowContinuation{}, false, fmt.Errorf("tool approval id and account_id are required")
+	}
+	expectedResultState := ""
+	switch state {
+	case ToolApprovalStateSucceeded, ToolApprovalStatePartial:
+		expectedResultState = WorkflowResultStateSucceeded
+	case ToolApprovalStateFailed:
+		expectedResultState = WorkflowResultStateFailed
+	default:
+		return WorkflowResult{}, WorkflowContinuation{}, false, fmt.Errorf("unsupported completed tool approval state %q", state)
+	}
+	workflowResult.RequestID = strings.TrimSpace(workflowResult.RequestID)
+	workflowResult.AccountID = strings.TrimSpace(workflowResult.AccountID)
+	workflowResult.CreatedAt = now
+	preparedResult, err := prepareWorkflowResult(workflowResult)
+	if err != nil {
+		return WorkflowResult{}, WorkflowContinuation{}, false, err
+	}
+	if preparedResult.RequestID != id || preparedResult.AccountID != accountID {
+		return WorkflowResult{}, WorkflowContinuation{}, false, fmt.Errorf("tool approval and workflow result identity must match")
+	}
+	if preparedResult.State != expectedResultState {
+		return WorkflowResult{}, WorkflowContinuation{}, false, fmt.Errorf("tool approval state %q requires workflow result state %q", state, expectedResultState)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return WorkflowResult{}, WorkflowContinuation{}, false, fmt.Errorf("begin complete tool approval with result: %w", err)
+	}
+	defer tx.Rollback()
+	approval, err := toolApprovalByID(tx, id, accountID)
+	if err != nil {
+		return WorkflowResult{}, WorkflowContinuation{}, false, err
+	}
+	if approval.State != ToolApprovalStateExecuting {
+		if approval.State != state {
+			return WorkflowResult{}, WorkflowContinuation{}, false, ErrToolApprovalResolved
+		}
+		existing, loadErr := workflowResultByID(tx, id, accountID)
+		if loadErr != nil {
+			return WorkflowResult{}, WorkflowContinuation{}, false, loadErr
+		}
+		if existing.State != preparedResult.State || string(existing.Payload) != string(preparedResult.Payload) {
+			return existing, WorkflowContinuation{}, false, ErrWorkflowResultConflict
+		}
+		continuation, continuationErr := workflowContinuationByID(tx, id, accountID)
+		if continuationErr != nil {
+			return existing, WorkflowContinuation{}, false, continuationErr
+		}
+		return existing, continuation, continuation.State == WorkflowContinuationStateReady, nil
+	}
+	updated, err := tx.Exec(
+		`UPDATE tool_approvals SET state=?, payload='', updated_at_ms=?
+		 WHERE id=? AND account_id=? AND state=?`,
+		state, now.UnixMilli(), id, accountID, ToolApprovalStateExecuting,
+	)
+	if err != nil {
+		return WorkflowResult{}, WorkflowContinuation{}, false, fmt.Errorf("complete tool approval with result: %w", err)
+	}
+	if err := requireOneToolApprovalRow(updated); err != nil {
+		return WorkflowResult{}, WorkflowContinuation{}, false, err
+	}
+	if err := updateWorkflowRequestState(tx, id, accountID, state, now); err != nil {
+		return WorkflowResult{}, WorkflowContinuation{}, false, err
+	}
+	storedResult, continuation, ready, err := storeWorkflowResultTx(tx, preparedResult)
+	if err != nil {
+		return storedResult, continuation, false, err
+	}
+	approval.State = state
+	approval.Payload = ""
+	approval.UpdatedAt = now
+	if err := enqueueToolApprovalTerminalCardDelivery(tx, approval, now); err != nil {
+		return WorkflowResult{}, WorkflowContinuation{}, false, fmt.Errorf("enqueue completed tool approval card: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return WorkflowResult{}, WorkflowContinuation{}, false, fmt.Errorf("commit complete tool approval with result: %w", err)
+	}
+	return storedResult, continuation, ready, nil
+}
+
 // FailToolApproval closes a pending or executing request and clears its payload.
 func (s *Store) FailToolApproval(id, accountID string, now time.Time) error {
 	now = normalizedApprovalTime(now)

@@ -25,7 +25,8 @@ var (
 		2 * time.Minute,
 		10 * time.Minute,
 	}
-	errFeishuCardDeliveryObsolete = errors.New("feishu card delivery is obsolete")
+	errFeishuCardDeliveryObsolete      = errors.New("feishu card delivery is obsolete")
+	errFeishuCardDeliveryResultPending = errors.New("feishu card delivery workflow result is pending")
 )
 
 type feishuCardDeliveryStore interface {
@@ -195,6 +196,12 @@ func (w *feishuCardDeliveryWorker) handleFailure(ctx context.Context, delivery s
 			shortRequestID(delivery.RequestID), delivery.AccountID, delivery.Purpose, err)
 		return
 	}
+	if errors.Is(cause, errFeishuCardDeliveryResultPending) {
+		feishuLog.Debug(ctx, "waiting for feishu workflow result before terminal card delivery request=%s account=%s purpose=%s revision=%d attempt=%d available_at=%s",
+			shortRequestID(delivery.RequestID), delivery.AccountID, delivery.Purpose, delivery.Revision,
+			delivery.Attempts, availableAt.Format(time.RFC3339))
+		return
+	}
 	feishuLog.Warn(ctx, "scheduled feishu card delivery retry request=%s account=%s purpose=%s revision=%d attempt=%d available_at=%s error=%s",
 		shortRequestID(delivery.RequestID), delivery.AccountID, delivery.Purpose, delivery.Revision,
 		delivery.Attempts, availableAt.Format(time.RFC3339), lastError)
@@ -255,24 +262,30 @@ func (w *feishuCardDeliveryWorker) renderToolApprovalTerminal(delivery store.Fei
 	if err != nil {
 		return nil, fmt.Errorf("load tool approval for card delivery: %w", err)
 	}
+	result, err := w.store.GetWorkflowResult(delivery.RequestID, delivery.AccountID)
+	if errors.Is(err, store.ErrWorkflowResultNotFound) {
+		return nil, fmt.Errorf("%w: request=%s", errFeishuCardDeliveryResultPending, shortRequestID(delivery.RequestID))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load tool approval workflow result: %w", err)
+	}
 	resultState, _, defaultMessage, warning, _, err := recoveredApprovalResult(approval.State)
 	if err != nil {
 		return nil, fmt.Errorf("%w: tool approval state=%s", errFeishuCardDeliveryObsolete, approval.State)
 	}
+	if result.State != resultState {
+		return nil, fmt.Errorf("%w: tool approval state=%s result_state=%s", errFeishuCardDeliveryObsolete, approval.State, result.State)
+	}
 	message := defaultMessage
-	if result, loadErr := w.store.GetWorkflowResult(delivery.RequestID, delivery.AccountID); loadErr == nil {
-		var payload struct {
-			Message string `json:"message"`
-			Warning bool   `json:"warning"`
+	var payload struct {
+		Message string `json:"message"`
+		Warning bool   `json:"warning"`
+	}
+	if json.Unmarshal(result.Payload, &payload) == nil {
+		if strings.TrimSpace(payload.Message) != "" {
+			message = strings.TrimSpace(payload.Message)
 		}
-		if json.Unmarshal(result.Payload, &payload) == nil {
-			if strings.TrimSpace(payload.Message) != "" {
-				message = strings.TrimSpace(payload.Message)
-			}
-			warning = payload.Warning
-		}
-	} else if !errors.Is(loadErr, store.ErrWorkflowResultNotFound) {
-		return nil, fmt.Errorf("load tool approval workflow result: %w", loadErr)
+		warning = payload.Warning
 	}
 	switch resultState {
 	case store.WorkflowResultStateDenied:

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -88,6 +89,183 @@ func TestToolApprovalApproveAndCompleteIsSingleUse(t *testing.T) {
 	}
 	if err := st.CompleteToolApproval(created.ID, created.AccountID, ToolApprovalStateSucceeded, now.Add(5*time.Second)); !errors.Is(err, ErrToolApprovalResolved) {
 		t.Fatalf("second completion error = %v, want ErrToolApprovalResolved", err)
+	}
+}
+
+func TestCompleteToolApprovalWithResultPublishesTerminalStateAtomically(t *testing.T) {
+	st := openFeishuDocsTestStore(t)
+	now := time.Date(2026, time.August, 5, 13, 24, 0, 0, time.UTC)
+	approval := createBoundToolApproval(t, st, now)
+	continuation := attachWorkflowContinuationForTest(t, st, approval.ID, approval.AccountID, now, 1)
+	if _, _, err := st.CommitWorkflowContinuation(continuation.RequestID, continuation.AccountID, 2, now.Add(time.Second)); err != nil {
+		t.Fatalf("CommitWorkflowContinuation returned error: %v", err)
+	}
+	approval, err := st.DecideToolApproval(
+		approval.ID,
+		approval.AccountID,
+		ToolApprovalDecisionApprove,
+		ToolApprovalMatch{ActorOpenID: approval.ActorOpenID, ChatID: approval.ChatID, CardMessageID: "om_card"},
+		now.Add(2*time.Second),
+	)
+	if err != nil {
+		t.Fatalf("DecideToolApproval returned error: %v", err)
+	}
+	result := WorkflowResult{
+		RequestID: approval.ID,
+		AccountID: approval.AccountID,
+		State:     WorkflowResultStateSucceeded,
+		Payload:   json.RawMessage(`{"status":"succeeded","message":"document appended","warning":false}`),
+	}
+	stored, readyContinuation, ready, err := st.CompleteToolApprovalWithResult(
+		approval.ID,
+		approval.AccountID,
+		ToolApprovalStateSucceeded,
+		result,
+		now.Add(3*time.Second),
+	)
+	if err != nil || !ready || readyContinuation.State != WorkflowContinuationStateReady ||
+		!strings.Contains(string(stored.Payload), `"message":"document appended"`) {
+		t.Fatalf("CompleteToolApprovalWithResult = result:%#v continuation:%#v ready:%t err:%v", stored, readyContinuation, ready, err)
+	}
+	completed, err := st.GetToolApproval(approval.ID, approval.AccountID)
+	if err != nil || completed.State != ToolApprovalStateSucceeded || completed.Payload != "" {
+		t.Fatalf("completed approval = %#v err=%v", completed, err)
+	}
+	workflow, err := st.GetWorkflowRequest(approval.ID, approval.AccountID)
+	if err != nil || workflow.State != WorkflowRequestStateSucceeded {
+		t.Fatalf("completed workflow = %#v err=%v", workflow, err)
+	}
+	delivery, err := st.GetFeishuCardDeliveryByKey(
+		approval.AccountID,
+		approval.ID,
+		FeishuCardDeliveryPurposeToolApprovalTerminal,
+		FeishuCardDeliveryRevisionTerminal,
+	)
+	if err != nil || delivery.State != FeishuCardDeliveryStatePending {
+		t.Fatalf("terminal card delivery = %#v err=%v", delivery, err)
+	}
+	if _, _, ready, err := st.CompleteToolApprovalWithResult(
+		approval.ID,
+		approval.AccountID,
+		ToolApprovalStateSucceeded,
+		result,
+		now.Add(4*time.Second),
+	); err != nil || !ready {
+		t.Fatalf("idempotent completion ready=%t err=%v", ready, err)
+	}
+	conflict := result
+	conflict.Payload = json.RawMessage(`{"status":"succeeded","message":"different"}`)
+	if _, _, _, err := st.CompleteToolApprovalWithResult(
+		approval.ID,
+		approval.AccountID,
+		ToolApprovalStateSucceeded,
+		conflict,
+		now.Add(5*time.Second),
+	); !errors.Is(err, ErrWorkflowResultConflict) {
+		t.Fatalf("conflicting completion error = %v, want ErrWorkflowResultConflict", err)
+	}
+}
+
+func TestCompleteToolApprovalWithResultRollsBackWithoutContinuation(t *testing.T) {
+	st := openFeishuDocsTestStore(t)
+	now := time.Date(2026, time.August, 5, 13, 25, 0, 0, time.UTC)
+	approval := createBoundToolApproval(t, st, now)
+	approval, err := st.DecideToolApproval(
+		approval.ID,
+		approval.AccountID,
+		ToolApprovalDecisionApprove,
+		ToolApprovalMatch{ActorOpenID: approval.ActorOpenID, ChatID: approval.ChatID, CardMessageID: "om_card"},
+		now.Add(time.Second),
+	)
+	if err != nil {
+		t.Fatalf("DecideToolApproval returned error: %v", err)
+	}
+	_, _, _, err = st.CompleteToolApprovalWithResult(
+		approval.ID,
+		approval.AccountID,
+		ToolApprovalStateSucceeded,
+		WorkflowResult{
+			RequestID: approval.ID,
+			AccountID: approval.AccountID,
+			State:     WorkflowResultStateSucceeded,
+			Payload:   json.RawMessage(`{"status":"succeeded"}`),
+		},
+		now.Add(2*time.Second),
+	)
+	if !errors.Is(err, ErrWorkflowContinuationNotFound) {
+		t.Fatalf("completion error = %v, want ErrWorkflowContinuationNotFound", err)
+	}
+	unchanged, loadErr := st.GetToolApproval(approval.ID, approval.AccountID)
+	if loadErr != nil || unchanged.State != ToolApprovalStateExecuting || unchanged.Payload == "" {
+		t.Fatalf("approval after rolled-back completion = %#v err=%v", unchanged, loadErr)
+	}
+	workflow, loadErr := st.GetWorkflowRequest(approval.ID, approval.AccountID)
+	if loadErr != nil || workflow.State != WorkflowRequestStateExecuting {
+		t.Fatalf("workflow after rolled-back completion = %#v err=%v", workflow, loadErr)
+	}
+	if _, loadErr := st.GetWorkflowResult(approval.ID, approval.AccountID); !errors.Is(loadErr, ErrWorkflowResultNotFound) {
+		t.Fatalf("workflow result after rollback error = %v, want ErrWorkflowResultNotFound", loadErr)
+	}
+	if _, loadErr := st.GetFeishuCardDeliveryByKey(
+		approval.AccountID,
+		approval.ID,
+		FeishuCardDeliveryPurposeToolApprovalTerminal,
+		FeishuCardDeliveryRevisionTerminal,
+	); !errors.Is(loadErr, ErrFeishuCardDeliveryNotFound) {
+		t.Fatalf("terminal card delivery after rollback error = %v, want ErrFeishuCardDeliveryNotFound", loadErr)
+	}
+}
+
+func TestCompleteToolApprovalWithResultRollsBackWhenTerminalOutboxFails(t *testing.T) {
+	st := openFeishuDocsTestStore(t)
+	now := time.Date(2026, time.August, 5, 13, 26, 0, 0, time.UTC)
+	approval := createBoundToolApproval(t, st, now)
+	continuation := attachWorkflowContinuationForTest(t, st, approval.ID, approval.AccountID, now, 1)
+	if _, _, err := st.CommitWorkflowContinuation(continuation.RequestID, continuation.AccountID, 2, now.Add(time.Second)); err != nil {
+		t.Fatalf("CommitWorkflowContinuation returned error: %v", err)
+	}
+	approval, err := st.DecideToolApproval(
+		approval.ID,
+		approval.AccountID,
+		ToolApprovalDecisionApprove,
+		ToolApprovalMatch{ActorOpenID: approval.ActorOpenID, ChatID: approval.ChatID, CardMessageID: "om_card"},
+		now.Add(2*time.Second),
+	)
+	if err != nil {
+		t.Fatalf("DecideToolApproval returned error: %v", err)
+	}
+	if _, err := st.db.Exec(`CREATE TRIGGER reject_atomic_terminal_card BEFORE INSERT ON feishu_card_deliveries BEGIN SELECT RAISE(ABORT, 'injected terminal card failure'); END`); err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+	_, _, _, err = st.CompleteToolApprovalWithResult(
+		approval.ID,
+		approval.AccountID,
+		ToolApprovalStateSucceeded,
+		WorkflowResult{
+			RequestID: approval.ID,
+			AccountID: approval.AccountID,
+			State:     WorkflowResultStateSucceeded,
+			Payload:   json.RawMessage(`{"status":"succeeded","message":"document appended"}`),
+		},
+		now.Add(3*time.Second),
+	)
+	if err == nil {
+		t.Fatal("CompleteToolApprovalWithResult returned nil error with rejected outbox insert")
+	}
+	stored, loadErr := st.GetToolApproval(approval.ID, approval.AccountID)
+	if loadErr != nil || stored.State != ToolApprovalStateExecuting || stored.Payload == "" {
+		t.Fatalf("approval after outbox rollback = %#v err=%v", stored, loadErr)
+	}
+	workflow, loadErr := st.GetWorkflowRequest(approval.ID, approval.AccountID)
+	if loadErr != nil || workflow.State != WorkflowRequestStateExecuting {
+		t.Fatalf("workflow after outbox rollback = %#v err=%v", workflow, loadErr)
+	}
+	if _, loadErr := st.GetWorkflowResult(approval.ID, approval.AccountID); !errors.Is(loadErr, ErrWorkflowResultNotFound) {
+		t.Fatalf("workflow result after outbox rollback error = %v, want ErrWorkflowResultNotFound", loadErr)
+	}
+	continuation, loadErr = st.GetWorkflowContinuation(approval.ID, approval.AccountID)
+	if loadErr != nil || continuation.State != WorkflowContinuationStateWaiting {
+		t.Fatalf("continuation after outbox rollback = %#v err=%v", continuation, loadErr)
 	}
 }
 

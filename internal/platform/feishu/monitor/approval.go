@@ -31,6 +31,7 @@ type toolApprovalStore interface {
 	SetToolApprovalCardMessageID(id, accountID, messageID string, now time.Time) error
 	DecideToolApproval(id, accountID, decision string, match store.ToolApprovalMatch, now time.Time) (store.ToolApproval, error)
 	CompleteToolApproval(id, accountID, state string, now time.Time) error
+	CompleteToolApprovalWithResult(id, accountID, state string, result store.WorkflowResult, now time.Time) (store.WorkflowResult, store.WorkflowContinuation, bool, error)
 	FailToolApproval(id, accountID string, now time.Time) error
 	GetToolApproval(id, accountID string) (store.ToolApproval, error)
 	ExpireToolApprovals(accountID string, now time.Time) (int64, error)
@@ -256,6 +257,11 @@ func (m *operationApprovalService) requestApproval(ctx context.Context, request 
 		return feishutools.OperationApprovalResult{}, fmt.Errorf("expire stale feishu tool approvals: %w", err)
 	} else if count > 0 {
 		feishuLog.Debug(ctx, "expired stale feishu tool approvals account=%s count=%d", m.account.ID, count)
+		reconciled, reconcileErr := m.reconcileTerminalApprovalResults(ctx, now)
+		if reconcileErr != nil {
+			return feishutools.OperationApprovalResult{}, fmt.Errorf("publish expired feishu tool approval results: %w", reconcileErr)
+		}
+		feishuLog.Debug(ctx, "published expired feishu tool approval results account=%s count=%d", m.account.ID, reconciled)
 	}
 	approval, err := m.store.CreateToolApproval(store.ToolApproval{
 		AccountID:       m.account.ID,
@@ -489,17 +495,43 @@ func (m *operationApprovalService) executeApproved(approval store.ToolApproval, 
 		return
 	}
 	if err != nil {
-		completeErr := m.store.CompleteToolApproval(approval.ID, approval.AccountID, store.ToolApprovalStateFailed, completedAt)
+		message := "授权已确认，但操作执行失败。请稍后重新发起。"
+		workflowResult, resultErr := approvalWorkflowResultRecord(
+			approval,
+			store.WorkflowResultStateFailed,
+			"failed",
+			message,
+			false,
+			"",
+			completedAt,
+		)
+		if resultErr != nil {
+			feishuLog.Error(m.baseContext(), "build failed feishu tool approval result request=%s account=%s: %v", shortRequestID(approval.ID), approval.AccountID, resultErr)
+			return
+		}
+		_, _, ready, completeErr := m.store.CompleteToolApprovalWithResult(
+			approval.ID,
+			approval.AccountID,
+			store.ToolApprovalStateFailed,
+			workflowResult,
+			completedAt,
+		)
 		if completeErr != nil {
-			feishuLog.Error(m.baseContext(), "mark feishu tool approval failed request=%s account=%s: %v", shortRequestID(approval.ID), approval.AccountID, completeErr)
+			feishuLog.Error(m.baseContext(), "atomically fail feishu tool approval request=%s account=%s: %v", shortRequestID(approval.ID), approval.AccountID, completeErr)
 		}
 		feishuLog.Error(m.baseContext(), "execute approved feishu tool failed request=%s account=%s tool=%s user=%s chat=%s: %v",
 			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID, err)
 		if completeErr != nil {
 			return
 		}
-		m.updateApprovalResultCard(approval, callbackToken, statusCard{title: "执行失败", template: "red", message: "授权已确认，但操作执行失败。请稍后重新发起。"})
-		m.persistApprovalWorkflowResult(m.baseContext(), approval, store.WorkflowResultStateFailed, "failed", "授权已确认，但操作执行失败。", false, "", completedAt)
+		feishuLog.Debug(m.baseContext(), "atomically published failed feishu tool approval result request=%s account=%s continuation_ready=%t",
+			shortRequestID(approval.ID), approval.AccountID, ready)
+		if feishuRuntimeOwnershipLost(m.baseContext()) {
+			feishuLog.Warn(m.baseContext(), "deferred direct failed feishu tool approval card update after runtime ownership cancellation request=%s account=%s tool=%s",
+				shortRequestID(approval.ID), approval.AccountID, approval.ToolName)
+			return
+		}
+		m.updateApprovalResultCard(approval, callbackToken, statusCard{title: "执行失败", template: "red", message: message})
 		return
 	}
 	completedState := store.ToolApprovalStateSucceeded
@@ -510,13 +542,38 @@ func (m *operationApprovalService) executeApproved(approval store.ToolApproval, 
 	if message == "" {
 		message = "✅ 已完成授权操作。"
 	}
-	completeErr := m.store.CompleteToolApproval(approval.ID, approval.AccountID, completedState, completedAt)
-	if completeErr != nil {
-		feishuLog.Error(m.baseContext(), "mark feishu tool approval completed request=%s account=%s state=%s: %v", shortRequestID(approval.ID), approval.AccountID, completedState, completeErr)
+	status := "succeeded"
+	if result.Warning {
+		status = "succeeded_with_warning"
+	}
+	workflowResult, resultErr := approvalWorkflowResultRecord(
+		approval,
+		store.WorkflowResultStateSucceeded,
+		status,
+		message,
+		result.Warning,
+		result.WarningReason,
+		completedAt,
+	)
+	if resultErr != nil {
+		feishuLog.Error(m.baseContext(), "build completed feishu tool approval result request=%s account=%s: %v", shortRequestID(approval.ID), approval.AccountID, resultErr)
 		return
 	}
+	_, _, ready, completeErr := m.store.CompleteToolApprovalWithResult(
+		approval.ID,
+		approval.AccountID,
+		completedState,
+		workflowResult,
+		completedAt,
+	)
+	if completeErr != nil {
+		feishuLog.Error(m.baseContext(), "atomically complete feishu tool approval request=%s account=%s state=%s: %v", shortRequestID(approval.ID), approval.AccountID, completedState, completeErr)
+		return
+	}
+	feishuLog.Debug(m.baseContext(), "atomically published feishu tool approval result request=%s account=%s state=%s continuation_ready=%t",
+		shortRequestID(approval.ID), approval.AccountID, completedState, ready)
 	if feishuRuntimeOwnershipLost(m.baseContext()) {
-		feishuLog.Warn(m.baseContext(), "deferred feishu tool approval terminal publication after runtime ownership cancellation request=%s account=%s tool=%s state=%s",
+		feishuLog.Warn(m.baseContext(), "deferred direct feishu tool approval card update after runtime ownership cancellation request=%s account=%s tool=%s state=%s",
 			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, completedState)
 		return
 	}
@@ -530,11 +587,6 @@ func (m *operationApprovalService) executeApproved(approval store.ToolApproval, 
 			shortRequestID(approval.ID), approval.AccountID, approval.ToolName, approvalActorID(approval), approval.ChatID)
 		m.updateApprovalResultCard(approval, callbackToken, statusCard{title: "执行完成", template: "green", message: message})
 	}
-	status := "succeeded"
-	if result.Warning {
-		status = "succeeded_with_warning"
-	}
-	m.persistApprovalWorkflowResult(m.baseContext(), approval, store.WorkflowResultStateSucceeded, status, message, result.Warning, result.WarningReason, completedAt)
 }
 
 func (m *operationApprovalService) updateApprovalResultCard(approval store.ToolApproval, callbackToken string, card Card) {
@@ -601,6 +653,26 @@ func (m *operationApprovalService) persistApprovalWorkflowResult(ctx context.Con
 	persistWorkflowResultBestEffort(ctx, m.store, approval.ID, approval.AccountID, state, approvalWorkflowResultPayload(approval, status, message, warning, warningReason), now)
 }
 
+func approvalWorkflowResultRecord(
+	approval store.ToolApproval,
+	state, status, message string,
+	warning bool,
+	warningReason string,
+	now time.Time,
+) (store.WorkflowResult, error) {
+	payload, err := json.Marshal(approvalWorkflowResultPayload(approval, status, message, warning, warningReason))
+	if err != nil {
+		return store.WorkflowResult{}, fmt.Errorf("marshal tool approval workflow result: %w", err)
+	}
+	return store.WorkflowResult{
+		RequestID: approval.ID,
+		AccountID: approval.AccountID,
+		State:     state,
+		Payload:   payload,
+		CreatedAt: now,
+	}, nil
+}
+
 func approvalWorkflowResultPayload(approval store.ToolApproval, status, message string, warning bool, warningReason string) map[string]any {
 	return map[string]any{
 		"status":         status,
@@ -638,9 +710,6 @@ func (m *operationApprovalService) reconcileTerminalApprovalResults(ctx context.
 			if err != nil {
 				return total, err
 			}
-			if recoveryCardCtx.Err() == nil {
-				m.updateApprovalResultCardWithContext(recoveryCardCtx, approval, "", recoveredApprovalStatusCard(gap.State, message))
-			}
 			_, ready, err := persistWorkflowResult(
 				m.store,
 				approval.ID,
@@ -651,6 +720,9 @@ func (m *operationApprovalService) reconcileTerminalApprovalResults(ctx context.
 			)
 			if err != nil {
 				return total, fmt.Errorf("store recovered tool approval result %s: %w", shortRequestID(gap.ID), err)
+			}
+			if recoveryCardCtx.Err() == nil {
+				m.updateApprovalResultCardWithContext(recoveryCardCtx, approval, "", recoveredApprovalStatusCard(gap.State, message))
 			}
 			total++
 			feishuLog.Debug(ctx, "reconciled feishu tool approval result request=%s account=%s workflow_state=%s result_state=%s ready=%t",

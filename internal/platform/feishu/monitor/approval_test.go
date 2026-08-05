@@ -136,6 +136,14 @@ func (f failingCompleteToolApprovalStore) CompleteToolApproval(_, _, _ string, _
 	return f.err
 }
 
+func (f failingCompleteToolApprovalStore) CompleteToolApprovalWithResult(
+	_, _, _ string,
+	_ store.WorkflowResult,
+	_ time.Time,
+) (store.WorkflowResult, store.WorkflowContinuation, bool, error) {
+	return store.WorkflowResult{}, store.WorkflowContinuation{}, false, f.err
+}
+
 type recordingToolApprovalStore struct {
 	toolApprovalStore
 	canceled []string
@@ -144,11 +152,6 @@ type recordingToolApprovalStore struct {
 func (s *recordingToolApprovalStore) CancelWorkflowContinuation(requestID, accountID, reason string, now time.Time) error {
 	s.canceled = append(s.canceled, requestID)
 	return s.toolApprovalStore.CancelWorkflowContinuation(requestID, accountID, reason, now)
-}
-
-type observingToolApprovalResultStore struct {
-	toolApprovalStore
-	onStoreResult func()
 }
 
 type resolveExecutingApprovalDuringRecoveryListStore struct {
@@ -165,13 +168,6 @@ func (s *resolveExecutingApprovalDuringRecoveryListStore) ListExecutingToolAppro
 		return nil, err
 	}
 	return approvals, nil
-}
-
-func (s *observingToolApprovalResultStore) StoreWorkflowResult(result store.WorkflowResult) (store.WorkflowResult, store.WorkflowContinuation, bool, error) {
-	if s.onStoreResult != nil {
-		s.onStoreResult()
-	}
-	return s.toolApprovalStore.StoreWorkflowResult(result)
 }
 
 func (f *fakeApprovalExecutor) OperationApprovalPolicy() feishutools.OperationApprovalPolicy {
@@ -731,18 +727,18 @@ func TestApprovalManagerPersistsOutcomeUnknownExecutionAsPartialWarning(t *testi
 	}
 }
 
-func TestApprovalManagerAttemptsTerminalCardBeforeMakingContinuationReady(t *testing.T) {
+func TestApprovalManagerPersistsResultBeforeTerminalCardUpdate(t *testing.T) {
 	st := openFeishuApprovalTestStore(t)
-	sender := &fakeApprovalSender{}
-	manager := newTestApprovalManager(t, st, sender)
-	cardUpdatedBeforeResult := make(chan bool, 1)
-	manager.store = &observingToolApprovalResultStore{
-		toolApprovalStore: manager.store,
-		onStoreResult: func() {
-			_, updates, _ := sender.snapshot()
-			cardUpdatedBeforeResult <- len(updates) > 0
+	resultVisibleAtCardUpdate := make(chan bool, 1)
+	pendingID := ""
+	sender := &fakeApprovalSender{
+		interactionUpdateFunc: func(context.Context, string, string) error {
+			_, err := st.GetWorkflowResult(pendingID, "feishu:cli_test")
+			resultVisibleAtCardUpdate <- err == nil
+			return nil
 		},
 	}
+	manager := newTestApprovalManager(t, st, sender)
 	executor := &fakeApprovalExecutor{
 		name:   "feishu_docs_create",
 		result: feishutools.OperationApprovalExecution{Message: "文档已创建"},
@@ -751,6 +747,7 @@ func TestApprovalManagerAttemptsTerminalCardBeforeMakingContinuationReady(t *tes
 		t.Fatalf("registerExecutor returned error: %v", err)
 	}
 	pending := requestTestApproval(t, manager)
+	pendingID = pending.RequestID
 
 	response, err := manager.HandleCardAction(t.Context(), approvalCardEvent(
 		pending.RequestID,
@@ -764,12 +761,12 @@ func TestApprovalManagerAttemptsTerminalCardBeforeMakingContinuationReady(t *tes
 		t.Fatalf("HandleCardAction response = %#v err=%v", response, err)
 	}
 	select {
-	case updated := <-cardUpdatedBeforeResult:
-		if !updated {
-			t.Fatal("workflow continuation became ready before the terminal approval card update was attempted")
+	case visible := <-resultVisibleAtCardUpdate:
+		if !visible {
+			t.Fatal("terminal approval card update ran before the workflow result was durable")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("approved result was not persisted")
+		t.Fatal("terminal approval card update was not attempted")
 	}
 }
 
@@ -1048,6 +1045,7 @@ func TestApprovalManagerExpiredDecisionStoresWorkflowResult(t *testing.T) {
 
 func TestApprovalManagerRecoveryReconcilesExpiredWorkflowResult(t *testing.T) {
 	st := openFeishuApprovalTestStore(t)
+	resultVisibleAtCardUpdate := make(chan bool, 1)
 	sender := &fakeApprovalSender{}
 	manager := newTestApprovalManager(t, st, sender)
 	if err := manager.registerExecutor(&fakeApprovalExecutor{name: "feishu_docs_create"}); err != nil {
@@ -1055,25 +1053,22 @@ func TestApprovalManagerRecoveryReconcilesExpiredWorkflowResult(t *testing.T) {
 	}
 	pending := requestTestApproval(t, manager)
 	manager.now = func() time.Time { return pending.ExpiresAt }
-	cardUpdatedBeforeResult := make(chan bool, 1)
-	manager.store = &observingToolApprovalResultStore{
-		toolApprovalStore: manager.store,
-		onStoreResult: func() {
-			_, updates, _ := sender.snapshot()
-			cardUpdatedBeforeResult <- len(updates) > 0
-		},
+	sender.updateCardFunc = func(context.Context, string, string) error {
+		_, err := st.GetWorkflowResult(pending.RequestID, manager.account.ID)
+		resultVisibleAtCardUpdate <- err == nil
+		return nil
 	}
 
 	if err := manager.recoverPersistedApprovals(t.Context()); err != nil {
 		t.Fatalf("recoverPersistedApprovals returned error: %v", err)
 	}
 	select {
-	case updated := <-cardUpdatedBeforeResult:
-		if !updated {
-			t.Fatal("recovery made the continuation ready before updating the expired approval card")
+	case visible := <-resultVisibleAtCardUpdate:
+		if !visible {
+			t.Fatal("recovery updated the expired approval card before storing its workflow result")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("recovery did not persist the expired approval result")
+		t.Fatal("recovery did not update the expired approval card")
 	}
 	workflowResult, err := st.GetWorkflowResult(pending.RequestID, "feishu:cli_test")
 	if err != nil || workflowResult.State != store.WorkflowResultStateExpired || !strings.Contains(string(workflowResult.Payload), `"status":"expired"`) {

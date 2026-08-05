@@ -643,6 +643,16 @@ tool's independent operation approval. Append is restricted to a document
 bound to the current trusted chat or an external Docx with a live scoped
 `docx/write` grant and Feishu capability.
 
+For an approved asynchronous operation, the approval terminal state, sanitized
+workflow result, continuation-ready transition, and terminal card-delivery
+outbox are committed in one SQLite transaction. The card worker will not render
+a terminal operation card until that durable result is visible; a short result
+gap is retried instead of being reported as a service interruption. Startup
+reconciliation still synthesizes an explicit fallback result for legacy rows or
+a real pre-transaction crash, and persists that fallback before updating the
+card. Consequently, a successful append cannot be overwritten by the generic
+“details were not saved” warning merely because the card worker won a race.
+
 Pending operation and resource-access requests survive process restarts in the
 Feishu platform SQLite database. The document payload is retained only while
 operation authorization is pending/executing and is cleared on denial, expiry,

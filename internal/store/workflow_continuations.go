@@ -222,6 +222,21 @@ func (s *Store) StoreWorkflowResult(result WorkflowResult) (WorkflowResult, Work
 		return WorkflowResult{}, WorkflowContinuation{}, false, fmt.Errorf("begin store workflow result: %w", err)
 	}
 	defer tx.Rollback()
+	stored, continuation, ready, err := storeWorkflowResultTx(tx, result)
+	if err != nil {
+		return stored, continuation, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return WorkflowResult{}, WorkflowContinuation{}, false, fmt.Errorf("commit workflow result: %w", err)
+	}
+	return stored, continuation, ready, nil
+}
+
+// storeWorkflowResultTx inserts a terminal result and readies its committed
+// continuation inside the caller's transaction. This keeps workflow-specific
+// terminal state, the model-visible result, and any terminal outbox atomically
+// visible when a higher-level finalizer uses the same transaction.
+func storeWorkflowResultTx(tx *sql.Tx, result WorkflowResult) (WorkflowResult, WorkflowContinuation, bool, error) {
 	continuation, err := workflowContinuationByID(tx, result.RequestID, result.AccountID)
 	if err != nil {
 		return WorkflowResult{}, WorkflowContinuation{}, false, err
@@ -268,9 +283,6 @@ func (s *Store) StoreWorkflowResult(result WorkflowResult) (WorkflowResult, Work
 		continuation.AvailableAt = result.CreatedAt
 		continuation.UpdatedAt = result.CreatedAt
 		ready = true
-	}
-	if err := tx.Commit(); err != nil {
-		return WorkflowResult{}, WorkflowContinuation{}, false, fmt.Errorf("commit workflow result: %w", err)
 	}
 	return result, continuation, ready, nil
 }

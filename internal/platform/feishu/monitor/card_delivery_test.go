@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -94,14 +95,46 @@ func TestFeishuCardDeliveryWorkerRetriesAfterRestart(t *testing.T) {
 	if err := st.SetToolApprovalCardMessageID(approval.ID, approval.AccountID, "om_card", now); err != nil {
 		t.Fatalf("SetToolApprovalCardMessageID returned error: %v", err)
 	}
+	continuation, err := st.CreateWorkflowContinuation(store.WorkflowContinuation{
+		RequestID:       approval.ID,
+		AccountID:       approval.AccountID,
+		Platform:        store.PlatformFeishu,
+		UserKey:         "feishu:ou_requester",
+		SessionID:       "session_current",
+		ChatID:          approval.ChatID,
+		SourceMessageID: approval.SourceMessageID,
+		ActorOpenID:     approval.ActorOpenID,
+		OriginRevision:  1,
+		OriginTurnID:    "turn_origin",
+		ToolCallID:      "call_create",
+		ToolName:        approval.ToolName,
+		CreatedAt:       now,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorkflowContinuation returned error: %v", err)
+	}
+	if _, _, err := st.CommitWorkflowContinuation(continuation.RequestID, continuation.AccountID, 2, now.Add(time.Second)); err != nil {
+		t.Fatalf("CommitWorkflowContinuation returned error: %v", err)
+	}
 	approval, err = st.DecideToolApproval(approval.ID, approval.AccountID, store.ToolApprovalDecisionApprove, store.ToolApprovalMatch{
 		ActorOpenID: "ou_requester", ChatID: "oc_chat", CardMessageID: "om_card",
 	}, now.Add(time.Second))
 	if err != nil {
 		t.Fatalf("DecideToolApproval returned error: %v", err)
 	}
-	if err := st.CompleteToolApproval(approval.ID, approval.AccountID, store.ToolApprovalStateSucceeded, now.Add(2*time.Second)); err != nil {
-		t.Fatalf("CompleteToolApproval returned error: %v", err)
+	if _, _, _, err := st.CompleteToolApprovalWithResult(
+		approval.ID,
+		approval.AccountID,
+		store.ToolApprovalStateSucceeded,
+		store.WorkflowResult{
+			RequestID: approval.ID,
+			AccountID: approval.AccountID,
+			State:     store.WorkflowResultStateSucceeded,
+			Payload:   json.RawMessage(`{"message":"文档已创建","warning":false}`),
+		},
+		now.Add(2*time.Second),
+	); err != nil {
+		t.Fatalf("CompleteToolApprovalWithResult returned error: %v", err)
 	}
 	updater := &fakeCardDeliveryUpdater{failFor: 1}
 	worker, err := newFeishuCardDeliveryWorker(st, updater, nil, store.Account{ID: approval.AccountID})
@@ -134,6 +167,111 @@ func TestFeishuCardDeliveryWorkerRetriesAfterRestart(t *testing.T) {
 	calls := updater.snapshot()
 	if len(calls) != 2 || calls[0].messageID != "om_card" || !strings.Contains(calls[1].text, "执行完成") {
 		t.Fatalf("card delivery calls = %#v", calls)
+	}
+}
+
+func TestFeishuCardDeliveryWorkerWaitsForToolApprovalWorkflowResult(t *testing.T) {
+	st := openFeishuApprovalTestStore(t)
+	now := time.Date(2026, time.August, 5, 13, 24, 0, 0, time.UTC)
+	approval, err := st.CreateToolApproval(store.ToolApproval{
+		AccountID:       "feishu:cli_test",
+		ToolName:        "feishu_docs_append",
+		ActionKey:       "append",
+		ResourceType:    "docx",
+		ResourceToken:   "doxcn_manual",
+		ActorOpenID:     "ou_requester",
+		ChatID:          "oc_chat",
+		SourceMessageID: "om_source",
+		Payload:         `{"content":"summary"}`,
+		CreatedAt:       now,
+		ExpiresAt:       now.Add(10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("CreateToolApproval returned error: %v", err)
+	}
+	if err := st.SetToolApprovalCardMessageID(approval.ID, approval.AccountID, "om_card", now.Add(time.Second)); err != nil {
+		t.Fatalf("SetToolApprovalCardMessageID returned error: %v", err)
+	}
+	continuation, err := st.CreateWorkflowContinuation(store.WorkflowContinuation{
+		RequestID:       approval.ID,
+		AccountID:       approval.AccountID,
+		Platform:        store.PlatformFeishu,
+		UserKey:         "feishu:ou_requester",
+		SessionID:       "session_current",
+		ChatID:          approval.ChatID,
+		SourceMessageID: approval.SourceMessageID,
+		ActorOpenID:     approval.ActorOpenID,
+		OriginRevision:  1,
+		OriginTurnID:    "turn_origin",
+		ToolCallID:      "call_append",
+		ToolName:        approval.ToolName,
+		CreatedAt:       now,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorkflowContinuation returned error: %v", err)
+	}
+	if _, _, err := st.CommitWorkflowContinuation(continuation.RequestID, continuation.AccountID, 2, now.Add(time.Second)); err != nil {
+		t.Fatalf("CommitWorkflowContinuation returned error: %v", err)
+	}
+	approval, err = st.DecideToolApproval(approval.ID, approval.AccountID, store.ToolApprovalDecisionApprove, store.ToolApprovalMatch{
+		ActorOpenID: approval.ActorOpenID, ChatID: approval.ChatID, CardMessageID: "om_card",
+	}, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatalf("DecideToolApproval returned error: %v", err)
+	}
+	if err := st.CompleteToolApproval(approval.ID, approval.AccountID, store.ToolApprovalStateSucceeded, now.Add(3*time.Second)); err != nil {
+		t.Fatalf("CompleteToolApproval returned error: %v", err)
+	}
+
+	updater := &fakeCardDeliveryUpdater{}
+	worker, err := newFeishuCardDeliveryWorker(st, updater, nil, store.Account{ID: approval.AccountID})
+	if err != nil {
+		t.Fatalf("newFeishuCardDeliveryWorker returned error: %v", err)
+	}
+	workerNow := now.Add(4 * time.Second)
+	worker.now = func() time.Time { return workerNow }
+	worker.retryDelays = []time.Duration{time.Second}
+	worker.processAvailable(t.Context())
+	if calls := updater.snapshot(); len(calls) != 0 {
+		t.Fatalf("card worker published terminal fallback before workflow result = %#v", calls)
+	}
+	delivery, err := st.GetFeishuCardDeliveryByKey(
+		approval.AccountID,
+		approval.ID,
+		store.FeishuCardDeliveryPurposeToolApprovalTerminal,
+		store.FeishuCardDeliveryRevisionTerminal,
+	)
+	if err != nil || delivery.State != store.FeishuCardDeliveryStatePending || delivery.Attempts != 1 {
+		t.Fatalf("delivery while result pending = %#v err=%v", delivery, err)
+	}
+
+	if _, _, _, err := st.StoreWorkflowResult(store.WorkflowResult{
+		RequestID: approval.ID,
+		AccountID: approval.AccountID,
+		State:     store.WorkflowResultStateSucceeded,
+		Payload: json.RawMessage(`{
+			"status":"succeeded",
+			"tool_name":"feishu_docs_append",
+			"action_key":"append",
+			"resource_type":"docx",
+			"resource_token":"doxcn_manual",
+			"message":"✅ 已追加飞书文档内容",
+			"warning":false,
+			"warning_reason":""
+		}`),
+		CreatedAt: now.Add(5 * time.Second),
+	}); err != nil {
+		t.Fatalf("StoreWorkflowResult returned error: %v", err)
+	}
+	workerNow = now.Add(6 * time.Second)
+	worker.processAvailable(t.Context())
+	calls := updater.snapshot()
+	if len(calls) != 1 || !strings.Contains(calls[0].text, "已追加飞书文档内容") || strings.Contains(calls[0].text, "服务中断") {
+		t.Fatalf("card worker result update = %#v", calls)
+	}
+	delivery, err = st.GetFeishuCardDelivery(delivery.ID, delivery.AccountID)
+	if err != nil || delivery.State != store.FeishuCardDeliveryStateDelivered {
+		t.Fatalf("delivery after workflow result = %#v err=%v", delivery, err)
 	}
 }
 
