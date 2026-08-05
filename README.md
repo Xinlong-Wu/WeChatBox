@@ -1055,6 +1055,11 @@ changing models while a card is pending affects the resumed turn without moving
 the workflow to another session. An archived/deleted target session cancels the
 continuation; transient model, tool, storage, or delivery failures use bounded
 backoff retries and eventually become failed.
+Docs-enabled Feishu startup fails closed if the Core handler does not expose
+workflow resumption; it never starts an account with authorization cards but no
+continuation consumer. Runtime platform decorators, including the command-policy
+wrapper, preserve `WorkflowResumer` when the wrapped handler supports it without
+advertising that optional capability for ordinary handlers.
 Runtime shutdown closes callback task admission before any new approval or
 OAuth one-shot state is consumed, waits for already admitted approval/OAuth
 tasks to exit, and returns an interrupted continuation lease to `ready` without

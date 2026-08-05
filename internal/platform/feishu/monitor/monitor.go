@@ -107,6 +107,11 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) (runErr error)
 	if creds.AppSecret == "" {
 		return fmt.Errorf("feishu account %s credentials app_secret is required", acc.Name)
 	}
+	docsEnabled := docsToolsEnabled(p.config.Tools)
+	workflowResumer, err := workflowResumerForDocs(handler, docsEnabled)
+	if err != nil {
+		return fmt.Errorf("initialize feishu Docs workflows for account %s: %w", acc.Name, err)
+	}
 	baseURL := accountConfig.BaseURL
 
 	sdkLogLevel := feishuSDKLogLevel(p.level)
@@ -136,7 +141,7 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) (runErr error)
 	var cards CardService
 	var operationApprovals feishutools.OperationApprovalService
 	var docxAppendCipher *feishutools.DocxAppendEnvelopeCipher
-	if docsToolsEnabled(p.config.Tools) {
+	if docsEnabled {
 		docxAppendCipher, err = feishutools.NewDocxAppendEnvelopeCipher(creds.AppSecret, acc.ID)
 		if err != nil {
 			return fmt.Errorf("initialize feishu docx append recovery encryption for account %s: %w", acc.Name, err)
@@ -182,11 +187,19 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) (runErr error)
 	if err := toolRuntime.RecoverDocxAppendOperations(lifecycleCtx); err != nil {
 		return fmt.Errorf("recover feishu docx append operations for account %s: %w", acc.Name, err)
 	}
-	if docsToolsEnabled(p.config.Tools) {
-		cardWorker, workerErr := newFeishuCardDeliveryWorker(p.store, cards, resourceAccess, acc)
-		if workerErr != nil {
-			return fmt.Errorf("initialize feishu card delivery worker for account %s: %w", acc.Name, workerErr)
+	var cardWorker *feishuCardDeliveryWorker
+	var continuationWorker *workflowContinuationWorker
+	if docsEnabled {
+		cardWorker, err = newFeishuCardDeliveryWorker(p.store, cards, resourceAccess, acc)
+		if err != nil {
+			return fmt.Errorf("initialize feishu card delivery worker for account %s: %w", acc.Name, err)
 		}
+		continuationWorker, err = newWorkflowContinuationWorker(p.store, workflowResumer, sender, cards, acc, tools)
+		if err != nil {
+			return fmt.Errorf("initialize feishu workflow continuation worker for account %s: %w", acc.Name, err)
+		}
+	}
+	if cardWorker != nil {
 		done := make(chan struct{})
 		cardDeliveryDone = done
 		go func() {
@@ -194,21 +207,13 @@ func (p *Platform) Run(ctx context.Context, handler core.Handler) (runErr error)
 			cardWorker.Run(lifecycleCtx)
 		}()
 	}
-	if docsToolsEnabled(p.config.Tools) {
-		if resumer, ok := handler.(core.WorkflowResumer); ok {
-			worker, workerErr := newWorkflowContinuationWorker(p.store, resumer, sender, cards, acc, tools)
-			if workerErr != nil {
-				return fmt.Errorf("initialize feishu workflow continuation worker for account %s: %w", acc.Name, workerErr)
-			}
-			done := make(chan struct{})
-			continuationDone = done
-			go func() {
-				defer close(done)
-				worker.Run(lifecycleCtx)
-			}()
-		} else {
-			feishuLog.Warn(ctx, "feishu workflow continuation worker disabled because handler does not support resumption account=%s", acc.ID)
-		}
+	if continuationWorker != nil {
+		done := make(chan struct{})
+		continuationDone = done
+		go func() {
+			defer close(done)
+			continuationWorker.Run(lifecycleCtx)
+		}()
 	}
 	if names := toolNames(tools); len(names) > 0 {
 		feishuLog.Info(ctx, "registered tools for account %s (%s): %s", acc.Name, acc.ID, strings.Join(names, ", "))
@@ -296,6 +301,17 @@ func (r feishuToolRuntime) RecoverDocxAppendOperations(ctx context.Context) erro
 func docsToolsEnabled(cfg feishutools.Config) bool {
 	cfg = feishutools.NormalizeConfig(cfg)
 	return cfg.Docs.Enabled
+}
+
+func workflowResumerForDocs(handler core.Handler, docsEnabled bool) (core.WorkflowResumer, error) {
+	if !docsEnabled {
+		return nil, nil
+	}
+	resumer, ok := handler.(core.WorkflowResumer)
+	if !ok {
+		return nil, errors.New("feishu Docs workflows require handler workflow resumption")
+	}
+	return resumer, nil
 }
 
 func docsOperationApprovalRequired(cfg feishutools.Config) bool {

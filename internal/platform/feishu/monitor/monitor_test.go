@@ -2146,9 +2146,31 @@ func TestPlatformRunRequiresStoreForDocumentResources(t *testing.T) {
 		Tools: feishutools.Config{
 			Docs: feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true},
 		},
-	}, logging.Info).Run(context.Background(), &fakeProcessor{})
+	}, logging.Info).Run(context.Background(), &fakeWorkflowResumeHandler{
+		fakeProcessor:       &fakeProcessor{},
+		fakeWorkflowResumer: &fakeWorkflowResumer{},
+	})
 	if err == nil || !strings.Contains(err.Error(), "runtime lease requires a Feishu store") {
 		t.Fatalf("Run error = %v, want missing Feishu runtime store", err)
+	}
+}
+
+func TestPlatformRunRequiresWorkflowResumerBeforeDocsStartup(t *testing.T) {
+	acc := store.Account{ID: "feishu:cli_xxx", Name: "fsbot", Platform: store.PlatformFeishu}
+	err := NewPlatform(nil, acc, feishu.Config{
+		Accounts: map[string]feishu.AccountConfig{
+			"fsbot": {
+				AppID:     "cli_xxx",
+				AppSecret: "secret",
+				BaseURL:   "http://127.0.0.1:1",
+			},
+		},
+		Tools: feishutools.Config{
+			Docs: feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true},
+		},
+	}, logging.Info).Run(t.Context(), &fakeProcessor{})
+	if err == nil || !strings.Contains(err.Error(), "Docs workflows require handler workflow resumption") {
+		t.Fatalf("Run error = %v, want workflow-resumption requirement before Docs startup", err)
 	}
 }
 
@@ -2225,7 +2247,10 @@ func TestPlatformRunHeldAccountLeaseSkipsStartupRecovery(t *testing.T) {
 			"fsbot": {AppID: "cli_xxx", AppSecret: "secret", BaseURL: server.URL},
 		},
 		Tools: feishutools.Config{Docs: feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true}},
-	}, logging.Info).Run(t.Context(), &fakeProcessor{})
+	}, logging.Info).Run(t.Context(), &fakeWorkflowResumeHandler{
+		fakeProcessor:       &fakeProcessor{},
+		fakeWorkflowResumer: &fakeWorkflowResumer{},
+	})
 	if !errors.Is(err, store.ErrFeishuAccountRuntimeLeaseHeld) {
 		t.Fatalf("Run error = %v, want ErrFeishuAccountRuntimeLeaseHeld", err)
 	}

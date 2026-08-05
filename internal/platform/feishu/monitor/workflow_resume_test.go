@@ -23,6 +23,11 @@ type fakeWorkflowResumer struct {
 	resume   func(context.Context, core.WorkflowResumeRequest, core.Sender) error
 }
 
+type fakeWorkflowResumeHandler struct {
+	*fakeProcessor
+	*fakeWorkflowResumer
+}
+
 func (f *fakeWorkflowResumer) ResumeWorkflow(ctx context.Context, request core.WorkflowResumeRequest, sender core.Sender) error {
 	f.requests = append(f.requests, request)
 	if f.resume != nil {
@@ -40,6 +45,33 @@ func (f *fakeWorkflowResumer) ResumeWorkflow(ctx context.Context, request core.W
 		text = "workflow resumed"
 	}
 	return sender.Send(ctx, core.OutboundMessage{Text: text})
+}
+
+func TestWorkflowResumerForDocs(t *testing.T) {
+	plain := &fakeProcessor{}
+	if resumer, err := workflowResumerForDocs(plain, false); err != nil || resumer != nil {
+		t.Fatalf("Docs-disabled workflow resumer = %T, err=%v; want nil, nil", resumer, err)
+	}
+
+	resumable := &fakeWorkflowResumeHandler{
+		fakeProcessor:       &fakeProcessor{},
+		fakeWorkflowResumer: &fakeWorkflowResumer{},
+	}
+	resumer, err := workflowResumerForDocs(resumable, true)
+	if err != nil {
+		t.Fatalf("Docs-enabled resumable handler returned error: %v", err)
+	}
+	if resumer != resumable {
+		t.Fatalf("Docs-enabled workflow resumer = %T, want original handler %T", resumer, resumable)
+	}
+
+	resumer, err = workflowResumerForDocs(plain, true)
+	if err == nil || !strings.Contains(err.Error(), "Docs workflows require handler workflow resumption") {
+		t.Fatalf("Docs-enabled plain handler resumer = %T, err=%v; want explicit workflow-resumption error", resumer, err)
+	}
+	if resumer != nil {
+		t.Fatalf("Docs-enabled plain handler resumer = %T, want nil", resumer)
+	}
 }
 
 type workflowResumeSendCall struct {
