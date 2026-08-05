@@ -356,8 +356,10 @@ callbacks. The public callback URL may be reverse-proxied to that local TCP
 listener, and LingoBridge serves the path taken from the callback URL. The
 resource card still accepts a manual handoff as a fallback. A listen address
 without a callback URL is invalid. If neither field is configured, Bot-owned
-resources and already live-verifiable grants still work, but LingoBridge cannot
-start a new external resource grant. The removed `oauth_redirect_uri` and
+resources, already live-verifiable grants, and manually provisioned
+collaborator permissions discovered through a read-only Feishu check still
+work. LingoBridge cannot create or upgrade a missing Feishu collaborator
+permission without OAuth. The removed `oauth_redirect_uri` and
 `oauth_listen_address` names are not accepted as compatibility aliases.
 
 When Docs is enabled, LingoBridge registers `feishu_docs_request_access`,
@@ -459,8 +461,16 @@ mapping, so a stale caller cannot overwrite a ledger-authoritative terminal
 state. Legacy requests without an append ledger retain their caller-provided
 state, and tool-approval workflows remain independently managed.
 
-When a new local grant is required, LingoBridge first sends a Card V2 choice
-with **允许 N 分钟**, **永久允许**, and **拒绝**. A temporary `once` grant starts
+When a new local grant is required and no sufficient capability row exists,
+LingoBridge first performs a read-only live check for the exact Bot or
+`openchat` collaborator. If an administrator or user already granted the
+required Feishu permission manually, LingoBridge records that capability and
+sends the Card V2 choice with **允许 N 分钟**, **永久允许**, and **拒绝** without
+requiring OAuth. This discovery never creates the actor/chat-scoped local grant
+by itself; the requester must still choose `once` or `all`. A negative check
+keeps the existing OAuth path, while a transient or malformed permission-check
+response fails closed before a card or collaborator mutation and can be retried.
+A temporary `once` grant starts
 when the Feishu capability is successfully verified, remains reusable for the
 selected 10–60 minute window, and then expires only in LingoBridge. An `all`
 grant has no local expiry. Neither mode removes or downgrades the Bot/group

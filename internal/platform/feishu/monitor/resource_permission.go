@@ -56,6 +56,13 @@ func (m *resourceAccessManager) verifyTenantAccess(ctx context.Context, resource
 	return m.resourcePermissionService().verifyTenantAccess(ctx, resourceType, resourceToken, permission, subjectType, subjectID)
 }
 
+func (m *resourceAccessManager) discoverTenantCapability(ctx context.Context, request store.FeishuResourceAccessRequest) (bool, error) {
+	if m != nil && m.discoverCapability != nil {
+		return m.discoverCapability(ctx, request)
+	}
+	return m.resourcePermissionService().discoverTenantCapability(ctx, request)
+}
+
 func (m *resourceAccessManager) resourceGrantSubject(chat feishutools.ChatContext, resourceType string) (string, string, string) {
 	return m.resourcePermissionService().resourceGrantSubject(chat, resourceType)
 }
@@ -227,6 +234,53 @@ func (s *resourcePermissionService) verifyTenantAccess(ctx context.Context, reso
 		return false, fmt.Errorf("verify feishu resource permission code=%d msg=%s", resp.Code, resp.Msg)
 	}
 	return resp.Data != nil && resp.Data.AuthResult != nil && *resp.Data.AuthResult, nil
+}
+
+// discoverTenantCapability performs a read-only Feishu permission check when
+// LingoBridge has no sufficient local capability row. A positive result records
+// the external fact only; it deliberately does not create the user/chat-scoped
+// local grant, which still requires an explicit once/all card decision.
+func (s *resourcePermissionService) discoverTenantCapability(ctx context.Context, request store.FeishuResourceAccessRequest) (bool, error) {
+	verified, err := s.verifyTenantAccess(
+		ctx,
+		request.ResourceType,
+		request.ResourceToken,
+		request.Permission,
+		request.SubjectType,
+		request.SubjectID,
+	)
+	if err != nil {
+		return false, err
+	}
+	if !verified {
+		feishuLog.Debug(ctx, "no existing feishu resource capability discovered request=%s account=%s chat=%s type=%s resource_ref=%s permission=%s subject_type=%s",
+			shortRequestID(request.ID), request.AccountID, request.ChatID, request.ResourceType,
+			shortResourceRef(request.ResourceToken), request.Permission, request.SubjectType)
+		return false, nil
+	}
+	verifiedAt := s.currentTime()
+	capability, err := s.store.UpsertFeishuResourceCapability(store.FeishuResourceCapability{
+		AccountID:         request.AccountID,
+		ResourceType:      request.ResourceType,
+		ResourceToken:     request.ResourceToken,
+		SubjectType:       request.SubjectType,
+		SubjectID:         request.SubjectID,
+		Permission:        request.Permission,
+		SourceActorOpenID: request.ActorOpenID,
+		SourceActorUserID: request.ActorUserID,
+		SourceRequestID:   request.ID,
+		State:             store.FeishuResourceCapabilityStateActive,
+		CreatedAt:         verifiedAt,
+		VerifiedAt:        verifiedAt,
+		UpdatedAt:         verifiedAt,
+	})
+	if err != nil {
+		return false, fmt.Errorf("persist discovered feishu resource capability: %w", err)
+	}
+	feishuLog.Info(ctx, "discovered existing feishu resource capability request=%s account=%s chat=%s type=%s resource_ref=%s permission=%s subject_type=%s source_request=%s",
+		shortRequestID(request.ID), request.AccountID, request.ChatID, request.ResourceType,
+		shortResourceRef(request.ResourceToken), capability.Permission, capability.SubjectType, shortRequestID(capability.SourceRequestID))
+	return true, nil
 }
 
 func (s *resourcePermissionService) resourceGrantSubject(chat feishutools.ChatContext, resourceType string) (string, string, string) {

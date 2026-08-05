@@ -124,6 +124,20 @@ func TestDocsResourceAccessToolReturnsPendingWorkflowID(t *testing.T) {
 	}
 }
 
+func TestDocsResourceAccessToolDescribesManualCapabilityDiscovery(t *testing.T) {
+	spec := docsResourceAccessSpec()
+	for _, fragment := range []string{
+		"read-only Feishu permission check",
+		"manually granted Bot/group permission",
+		"avoids OAuth",
+		"must still choose either a temporary 10–60 minute grant or a permanent grant",
+	} {
+		if !strings.Contains(spec.Description, fragment) {
+			t.Fatalf("resource access description missing %q: %s", fragment, spec.Description)
+		}
+	}
+}
+
 func TestDocsResourceAccessToolRejectsInvalidPermissionAndAliasType(t *testing.T) {
 	controller := &fakeResourceAccessController{}
 	tool := NewDocsResourceAccessTools(controller, Config{Docs: DocsToolsConfig{Enabled: true}})[0]

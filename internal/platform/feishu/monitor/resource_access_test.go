@@ -1249,6 +1249,200 @@ func TestResourceAccessManagerDoesNotReuseGrantWithoutActiveCapability(t *testin
 	}
 }
 
+func TestResourceAccessManagerDiscoversManualBotPermissionWithoutOAuth(t *testing.T) {
+	var authCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+		case "/open-apis/drive/v1/permissions/doxcn_manual/members/auth":
+			authCalls.Add(1)
+			if r.URL.Query().Get("type") != "docx" || r.URL.Query().Get("action") != "edit" {
+				t.Fatalf("manual permission auth query = %s", r.URL.RawQuery)
+			}
+			writeResourceAccessJSON(t, w, map[string]any{"code": 0, "msg": "Success", "data": map[string]any{"auth_result": true}})
+		default:
+			t.Fatalf("manual permission discovery unexpectedly called %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
+	manager.discoverCapability = nil
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType:        "docx",
+		ResourceToken:       "doxcn_manual",
+		Permission:          feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+		Reason:              "write a manually shared document",
+	})
+	if err != nil || result.Status != feishutools.ResourceAccessStatusPending {
+		t.Fatalf("manual permission RequestAccess = %#v err=%v", result, err)
+	}
+	if got := authCalls.Load(); got != 1 {
+		t.Fatalf("manual permission discovery calls = %d, want 1", got)
+	}
+	cards, _, _ := sender.snapshot()
+	if len(cards) != 1 || !strings.Contains(cards[0].text, "已有可核验的飞书资源权限，批准后无需 OAuth") ||
+		strings.Contains(cards[0].text, "前往飞书官方授权页面") {
+		t.Fatalf("manual permission choice card = %#v", cards)
+	}
+	capability, active, err := st.ActiveFeishuResourceCapability(
+		"feishu:cli_test", "docx", "doxcn_manual", "openid", "ou_bot", store.FeishuResourcePermissionWrite,
+	)
+	if err != nil || !active || capability.SourceRequestID != result.RequestID || capability.SourceActorOpenID != "ou_requester" {
+		t.Fatalf("discovered capability = %#v active=%t err=%v", capability, active, err)
+	}
+	if _, active, err := st.ActiveFeishuResourceGrant(
+		"feishu:cli_test", store.FeishuResourceGrantActorTypeOpenID, "ou_requester", "oc_chat",
+		"docx", "doxcn_manual", store.FeishuResourcePermissionWrite, manager.currentTime(),
+	); err != nil || active {
+		t.Fatalf("grant before user choice active=%t err=%v, want false", active, err)
+	}
+
+	event := resourceAccessCardEvent(result.RequestID, "ou_requester", "oc_chat", "om_card")
+	event.Event.Action.Value["action"] = resourceAccessCardActionApproveOnce
+	response, err := manager.HandleCardAction(context.Background(), event)
+	if err != nil || response == nil || response.Toast == nil || response.Toast.Type != "success" {
+		t.Fatalf("manual permission approval response = %#v err=%v", response, err)
+	}
+	completed := waitForResourceAccessCompletion(t, st, sender, result.RequestID)
+	if completed.GrantMode != store.FeishuResourceGrantModeOnce || completed.GrantSource != store.FeishuResourceGrantSourceExistingGrant {
+		t.Fatalf("completed manual permission request = %#v", completed)
+	}
+	if got := authCalls.Load(); got != 2 {
+		t.Fatalf("manual permission total live checks = %d, want 2", got)
+	}
+	_, updates, _ := sender.snapshot()
+	for _, update := range updates {
+		if strings.Contains(update.text, "前往飞书官方授权页面") {
+			t.Fatalf("manual permission unexpectedly entered OAuth: %s", update.text)
+		}
+	}
+}
+
+func TestResourceAccessManagerDiscoveryUpgradesRecordedReadCapability(t *testing.T) {
+	var authCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+		case "/open-apis/drive/v1/permissions/doxcn_manual_upgrade/members/auth":
+			authCalls.Add(1)
+			if r.URL.Query().Get("action") != "edit" {
+				t.Fatalf("manual upgrade auth query = %s", r.URL.RawQuery)
+			}
+			writeResourceAccessJSON(t, w, map[string]any{"code": 0, "msg": "Success", "data": map[string]any{"auth_result": true}})
+		default:
+			t.Fatalf("manual capability upgrade unexpectedly called %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{})
+	manager.discoverCapability = nil
+	now := manager.currentTime()
+	if _, err := st.UpsertFeishuResourceCapability(store.FeishuResourceCapability{
+		AccountID: "feishu:cli_test", ResourceType: "docx", ResourceToken: "doxcn_manual_upgrade",
+		SubjectType: "openid", SubjectID: "ou_bot", Permission: store.FeishuResourcePermissionRead,
+		SourceActorOpenID: "ou_requester", SourceRequestID: "req_read_capability",
+		State: store.FeishuResourceCapabilityStateActive, CreatedAt: now, VerifiedAt: now,
+	}); err != nil {
+		t.Fatalf("seed read capability: %v", err)
+	}
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType: "docx", ResourceToken: "doxcn_manual_upgrade", Permission: feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil || result.Status != feishutools.ResourceAccessStatusPending || authCalls.Load() != 1 {
+		t.Fatalf("manual capability upgrade result = %#v auth_calls=%d err=%v", result, authCalls.Load(), err)
+	}
+	capability, active, err := st.ActiveFeishuResourceCapability(
+		"feishu:cli_test", "docx", "doxcn_manual_upgrade", "openid", "ou_bot", store.FeishuResourcePermissionWrite,
+	)
+	if err != nil || !active || capability.Permission != store.FeishuResourcePermissionWrite || capability.SourceRequestID != result.RequestID {
+		t.Fatalf("upgraded capability = %#v active=%t err=%v", capability, active, err)
+	}
+	cards, _, _ := sender.snapshot()
+	if len(cards) != 1 || !strings.Contains(cards[0].text, "已有可核验的飞书资源权限，批准后无需 OAuth") {
+		t.Fatalf("manual upgrade card = %#v", cards)
+	}
+}
+
+func TestResourceAccessManagerDiscoveryMissKeepsOAuthChoice(t *testing.T) {
+	var authCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+		case "/open-apis/drive/v1/permissions/doxcn_manual_missing/members/auth":
+			authCalls.Add(1)
+			writeResourceAccessJSON(t, w, map[string]any{"code": 0, "msg": "Success", "data": map[string]any{"auth_result": false}})
+		default:
+			t.Fatalf("manual permission miss unexpectedly called %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID: "cli_xxx", BaseURL: server.URL, CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	manager.discoverCapability = nil
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType: "docx", ResourceToken: "doxcn_manual_missing", Permission: feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err != nil || result.Status != feishutools.ResourceAccessStatusPending || authCalls.Load() != 1 {
+		t.Fatalf("manual permission miss result = %#v auth_calls=%d err=%v", result, authCalls.Load(), err)
+	}
+	if _, active, err := st.ActiveFeishuResourceCapability(
+		"feishu:cli_test", "docx", "doxcn_manual_missing", "openid", "ou_bot", store.FeishuResourcePermissionWrite,
+	); err != nil || active {
+		t.Fatalf("manual permission miss capability active=%t err=%v, want false", active, err)
+	}
+	cards, _, _ := sender.snapshot()
+	if len(cards) != 1 || !strings.Contains(cards[0].text, "批准后需要在飞书官方页面完成 OAuth") {
+		t.Fatalf("manual permission miss card = %#v", cards)
+	}
+}
+
+func TestResourceAccessManagerDiscoveryErrorFailsClosedBeforeCard(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			writeResourceAccessJSON(t, w, tenantTokenResponseForResourceAccess())
+		case "/open-apis/drive/v1/permissions/doxcn_manual_error/members/auth":
+			w.WriteHeader(http.StatusInternalServerError)
+			writeResourceAccessJSON(t, w, map[string]any{"code": 99999, "msg": "temporary permission service failure"})
+		default:
+			t.Fatalf("manual permission error probe unexpectedly called %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	manager, st, sender := newTestResourceAccessManager(t, server, resourceAccessOAuthConfig{
+		ClientID: "cli_xxx", BaseURL: server.URL, CallbackURL: "https://bridge.example.com/feishu/oauth/callback",
+	})
+	manager.discoverCapability = nil
+	result, err := manager.RequestAccess(resourceAccessRequestContext(), feishutools.ResourceAccessRequest{
+		ResourceType: "docx", ResourceToken: "doxcn_manual_error", Permission: feishutools.ResourcePermissionWrite,
+		OnceDurationMinutes: 30,
+	})
+	if err == nil || !strings.Contains(err.Error(), "discover existing feishu resource capability") {
+		t.Fatalf("manual permission discovery error result = %#v err=%v", result, err)
+	}
+	if cards, _, _ := sender.snapshot(); len(cards) != 0 {
+		t.Fatalf("manual permission discovery error cards = %#v, want none", cards)
+	}
+	if result.RequestID != "" {
+		t.Fatalf("failed discovery exposed pending result = %#v", result)
+	}
+	requests, listErr := st.ListExecutingFeishuResourceAccessRequests("feishu:cli_test")
+	if listErr != nil || len(requests) != 0 {
+		t.Fatalf("failed discovery left executing requests = %#v err=%v", requests, listErr)
+	}
+}
+
 func TestResourceAccessManagerKeepsCapabilityOnTransientLiveCheckError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -3716,6 +3910,9 @@ func newTestResourceAccessManager(t *testing.T, server *httptest.Server, oauth r
 	t.Cleanup(manager.tasks.CloseAndWait)
 	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
 	manager.now = func() time.Time { return now }
+	manager.discoverCapability = func(context.Context, store.FeishuResourceAccessRequest) (bool, error) {
+		return false, nil
+	}
 	return manager, st, sender
 }
 

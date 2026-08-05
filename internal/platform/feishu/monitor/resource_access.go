@@ -61,6 +61,7 @@ type resourceAccessManager struct {
 	refreshAttemptCleanupInterval  time.Duration
 	refreshAttemptCleanupBatchSize int
 	cardUpdateTimeout              time.Duration
+	discoverCapability             func(context.Context, store.FeishuResourceAccessRequest) (bool, error)
 	tasks                          backgroundTaskGroup
 }
 
@@ -289,6 +290,13 @@ func (m *resourceAccessManager) RequestAccess(ctx context.Context, input feishut
 	if err != nil {
 		m.failResourceAccessBestEffort(ctx, request.ID)
 		return feishutools.ResourceAccessResult{}, fmt.Errorf("check feishu resource capability before authorization card: %w", err)
+	}
+	if !capabilityActive {
+		capabilityActive, err = m.discoverTenantCapability(ctx, request)
+		if err != nil {
+			m.failResourceAccessBestEffort(ctx, request.ID)
+			return feishutools.ResourceAccessResult{}, fmt.Errorf("discover existing feishu resource capability: %w", err)
+		}
 	}
 	if !capabilityActive && !m.oauthEnabled() {
 		m.failResourceAccessBestEffort(ctx, request.ID)
