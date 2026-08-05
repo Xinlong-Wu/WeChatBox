@@ -1025,20 +1025,20 @@ func TestHandleGroupTextMessageRepliesToOriginal(t *testing.T) {
 	}
 }
 
-func TestNewFeishuToolsRegistersEnabledChatHistory(t *testing.T) {
+func TestNewFeishuToolRuntimeRegistersEnabledChatHistory(t *testing.T) {
 	cfg := feishutools.Config{ChatHistory: feishutools.ChatHistoryConfig{Enabled: true}}
-	names := toolNames(newFeishuTools(&lark.Client{}, nil, "", cfg, nil, nil, nil, ""))
+	names := toolNames(newFeishuToolRuntime(&lark.Client{}, nil, "", cfg, nil, nil, nil, "").Tools())
 	if len(names) != 1 || names[0] != "feishu_chat_history_get" {
 		t.Fatalf("tool names = %#v, want chat history", names)
 	}
 }
 
-func TestNewFeishuToolsRegistersApprovalGatedDocumentWrites(t *testing.T) {
+func TestNewFeishuToolRuntimeRegistersApprovalGatedDocumentWrites(t *testing.T) {
 	st := openFeishuApprovalTestStore(t)
 	cfg := feishutools.Config{
 		Docs: feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true},
 	}
-	withoutApproval := toolNames(newFeishuTools(&lark.Client{}, st, "feishu:cli_test", cfg, nil, nil, nil, "runtime_test"))
+	withoutApproval := toolNames(newFeishuToolRuntime(&lark.Client{}, st, "feishu:cli_test", cfg, nil, nil, nil, "runtime_test").Tools())
 	withoutApprovalNames := strings.Join(withoutApproval, ",")
 	if strings.Contains(withoutApprovalNames, "feishu_docs_create") || strings.Contains(withoutApprovalNames, "feishu_docs_append") {
 		t.Fatalf("tools without approval workflow = %#v, document writes must fail closed", withoutApproval)
@@ -1047,12 +1047,12 @@ func TestNewFeishuToolsRegistersApprovalGatedDocumentWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDocxAppendEnvelopeCipher returned error: %v", err)
 	}
-	withoutExecutionOwner := toolNames(newFeishuTools(&lark.Client{}, st, "feishu:cli_test", cfg, fakeToolApprovalRequester{}, fakeResourceAccessController{}, appendCipher, ""))
+	withoutExecutionOwner := toolNames(newFeishuToolRuntime(&lark.Client{}, st, "feishu:cli_test", cfg, fakeToolApprovalRequester{}, fakeResourceAccessController{}, appendCipher, "").Tools())
 	withoutExecutionOwnerNames := strings.Join(withoutExecutionOwner, ",")
 	if strings.Contains(withoutExecutionOwnerNames, "feishu_docs_create") || strings.Contains(withoutExecutionOwnerNames, "feishu_docs_append") {
 		t.Fatalf("tools without append execution owner = %#v, document writes must fail closed", withoutExecutionOwner)
 	}
-	withApproval := toolNames(newFeishuTools(&lark.Client{}, st, "feishu:cli_test", cfg, fakeToolApprovalRequester{}, fakeResourceAccessController{}, appendCipher, "runtime_test"))
+	withApproval := toolNames(newFeishuToolRuntime(&lark.Client{}, st, "feishu:cli_test", cfg, fakeToolApprovalRequester{}, fakeResourceAccessController{}, appendCipher, "runtime_test").Tools())
 	if got, want := strings.Join(withApproval, ","), "feishu_docs_request_access,feishu_docs_search,feishu_docs_read,feishu_docs_create,feishu_docs_append,feishu_docs_folder_create,feishu_docs_folder_list"; got != want {
 		t.Fatalf("tools with approval workflow = %q, want %q", got, want)
 	}

@@ -52,7 +52,7 @@ func (t *docsService) executeDocxAppend(ctx context.Context, requestID string, d
 	}
 
 	// Low-level unit tests may construct a service without persistence. Every
-	// production service is built through NewDocsTools and has both dependencies.
+	// production service is built through NewDocsRuntime and has both dependencies.
 	if t.store == nil && t.appendCipher == nil {
 		index, err := t.docxTopLevelChildCount(ctx, document)
 		if err != nil {

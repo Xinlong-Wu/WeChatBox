@@ -412,13 +412,25 @@ create. LingoBridge instead lists the exact parent and conservatively matches
 resource type, exact name, application owner, and a bounded creation-time
 window. Only one unclaimed candidate may be adopted; zero, multiple, or
 already-claimed candidates return `outcome_unknown`. Both
-`feishu_docs_create` and `feishu_docs_folder_create` accept a retry containing
-only the returned `request_id`; this repairs or re-runs reconciliation and
-never repeats the create API after `remote_started`. If initial document text
+`feishu_docs_create` and `feishu_docs_folder_create` accept a recovery call
+containing only the returned `request_id`; this repairs or re-runs
+reconciliation for the existing ledgered workflow and never repeats the create
+API after `remote_started`. If initial document text
 was requested, its append uses the same durable append path described below.
 Older or interrupted create requests that do not have an append ledger still
 return the created document with an explicit warning instead of guessing and
 appending the text again.
+
+The model-facing create specifications additionally forbid submitting another
+create request for the same document or folder after a failed, `partial`, or
+`outcome_unknown` result. For a document, the model must use
+`feishu_docs_search` to find candidates and `feishu_docs_read` to verify that
+exactly one candidate is the intended document. For a folder, it must use
+`feishu_docs_folder_list` and accept the result only when exactly one folder
+matches. This uniqueness decision belongs to the model's read-only follow-up;
+the create implementation does not add a name-based preflight check. A
+`request_id`-only call is ledger verification/local repair, not another logical
+create request, and cannot repeat the Feishu create API.
 
 Docx block insertion uses a separate durable
 `feishu_docx_append_operations` ledger. Before the first append mutation,
@@ -550,9 +562,11 @@ Bot-owned folder already bound to the current chat. It does not show a separate
 operation-approval card. Its parent `folder/write` resource check runs before
 creation. After creation, the Bot records the new folder as Bot-owned, grants
 the current private-chat user or group `full_access`, and binds the folder to
-that chat. If sharing fails after the folder exists, retry with only the
-returned folder-create `request_id`; this retry ID identifies the partial
-folder-create workflow and is not a resource credential.
+that chat. If sharing or local persistence fails after the folder exists, a
+`request_id`-only recovery may finish that existing workflow without issuing a
+second create call; the ID is not a resource credential. The model still uses
+`feishu_docs_folder_list` to establish a unique user-visible result instead of
+submitting the same logical create again.
 
 `feishu_docs_create` creates a Docx only in a Bot-owned folder bound to the
 current chat. Omitting `folder_token` selects that chat's default Bot folder.
@@ -1135,9 +1149,22 @@ boundaries rather than implemented by each tool adapter. Resource permission
 checks, startup recovery, OAuth credential/refresh rotation, card-delivery
 retry, and remote-create reconciliation each have one implementation boundary.
 The document and folder tool values retain only their tool name/schema and
-delegate to one shared service per registered tool set. Store dependencies are
-expressed as small capability interfaces for those services; the resource
-access manager remains the live workflow and callback facade.
+delegate to one shared service per registered tool set. `DocsRuntime`
+explicitly owns the shared document service, registered adapters, and append
+startup recovery; monitor startup no longer rediscovers recovery state by
+scanning concrete tool adapter types. Store dependencies are expressed as
+small capability interfaces for those services.
+
+The resource-access facade is organized by workflow responsibility:
+`resource_access.go` owns construction and top-level request/card routing;
+`resource_access_grant.go` owns collaborator mutation and local grant
+completion; `resource_access_oauth.go` owns OAuth handoff, callback parsing,
+code exchange, and user verification; `resource_access_resolution.go` owns
+resource aliases, display names, and Bot-root lookup;
+`resource_access_completion.go` owns terminal workflow/card publication; and
+`resource_access_helpers.go` contains the small shared normalization and URL
+helpers. These files share the same manager and preserve one authorization
+state machine rather than introducing compatibility wrappers between layers.
 
 In-chat slash commands live in `internal/commands/` and are shared by every
 platform adapter unless that platform's command policy disables them.

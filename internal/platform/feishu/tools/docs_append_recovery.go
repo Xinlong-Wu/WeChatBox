@@ -7,33 +7,20 @@ import (
 	"time"
 
 	"lingobridge/internal/store"
-	tooltypes "lingobridge/internal/tools"
 )
 
 const docxAppendStartupRecoveryBatchSize = 100
 
 // RecoverDocxAppendOperations resumes append requests that crossed their
 // durable mutation boundary before the previous account runtime stopped.
-// Services are deduplicated because all Docs adapters share one docsService.
-func RecoverDocxAppendOperations(ctx context.Context, registered []tooltypes.Tool) error {
+func (r *DocsRuntime) RecoverDocxAppendOperations(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	seen := make(map[*docsService]struct{})
-	for _, candidate := range registered {
-		tool, ok := candidate.(docsTool)
-		if !ok || tool.service == nil {
-			continue
-		}
-		if _, ok := seen[tool.service]; ok {
-			continue
-		}
-		seen[tool.service] = struct{}{}
-		if err := tool.service.recoverDocxAppendOperations(ctx); err != nil {
-			return err
-		}
+	if r == nil || r.service == nil {
+		return nil
 	}
-	return nil
+	return r.service.recoverDocxAppendOperations(ctx)
 }
 
 func (t *docsService) recoverDocxAppendOperations(ctx context.Context) error {

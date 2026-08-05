@@ -57,39 +57,6 @@ type docsService struct {
 	now                   func() time.Time
 }
 
-// NewDocsTools returns Feishu document tools for tool-capable LLM providers.
-func NewDocsTools(client *lark.Client, st *store.Store, accountID string, cfg Config, approvals OperationApprovalService, resourceAccess ResourceAccessGuard, appendCipher *DocxAppendEnvelopeCipher, appendExecutionOwner string) []tooltypes.Tool {
-	cfg = NormalizeConfig(cfg)
-	accountID = strings.TrimSpace(accountID)
-	appendExecutionOwner = strings.TrimSpace(appendExecutionOwner)
-	if client == nil || st == nil || st.PlatformID() != store.PlatformFeishu || accountID == "" || !cfg.Docs.Enabled || resourceAccess == nil {
-		return nil
-	}
-	service := &docsService{
-		client:                client,
-		store:                 st,
-		accountID:             accountID,
-		cfg:                   cfg,
-		approvals:             approvals,
-		resourceAccess:        resourceAccess,
-		appendCipher:          appendCipher,
-		appendExecutionOwner:  appendExecutionOwner,
-		remoteReconcileDelays: copyRemoteCreateReconciliationDelays(),
-		now:                   time.Now,
-	}
-	tools := []tooltypes.Tool{
-		docsTool{name: searchToolName, spec: docsSearchSpec(), service: service},
-		docsTool{name: readToolName, spec: docsReadSpec(), service: service},
-	}
-	if cfg.Docs.AllowWrite {
-		if approvals != nil && resourceAccess != nil && appendCipher != nil && appendExecutionOwner != "" {
-			tools = append(tools, docsTool{name: createToolName, spec: docsCreateSpec(), service: service})
-			tools = append(tools, docsTool{name: appendToolName, spec: docsAppendSpec(), service: service})
-		}
-	}
-	return tools
-}
-
 func (t docsTool) Spec() tooltypes.Spec {
 	return t.spec
 }

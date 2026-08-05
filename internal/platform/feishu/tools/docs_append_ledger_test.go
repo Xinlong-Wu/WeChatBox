@@ -272,8 +272,8 @@ func TestDocsAppendPermanentGrantStartupRecoveryUsesDurablePayload(t *testing.T)
 		}
 	}()
 	recoveryAccess := grantedResourceAccessController("req_recovery_access")
-	restartedTools := NewDocsTools(client, restartedStore, "feishu:cli_test", Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}, approver, recoveryAccess, newTestDocxAppendCipher(t), testDocxAppendExecutionOwner)
-	if err := RecoverDocxAppendOperations(context.Background(), restartedTools); err != nil {
+	restartedRuntime := NewDocsRuntime(client, restartedStore, "feishu:cli_test", Config{Docs: DocsToolsConfig{Enabled: true, AllowWrite: true}}, approver, recoveryAccess, newTestDocxAppendCipher(t), testDocxAppendExecutionOwner)
+	if err := restartedRuntime.RecoverDocxAppendOperations(context.Background()); err != nil {
 		t.Fatalf("RecoverDocxAppendOperations returned error: %v", err)
 	}
 
@@ -382,7 +382,7 @@ func TestDocsCreateInitialContentRecoveryReusesFrozenAppendEnvelope(t *testing.T
 			t.Fatalf("close restarted Feishu store: %v", err)
 		}
 	}()
-	restartedTools := NewDocsTools(
+	restartedRuntime := NewDocsRuntime(
 		client,
 		restartedStore,
 		"feishu:cli_test",
@@ -392,6 +392,7 @@ func TestDocsCreateInitialContentRecoveryReusesFrozenAppendEnvelope(t *testing.T
 		newTestDocxAppendCipher(t),
 		testDocxAppendExecutionOwner,
 	)
+	restartedTools := restartedRuntime.Tools()
 	restartedExecutor := findDocsTool(t, restartedTools, createToolName).(OperationApprovalExecutor)
 	recovered, err := restartedExecutor.ExecuteApproved(context.Background(), "req_create_initial_restart", payload)
 	if err != nil || recovered.Warning || !strings.Contains(recovered.Message, "飞书文档已创建") {
@@ -796,7 +797,7 @@ func TestDocsCreateFailedInitialAppendRecoveryKeepsWorkflowPartial(t *testing.T)
 	if _, err := st.MarkFeishuDocxAppendOperationFailed(requestID, "feishu:cli_test", executionToken, "remote_rejected", now.Add(2*time.Second)); err != nil {
 		t.Fatalf("mark initial append failed: %v", err)
 	}
-	registered := NewDocsTools(
+	runtime := NewDocsRuntime(
 		&lark.Client{},
 		st,
 		"feishu:cli_test",
@@ -806,7 +807,7 @@ func TestDocsCreateFailedInitialAppendRecoveryKeepsWorkflowPartial(t *testing.T)
 		newTestDocxAppendCipher(t),
 		testDocxAppendExecutionOwner,
 	)
-	if err := RecoverDocxAppendOperations(context.Background(), registered); err != nil {
+	if err := runtime.RecoverDocxAppendOperations(context.Background()); err != nil {
 		t.Fatalf("RecoverDocxAppendOperations returned error: %v", err)
 	}
 	workflow, err := st.GetWorkflowRequest(requestID, "feishu:cli_test")
@@ -1189,7 +1190,7 @@ func TestDocsAppendRecoveryCipherMismatchKeepsNonterminalLedgerAndPartialWorkflo
 	if err != nil {
 		t.Fatalf("create mismatched cipher: %v", err)
 	}
-	registered := NewDocsTools(
+	runtime := NewDocsRuntime(
 		&lark.Client{},
 		st,
 		"feishu:cli_test",
@@ -1199,7 +1200,7 @@ func TestDocsAppendRecoveryCipherMismatchKeepsNonterminalLedgerAndPartialWorkflo
 		wrongCipher,
 		"runtime_old",
 	)
-	if err := RecoverDocxAppendOperations(context.Background(), registered); err != nil {
+	if err := runtime.RecoverDocxAppendOperations(context.Background()); err != nil {
 		t.Fatalf("RecoverDocxAppendOperations returned error: %v", err)
 	}
 	preserved, err := st.GetFeishuDocxAppendOperation(requestID, "feishu:cli_test")

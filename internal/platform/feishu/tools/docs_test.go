@@ -49,21 +49,22 @@ func TestDocsToolConfigDefaultsAndRegistration(t *testing.T) {
 
 	client := &lark.Client{}
 	st := openDocsFolderTestStore(t)
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil, nil, nil, ""); len(got) != 0 {
+	if got := NewDocsRuntime(client, st, "feishu:cli_test", cfg, nil, nil, nil, "").Tools(); len(got) != 0 {
 		t.Fatalf("disabled tools = %d, want 0", len(got))
 	}
 	cfg.Docs.Enabled = true
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil, nil, nil, ""); len(got) != 0 {
+	if got := NewDocsRuntime(client, st, "feishu:cli_test", cfg, nil, nil, nil, "").Tools(); len(got) != 0 {
 		t.Fatalf("docs tools without resource access guard = %d, want 0", len(got))
 	}
 	cfg.Docs.AllowWrite = true
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, nil, nil, nil, ""); len(got) != 0 {
+	if got := NewDocsRuntime(client, st, "feishu:cli_test", cfg, nil, nil, nil, "").Tools(); len(got) != 0 {
 		t.Fatalf("write tools without approval or resource access workflow = %d, want 0", len(got))
 	}
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, &fakeApprovalRequester{}, nil, nil, ""); len(got) != 0 {
+	if got := NewDocsRuntime(client, st, "feishu:cli_test", cfg, &fakeApprovalRequester{}, nil, nil, "").Tools(); len(got) != 0 {
 		t.Fatalf("write tools without resource access workflow = %d, want 0", len(got))
 	}
-	if got := NewDocsTools(client, st, "feishu:cli_test", cfg, &fakeApprovalRequester{result: OperationApprovalResult{Status: OperationApprovalStatusGranted}}, grantedResourceAccessController("req_access"), newTestDocxAppendCipher(t), testDocxAppendExecutionOwner); len(got) != 4 {
+	runtime := NewDocsRuntime(client, st, "feishu:cli_test", cfg, &fakeApprovalRequester{result: OperationApprovalResult{Status: OperationApprovalStatusGranted}}, grantedResourceAccessController("req_access"), newTestDocxAppendCipher(t), testDocxAppendExecutionOwner)
+	if got := runtime.Tools(); len(got) != 4 {
 		t.Fatalf("write tools with approval workflow = %d, want four tools", len(got))
 	} else {
 		sharedService := got[0].(docsTool).service
@@ -78,6 +79,11 @@ func TestDocsToolConfigDefaultsAndRegistration(t *testing.T) {
 			!createPolicy.RecoverInterrupted || !appendPolicy.RecoverInterrupted {
 			t.Fatalf("operation policies create=%#v append=%#v, want independent restart-safe actions", createPolicy, appendPolicy)
 		}
+	}
+	mutableView := runtime.Tools()
+	mutableView[0] = nil
+	if freshView := runtime.Tools(); freshView[0] == nil {
+		t.Fatal("DocsRuntime.Tools returned mutable runtime-owned slice")
 	}
 }
 
@@ -1507,7 +1513,7 @@ func TestDocsCreateRequiresAndRevalidatesFolderAccess(t *testing.T) {
 		t.Fatalf("seed folder: %v", err)
 	}
 	access := grantedResourceAccessController("req_access")
-	tools := NewDocsTools(&lark.Client{}, st, "feishu:cli_test", cfg, approver, access, newTestDocxAppendCipher(t), testDocxAppendExecutionOwner)
+	tools := NewDocsRuntime(&lark.Client{}, st, "feishu:cli_test", cfg, approver, access, newTestDocxAppendCipher(t), testDocxAppendExecutionOwner).Tools()
 	tool := findDocsTool(t, tools, createToolName)
 
 	access.err = NewResourceAuthorizationRequiredError(ResourceAccessRequirement{
@@ -1561,7 +1567,7 @@ func newDocsToolsForTest(t *testing.T, client *lark.Client, cfg Config, approver
 	}
 	acquireTestDocxAppendRuntimeLease(t, st, testDocxAppendExecutionOwner, time.Now().UTC())
 	access := grantedResourceAccessController("req_access")
-	return st, NewDocsTools(client, st, "feishu:cli_test", cfg, approver, access, newTestDocxAppendCipher(t), testDocxAppendExecutionOwner), access
+	return st, NewDocsRuntime(client, st, "feishu:cli_test", cfg, approver, access, newTestDocxAppendCipher(t), testDocxAppendExecutionOwner).Tools(), access
 }
 
 func seedDocsCreateApprovalWorkflow(t *testing.T, st *store.Store, requestID string) {
