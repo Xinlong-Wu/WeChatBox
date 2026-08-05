@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -31,10 +32,13 @@ func testLLMConfig() config.LLMConfig {
 
 type fakeSessions struct {
 	sess       *store.Session
+	targetSess *store.Session
+	sessionErr error
 	conv       *store.Conversation
 	saved      *store.Conversation
 	model      string
 	commandHit bool
+	saveErr    error
 }
 
 func (f *fakeSessions) GetOrCreateCurrentSession(userID string) (*store.Session, error) {
@@ -44,6 +48,16 @@ func (f *fakeSessions) GetOrCreateCurrentSession(userID string) (*store.Session,
 	return &store.Session{ID: "session", UserID: userID, Name: "default", Current: true}, nil
 }
 
+func (f *fakeSessions) GetSession(userID, sessionID string) (*store.Session, error) {
+	if f.sessionErr != nil {
+		return nil, f.sessionErr
+	}
+	if f.targetSess != nil {
+		return f.targetSess, nil
+	}
+	return &store.Session{ID: sessionID, UserID: userID, Name: "target"}, nil
+}
+
 func (f *fakeSessions) LoadHistory(userID, sessionID string) (*store.Conversation, error) {
 	if f.conv != nil {
 		return f.conv, nil
@@ -51,9 +65,14 @@ func (f *fakeSessions) LoadHistory(userID, sessionID string) (*store.Conversatio
 	return &store.Conversation{}, nil
 }
 
-func (f *fakeSessions) SaveHistory(userID, sessionID string, conv *store.Conversation) error {
+func (f *fakeSessions) SaveHistoryCAS(userID, sessionID string, expectedRevision int64, conv *store.Conversation) (int64, error) {
+	if f.saveErr != nil {
+		return 0, f.saveErr
+	}
+	conv.Revision = expectedRevision + 1
 	f.saved = conv
-	return nil
+	f.conv = conv
+	return conv.Revision, nil
 }
 
 func (f *fakeSessions) CurrentSession(userID string) (*store.Session, error) {
@@ -78,15 +97,15 @@ func (f *fakeSessions) ArchiveSession(userID, sessionName string) (*store.Archiv
 func (f *fakeSessions) ClearSession(userID string) (*store.Session, error) {
 	return &store.Session{ID: "cleared", UserID: userID, Name: "session-1", Current: true}, nil
 }
-func (f *fakeSessions) CurrentModel(userID string) (string, error) {
+func (f *fakeSessions) CurrentModel(userID, sessionID string) (string, error) {
 	if f.model != "" {
 		return f.model, nil
 	}
 	return "deepseek", nil
 }
-func (f *fakeSessions) SetModel(userID, modelName string) error { return nil }
-func (f *fakeSessions) DefaultModelName() string                { return "deepseek" }
-func (f *fakeSessions) ListModels() []string                    { return []string{"deepseek"} }
+func (f *fakeSessions) SetModel(userID, sessionID, modelName string) error { return nil }
+func (f *fakeSessions) DefaultModelName() string                           { return "deepseek" }
+func (f *fakeSessions) ListModels() []string                               { return []string{"deepseek"} }
 
 type fakeLLM struct {
 	called          bool
@@ -98,6 +117,50 @@ type fakeLLM struct {
 	streamErrs      []error
 	streamErr       error
 	systemPrompts   []string
+}
+
+type blockingLaneLLM struct {
+	entered chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	active  int
+	max     int
+	calls   int
+}
+
+func (b *blockingLaneLLM) PrepareUserMessage(content string, attachments []llm.InputAttachment) (store.Message, error) {
+	return store.Message{Role: "user", Content: content}, nil
+}
+
+func (b *blockingLaneLLM) Chat(systemPrompt string, messages []store.Message) (llm.Response, error) {
+	return b.ChatStream(systemPrompt, messages, nil)
+}
+
+func (b *blockingLaneLLM) ChatStream(systemPrompt string, messages []store.Message, onChunk func(chunk string) error) (llm.Response, error) {
+	b.mu.Lock()
+	b.active++
+	b.calls++
+	call := b.calls
+	if b.active > b.max {
+		b.max = b.active
+	}
+	b.mu.Unlock()
+	b.entered <- struct{}{}
+	<-b.release
+	b.mu.Lock()
+	b.active--
+	b.mu.Unlock()
+	return llm.Response{Text: "reply-" + strconv.Itoa(call)}, nil
+}
+
+func (b *blockingLaneLLM) AssistantMessage(resp llm.Response) (store.Message, error) {
+	return store.Message{Role: "assistant", Content: resp.Text}, nil
+}
+
+func (b *blockingLaneLLM) snapshot() (calls, maxActive int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.calls, b.max
 }
 
 func (f *fakeLLM) PrepareUserMessage(content string, attachments []llm.InputAttachment) (store.Message, error) {
@@ -209,11 +272,13 @@ func (f *fakeToolLLM) ChatStreamWithTools(systemPrompt string, messages []store.
 }
 
 type fakeTool struct {
-	spec   tooltypes.Spec
-	result string
-	err    string
-	block  bool
-	calls  []tooltypes.Call
+	spec              tooltypes.Spec
+	result            string
+	err               string
+	pendingWorkflowID string
+	block             bool
+	calls             []tooltypes.Call
+	executions        []tooltypes.ExecutionContext
 }
 
 func (f *fakeTool) Spec() tooltypes.Spec {
@@ -225,6 +290,8 @@ func (f *fakeTool) Spec() tooltypes.Spec {
 
 func (f *fakeTool) Execute(ctx context.Context, call tooltypes.Call) tooltypes.Result {
 	f.calls = append(f.calls, call)
+	execution, _ := tooltypes.ExecutionContextFromContext(ctx)
+	f.executions = append(f.executions, execution)
 	if f.block {
 		<-ctx.Done()
 		return tooltypes.Result{CallID: call.ID, Name: call.Name, Content: ctx.Err().Error(), IsError: true}
@@ -232,7 +299,39 @@ func (f *fakeTool) Execute(ctx context.Context, call tooltypes.Call) tooltypes.R
 	if f.err != "" {
 		return tooltypes.Result{CallID: call.ID, Name: call.Name, Content: f.err, IsError: true}
 	}
-	return tooltypes.Result{CallID: call.ID, Name: call.Name, Content: f.result}
+	return tooltypes.Result{CallID: call.ID, Name: call.Name, Content: f.result, PendingWorkflowID: f.pendingWorkflowID}
+}
+
+type workflowCommitCall struct {
+	requestID         string
+	accountID         string
+	committedRevision int64
+}
+
+type workflowCancelCall struct {
+	requestID string
+	accountID string
+	reason    string
+}
+
+type fakeWorkflowContinuationManager struct {
+	commits   []workflowCommitCall
+	cancels   []workflowCancelCall
+	commitErr error
+	cancelErr error
+}
+
+func (f *fakeWorkflowContinuationManager) CommitWorkflowContinuation(requestID, accountID string, committedRevision int64, now time.Time) (store.WorkflowContinuation, bool, error) {
+	f.commits = append(f.commits, workflowCommitCall{requestID: requestID, accountID: accountID, committedRevision: committedRevision})
+	if f.commitErr != nil {
+		return store.WorkflowContinuation{}, false, f.commitErr
+	}
+	return store.WorkflowContinuation{RequestID: requestID, AccountID: accountID, SessionID: "session", State: store.WorkflowContinuationStateWaiting}, false, nil
+}
+
+func (f *fakeWorkflowContinuationManager) CancelWorkflowContinuation(requestID, accountID, reason string, now time.Time) error {
+	f.cancels = append(f.cancels, workflowCancelCall{requestID: requestID, accountID: accountID, reason: reason})
+	return f.cancelErr
 }
 
 type cancelingTool struct {
@@ -656,6 +755,241 @@ func TestHandleTextRunsToolsAndSavesTrace(t *testing.T) {
 	}
 	if traces[0].Name != "fake_tool" || traces[0].Status != "ok" || !strings.Contains(traces[0].Arguments, "roadmap") {
 		t.Fatalf("trace = %#v, want ok fake_tool trace", traces[0])
+	}
+}
+
+func TestHandleTextBindsTrustedExecutionContextOutsideToolArguments(t *testing.T) {
+	sessions := &fakeSessions{
+		sess: &store.Session{ID: "sess_current", UserID: "trusted_user", Name: "default", Current: true},
+		conv: &store.Conversation{Revision: 7},
+	}
+	llmClient := &fakeToolLLM{
+		calls: []tooltypes.Call{{
+			ID:        "call_1",
+			Name:      "fake_tool",
+			Arguments: json.RawMessage(`{"account_id":"model_account","chat_id":"model_chat","session_id":"model_session","actor_open_id":"model_actor"}`),
+		}},
+		finalText: "done",
+	}
+	tool := &fakeTool{result: `{"ok":true}`}
+	bot := New(sessions, testLLMConfig())
+	bot.NewLLM = func(config.ResolvedModel) llm.Client { return llmClient }
+	ctx := tooltypes.WithExecutionContext(context.Background(), tooltypes.ExecutionContext{
+		Platform:        "untrusted_outer_platform",
+		AccountID:       "untrusted_outer_account",
+		UserKey:         "untrusted_outer_user",
+		SessionID:       "untrusted_outer_session",
+		ChatID:          "oc_trusted",
+		SourceMessageID: "om_trusted",
+		ActorOpenID:     "ou_trusted",
+		ActorUserID:     "u_trusted",
+		ChatIsGroup:     true,
+	})
+
+	err := bot.Handle(ctx, InboundMessage{
+		Platform:  "feishu",
+		AccountID: "feishu:cli_trusted",
+		UserKey:   "trusted_user",
+		LLMText:   "run tool",
+		Tools:     []tooltypes.Tool{tool},
+	}, &fakeSender{})
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if len(tool.executions) != 1 {
+		t.Fatalf("execution contexts = %#v, want one", tool.executions)
+	}
+	execution := tool.executions[0]
+	if execution.Platform != "feishu" || execution.AccountID != "feishu:cli_trusted" || execution.UserKey != "trusted_user" || execution.SessionID != "sess_current" {
+		t.Fatalf("runtime scope = %#v, want core-owned platform/account/user/session", execution)
+	}
+	if execution.ChatID != "oc_trusted" || execution.SourceMessageID != "om_trusted" || execution.ActorOpenID != "ou_trusted" || execution.ActorUserID != "u_trusted" || !execution.ChatIsGroup {
+		t.Fatalf("platform scope = %#v, want trusted Feishu chat and actor", execution)
+	}
+	if !strings.HasPrefix(execution.TurnID, "turn_") || execution.ToolCallID != "call_1" || execution.ToolName != "fake_tool" || execution.ConversationRevision != 7 {
+		t.Fatalf("call scope = %#v, want generated turn and runtime-bound call", execution)
+	}
+}
+
+func TestHandleCommitsPendingWorkflowAfterConversationCAS(t *testing.T) {
+	sessions := &fakeSessions{
+		sess: &store.Session{ID: "session", UserID: "user", Name: "default", Current: true},
+		conv: &store.Conversation{Revision: 7},
+	}
+	client := &fakeToolLLM{
+		calls:     []tooltypes.Call{{ID: "call_1", Name: "fake_tool", Arguments: json.RawMessage(`{}`)}},
+		finalText: "authorization pending",
+	}
+	tool := &fakeTool{result: `{"status":"pending"}`, pendingWorkflowID: "req_pending"}
+	workflows := &fakeWorkflowContinuationManager{}
+	bot := New(sessions, testLLMConfig())
+	bot.NewLLM = func(config.ResolvedModel) llm.Client { return client }
+	bot.Workflows = workflows
+
+	err := bot.Handle(context.Background(), InboundMessage{
+		Platform:  store.PlatformFeishu,
+		AccountID: "feishu:cli_test",
+		UserKey:   "user",
+		LLMText:   "request access",
+		Tools:     []tooltypes.Tool{tool},
+	}, &fakeSender{})
+	if err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if sessions.saved == nil || sessions.saved.Revision != 8 {
+		t.Fatalf("saved conversation = %#v, want revision 8", sessions.saved)
+	}
+	receipt, ok := sessions.saved.WorkflowOriginReceipts["req_pending"]
+	if !ok || receipt.ToolCallID != "call_1" || receipt.ToolName != "fake_tool" || receipt.CommittedRevision != 8 {
+		t.Fatalf("saved workflow origin receipt = %#v present=%t, want durable revision-8 proof", receipt, ok)
+	}
+	if len(workflows.commits) != 1 || workflows.commits[0] != (workflowCommitCall{
+		requestID:         "req_pending",
+		accountID:         "feishu:cli_test",
+		committedRevision: 8,
+	}) {
+		t.Fatalf("workflow commits = %#v", workflows.commits)
+	}
+	if len(workflows.cancels) != 0 {
+		t.Fatalf("workflow cancels = %#v, want none", workflows.cancels)
+	}
+}
+
+func TestHandleCancelsPendingWorkflowWhenConversationCASFails(t *testing.T) {
+	saveErr := errors.New("conversation save failed")
+	sessions := &fakeSessions{
+		sess:    &store.Session{ID: "session", UserID: "user", Name: "default", Current: true},
+		conv:    &store.Conversation{Revision: 4},
+		saveErr: saveErr,
+	}
+	client := &fakeToolLLM{
+		calls:     []tooltypes.Call{{ID: "call_1", Name: "fake_tool", Arguments: json.RawMessage(`{}`)}},
+		finalText: "authorization pending",
+	}
+	workflows := &fakeWorkflowContinuationManager{}
+	bot := New(sessions, testLLMConfig())
+	bot.NewLLM = func(config.ResolvedModel) llm.Client { return client }
+	bot.Workflows = workflows
+
+	err := bot.Handle(context.Background(), InboundMessage{
+		Platform:  store.PlatformFeishu,
+		AccountID: "feishu:cli_test",
+		UserKey:   "user",
+		LLMText:   "request access",
+		Tools:     []tooltypes.Tool{&fakeTool{result: `{"status":"pending"}`, pendingWorkflowID: "req_pending"}},
+	}, &fakeSender{})
+	if !errors.Is(err, saveErr) {
+		t.Fatalf("Handle error = %v, want conversation save error", err)
+	}
+	if len(workflows.commits) != 0 {
+		t.Fatalf("workflow commits = %#v, want none", workflows.commits)
+	}
+	if len(workflows.cancels) != 1 || workflows.cancels[0].requestID != "req_pending" || workflows.cancels[0].accountID != "feishu:cli_test" {
+		t.Fatalf("workflow cancels = %#v", workflows.cancels)
+	}
+}
+
+func TestHandleCancelsPendingWorkflowWhenToolLoopCannotFinish(t *testing.T) {
+	turnErr := errors.New("tool follow-up failed")
+	sessions := &fakeSessions{sess: &store.Session{ID: "session", UserID: "user", Name: "default", Current: true}}
+	client := &fakeToolLLM{
+		calls:    []tooltypes.Call{{ID: "call_1", Name: "fake_tool", Arguments: json.RawMessage(`{}`)}},
+		turnErrs: map[int]error{1: turnErr},
+	}
+	workflows := &fakeWorkflowContinuationManager{}
+	bot := New(sessions, testLLMConfig())
+	bot.NewLLM = func(config.ResolvedModel) llm.Client { return client }
+	bot.Workflows = workflows
+
+	err := bot.Handle(context.Background(), InboundMessage{
+		Platform:  store.PlatformFeishu,
+		AccountID: "feishu:cli_test",
+		UserKey:   "user",
+		LLMText:   "request access",
+		Tools:     []tooltypes.Tool{&fakeTool{result: `{"status":"pending"}`, pendingWorkflowID: "req_pending"}},
+	}, &fakeSender{})
+	if !errors.Is(err, turnErr) {
+		t.Fatalf("Handle error = %v, want tool follow-up error", err)
+	}
+	if len(workflows.commits) != 0 || len(workflows.cancels) != 1 || workflows.cancels[0].requestID != "req_pending" {
+		t.Fatalf("workflow commits=%#v cancels=%#v", workflows.commits, workflows.cancels)
+	}
+}
+
+func TestHandleLeavesSavedPendingWorkflowRecoverableWhenContinuationCommitFails(t *testing.T) {
+	commitErr := errors.New("continuation commit failed")
+	sessions := &fakeSessions{sess: &store.Session{ID: "session", UserID: "user", Name: "default", Current: true}}
+	client := &fakeToolLLM{
+		calls:     []tooltypes.Call{{ID: "call_1", Name: "fake_tool", Arguments: json.RawMessage(`{}`)}},
+		finalText: "authorization pending",
+	}
+	workflows := &fakeWorkflowContinuationManager{commitErr: commitErr}
+	bot := New(sessions, testLLMConfig())
+	bot.NewLLM = func(config.ResolvedModel) llm.Client { return client }
+	bot.Workflows = workflows
+
+	err := bot.Handle(context.Background(), InboundMessage{
+		Platform:  store.PlatformFeishu,
+		AccountID: "feishu:cli_test",
+		UserKey:   "user",
+		LLMText:   "request access",
+		Tools:     []tooltypes.Tool{&fakeTool{result: `{"status":"pending"}`, pendingWorkflowID: "req_pending"}},
+	}, &fakeSender{})
+	if !errors.Is(err, commitErr) {
+		t.Fatalf("Handle error = %v, want continuation commit error", err)
+	}
+	if len(workflows.commits) != 1 || len(workflows.cancels) != 0 {
+		t.Fatalf("workflow commits=%#v cancels=%#v", workflows.commits, workflows.cancels)
+	}
+}
+
+func TestHandleSerializesTurnsForSameSession(t *testing.T) {
+	sessions := &fakeSessions{sess: &store.Session{ID: "session", UserID: "user", Name: "default", Current: true}}
+	client := &blockingLaneLLM{
+		entered: make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	bot := New(sessions, testLLMConfig())
+	bot.NewLLM = func(config.ResolvedModel) llm.Client { return client }
+	errs := make(chan error, 2)
+	go func() {
+		errs <- bot.Handle(context.Background(), InboundMessage{Platform: "feishu", AccountID: "feishu:cli", UserKey: "user", LLMText: "first"}, &fakeSender{})
+	}()
+	select {
+	case <-client.entered:
+	case <-time.After(time.Second):
+		close(client.release)
+		t.Fatal("first turn did not enter LLM")
+	}
+	go func() {
+		errs <- bot.Handle(context.Background(), InboundMessage{Platform: "feishu", AccountID: "feishu:cli", UserKey: "user", LLMText: "second"}, &fakeSender{})
+	}()
+	enteredConcurrently := false
+	select {
+	case <-client.entered:
+		enteredConcurrently = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(client.release)
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatalf("Handle returned error: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for serialized turns")
+		}
+	}
+	if enteredConcurrently {
+		t.Fatal("second turn entered the LLM before the first session turn completed")
+	}
+	calls, maxActive := client.snapshot()
+	if calls != 2 || maxActive != 1 {
+		t.Fatalf("LLM concurrency = calls:%d max_active:%d, want 2/1", calls, maxActive)
+	}
+	if sessions.saved == nil || sessions.saved.Revision != 2 || len(sessions.saved.Messages) != 4 {
+		t.Fatalf("saved conversation = %#v, want two serialized turns at revision 2", sessions.saved)
 	}
 }
 

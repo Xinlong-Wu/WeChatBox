@@ -42,6 +42,11 @@ func (m *Manager) GetOrCreateCurrentSession(userID string) (*store.Session, erro
 	return m.store.GetCurrentSession(userID)
 }
 
+// GetSession returns one active session by durable ID.
+func (m *Manager) GetSession(userID, sessionID string) (*store.Session, error) {
+	return m.store.GetSession(userID, sessionID)
+}
+
 // CurrentSession returns the current session for command display.
 func (m *Manager) CurrentSession(userID string) (*store.Session, error) {
 	return m.GetOrCreateCurrentSession(userID)
@@ -52,9 +57,9 @@ func (m *Manager) LoadHistory(userID, sessionID string) (*store.Conversation, er
 	return m.store.LoadConversation(userID, sessionID)
 }
 
-// SaveHistory saves a conversation snapshot for a session.
-func (m *Manager) SaveHistory(userID, sessionID string, conv *store.Conversation) error {
-	return m.store.SaveConversation(userID, sessionID, conv)
+// SaveHistoryCAS saves a conversation snapshot if its expected revision is current.
+func (m *Manager) SaveHistoryCAS(userID, sessionID string, expectedRevision int64, conv *store.Conversation) (int64, error) {
+	return m.store.SaveConversationCAS(userID, sessionID, expectedRevision, conv)
 }
 
 // CreateSession creates a new session for a user and sets it as current.
@@ -119,9 +124,9 @@ func (m *Manager) ClearSession(userID string) (*store.Session, error) {
 	return m.store.ClearCurrentSession(userID, generatedSessionName())
 }
 
-// CurrentModel returns the current model profile for a user, falling back to default.
-func (m *Manager) CurrentModel(userID string) (string, error) {
-	modelName, err := m.store.GetUserModelName(userID)
+// CurrentModel returns the model profile for a session, falling back to default.
+func (m *Manager) CurrentModel(userID, sessionID string) (string, error) {
+	modelName, err := m.store.GetSessionModelName(userID, sessionID)
 	if err != nil {
 		return "", err
 	}
@@ -131,12 +136,12 @@ func (m *Manager) CurrentModel(userID string) (string, error) {
 	return m.defaultModel, nil
 }
 
-// SetModel saves a model profile preference for a user.
-func (m *Manager) SetModel(userID, modelName string) error {
+// SetModel saves a model profile preference for one session.
+func (m *Manager) SetModel(userID, sessionID, modelName string) error {
 	if !m.HasModel(modelName) {
 		return fmt.Errorf("%w: %q", ErrModelNotFound, modelName)
 	}
-	return m.store.SetUserModelName(userID, modelName)
+	return m.store.SetSessionModelName(userID, sessionID, modelName)
 }
 
 // DefaultModelName returns the configured default model profile.

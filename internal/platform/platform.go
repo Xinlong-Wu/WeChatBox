@@ -82,14 +82,35 @@ type policyHandler struct {
 	policy commands.Policy
 }
 
+type policyWorkflowHandler struct {
+	policyHandler
+	resumer core.WorkflowResumer
+}
+
 func (p policyPlatform) Run(ctx context.Context, handler core.Handler) error {
-	return p.inner.Run(ctx, policyHandler{next: handler, policy: p.policy})
+	return p.inner.Run(ctx, wrapPolicyHandler(handler, p.policy))
 }
 
 func (h policyHandler) Handle(ctx context.Context, msg core.InboundMessage, sender core.Sender) error {
 	msg.CommandPolicy = h.policy
 	return h.next.Handle(ctx, msg, sender)
 }
+
+func (h policyWorkflowHandler) ResumeWorkflow(ctx context.Context, request core.WorkflowResumeRequest, sender core.Sender) error {
+	return h.resumer.ResumeWorkflow(ctx, request, sender)
+}
+
+func wrapPolicyHandler(next core.Handler, policy commands.Policy) core.Handler {
+	wrapped := policyHandler{next: next, policy: policy}
+	if resumer, ok := next.(core.WorkflowResumer); ok {
+		return policyWorkflowHandler{policyHandler: wrapped, resumer: resumer}
+	}
+	return wrapped
+}
+
+var _ core.Handler = policyHandler{}
+var _ core.Handler = policyWorkflowHandler{}
+var _ core.WorkflowResumer = policyWorkflowHandler{}
 
 func NewRegistry() *Registry {
 	return &Registry{

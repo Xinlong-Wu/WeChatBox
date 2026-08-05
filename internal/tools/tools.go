@@ -26,6 +26,9 @@ type Result struct {
 	Name    string
 	Content string
 	IsError bool
+	// PendingWorkflowID is runtime-only coordination metadata. Providers and
+	// models receive Content, never this trusted workflow identifier.
+	PendingWorkflowID string
 }
 
 // Options controls generic tool loop execution limits.

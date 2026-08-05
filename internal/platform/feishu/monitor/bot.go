@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"lingobridge/internal/core"
-	feishutools "lingobridge/internal/platform/feishu/tools"
 	"lingobridge/internal/store"
 	tooltypes "lingobridge/internal/tools"
 
@@ -31,9 +30,12 @@ type bot struct {
 	account       store.Account
 	botOpenID     string
 	eventCommands map[string][]string
+	approvals     *operationApprovalService
+	cards         CardService
 	deduper       *eventDeduper
 	runCtx        context.Context
 	reactionDelay time.Duration
+	tasks         backgroundTaskGroup
 }
 
 type feishuResponder struct {
@@ -120,6 +122,21 @@ func (b *bot) handleMessage(ctx context.Context, event *larkim.P2MessageReceiveV
 		feishuLog.Debug(ctx, "feishu group message ignored because it does not mention the bot chat=%s message=%s event=%s", in.ChatID, in.MessageID, feishuEventID(event))
 		return nil
 	}
+	if b.processingContext().Err() != nil {
+		feishuLog.Debug(ctx, "feishu message ignored because the runtime is shutting down chat=%s message=%s event=%s", in.ChatID, in.MessageID, feishuEventID(event))
+		return nil
+	}
+	releaseTask, accepted := b.tasks.Reserve()
+	if !accepted {
+		feishuLog.Debug(ctx, "feishu message ignored because message admission is closed chat=%s message=%s event=%s", in.ChatID, in.MessageID, feishuEventID(event))
+		return nil
+	}
+	taskHandedOff := false
+	defer func() {
+		if !taskHandedOff {
+			releaseTask()
+		}
+	}()
 	dedupeKey := feishuDedupeKey(event)
 	if dedupeKey == "" {
 		feishuLog.Warn(ctx, "feishu message missing dedupe key; processing without dedupe")
@@ -128,7 +145,11 @@ func (b *bot) handleMessage(ctx context.Context, event *larkim.P2MessageReceiveV
 		return nil
 	}
 
-	go b.processMessage(in)
+	taskHandedOff = true
+	go func() {
+		defer releaseTask()
+		b.processMessage(in)
+	}()
 	return nil
 }
 
@@ -155,14 +176,15 @@ func logReceivedMessage(ctx context.Context, event *larkim.P2MessageReceiveV1) {
 }
 
 func (b *bot) processMessage(in incomingMessage) {
-	ctx := feishutools.WithActor(b.processingContext(), feishutools.Actor{
-		OpenID: in.SenderOpenID,
-		UserID: in.SenderUserID,
-	})
-	ctx = feishutools.WithChatContext(ctx, feishutools.ChatContext{
-		ChatID:    in.ChatID,
-		MessageID: in.MessageID,
-		IsGroup:   in.IsGroup,
+	ctx := tooltypes.WithExecutionContext(b.processingContext(), tooltypes.ExecutionContext{
+		Platform:        store.PlatformFeishu,
+		AccountID:       b.account.ID,
+		UserKey:         in.UserID,
+		ChatID:          in.ChatID,
+		SourceMessageID: in.MessageID,
+		ActorOpenID:     in.SenderOpenID,
+		ActorUserID:     in.SenderUserID,
+		ChatIsGroup:     in.IsGroup,
 	})
 	resp := feishuResponder{sender: b.sender, chatID: in.ChatID, messageID: in.MessageID, replyToMessageID: in.ReplyToMessageID, mentions: in.Mentions}
 	if in.Unsupported {

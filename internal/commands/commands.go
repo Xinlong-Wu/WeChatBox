@@ -18,8 +18,8 @@ type SessionManager interface {
 	RenameCurrentSession(userID, newName string) (*store.Session, error)
 	ArchiveSession(userID, sessionName string) (*store.ArchiveResult, error)
 	ClearSession(userID string) (*store.Session, error)
-	CurrentModel(userID string) (string, error)
-	SetModel(userID, modelName string) error
+	CurrentModel(userID, sessionID string) (string, error)
+	SetModel(userID, sessionID, modelName string) error
 	DefaultModelName() string
 	ListModels() []string
 }
@@ -229,7 +229,7 @@ func handleCurrent(userID string, sm SessionManager) (string, bool, error) {
 	if err != nil {
 		return "", true, fmt.Errorf("current session: %w", err)
 	}
-	modelName, err := sm.CurrentModel(userID)
+	modelName, err := sm.CurrentModel(userID, sess.ID)
 	if err != nil {
 		return "", true, fmt.Errorf("current model: %w", err)
 	}
@@ -334,8 +334,12 @@ func handleClear(userID string, args []string, sm SessionManager) (string, bool,
 }
 
 func handleModel(userID string, args []string, sm SessionManager) (string, bool, error) {
+	sess, err := sm.CurrentSession(userID)
+	if err != nil {
+		return "", true, fmt.Errorf("current session: %w", err)
+	}
 	if len(args) == 0 {
-		current, err := sm.CurrentModel(userID)
+		current, err := sm.CurrentModel(userID, sess.ID)
 		if err != nil {
 			return "", true, fmt.Errorf("current model: %w", err)
 		}
@@ -343,7 +347,7 @@ func handleModel(userID string, args []string, sm SessionManager) (string, bool,
 	}
 
 	modelName := args[0]
-	if err := sm.SetModel(userID, modelName); err != nil {
+	if err := sm.SetModel(userID, sess.ID, modelName); err != nil {
 		if errors.Is(err, session.ErrModelNotFound) {
 			return fmt.Sprintf("❌ 模型 %q 不存在。可用模型：%s", modelName, strings.Join(sm.ListModels(), ", ")), true, nil
 		}

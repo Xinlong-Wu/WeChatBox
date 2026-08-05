@@ -41,6 +41,8 @@ type fakeProcessor struct {
 	actorOK     bool
 	chat        feishutools.ChatContext
 	chatOK      bool
+	execution   tooltypes.ExecutionContext
+	executionOK bool
 	tools       int
 	called      bool
 	calls       int
@@ -60,6 +62,8 @@ type fakeProcessorSnapshot struct {
 	actorOK     bool
 	chat        feishutools.ChatContext
 	chatOK      bool
+	execution   tooltypes.ExecutionContext
+	executionOK bool
 	tools       int
 	called      bool
 	calls       int
@@ -68,6 +72,7 @@ type fakeProcessorSnapshot struct {
 func (f *fakeProcessor) Handle(ctx context.Context, msg core.InboundMessage, sender core.Sender) error {
 	actor, actorOK := feishutools.ActorFromContext(ctx)
 	chat, chatOK := feishutools.ChatContextFromContext(ctx)
+	execution, executionOK := tooltypes.ExecutionContextFromContext(ctx)
 	f.mu.Lock()
 	f.called = true
 	f.platform = msg.Platform
@@ -81,6 +86,8 @@ func (f *fakeProcessor) Handle(ctx context.Context, msg core.InboundMessage, sen
 	f.actorOK = actorOK
 	f.chat = chat
 	f.chatOK = chatOK
+	f.execution = execution
+	f.executionOK = executionOK
 	f.tools = len(msg.Tools)
 	f.calls++
 	started := f.started
@@ -111,6 +118,36 @@ func (fakeCoreTool) Spec() tooltypes.Spec {
 
 func (fakeCoreTool) Execute(ctx context.Context, call tooltypes.Call) tooltypes.Result {
 	return tooltypes.Result{CallID: call.ID, Name: call.Name, Content: "ok"}
+}
+
+type fakeToolApprovalRequester struct{}
+
+func (fakeToolApprovalRequester) CheckOrRequest(context.Context, feishutools.OperationApprovalRequest) (feishutools.OperationApprovalResult, error) {
+	return feishutools.OperationApprovalResult{Status: feishutools.OperationApprovalStatusPending, RequestID: "req_approval"}, nil
+}
+
+type fakeResourceAccessController struct{}
+
+func (fakeResourceAccessController) RequestAccess(context.Context, feishutools.ResourceAccessRequest) (feishutools.ResourceAccessResult, error) {
+	return feishutools.ResourceAccessResult{RequestID: "req_access", Status: feishutools.ResourceAccessStatusGranted}, nil
+}
+
+func (fakeResourceAccessController) Require(ctx context.Context, requirement feishutools.ResourceAccessRequirement) (feishutools.AuthorizedResource, error) {
+	actor, _ := feishutools.ActorFromContext(ctx)
+	chat, _ := feishutools.ChatContextFromContext(ctx)
+	return feishutools.AuthorizedResource{
+		AccountID:             "feishu:cli_test",
+		ActorOpenID:           actor.OpenID,
+		ActorUserID:           actor.UserID,
+		ChatID:                chat.ChatID,
+		ResourceType:          requirement.ResourceType,
+		ResourceToken:         requirement.ResourceToken,
+		EffectivePermission:   requirement.Permission,
+		GrantMode:             feishutools.ResourceAccessGrantModeAll,
+		CapabilitySubjectType: "bot",
+		CapabilitySubjectID:   "ou_bot",
+		Source:                feishutools.ResourceAccessSourceExistingGrant,
+	}, nil
 }
 
 type sentText struct {
@@ -153,6 +190,22 @@ type fakeSender struct {
 	addReactionErr    error
 	deleteReactionErr error
 	updateTextErr     error
+}
+
+type blockingSendTextSender struct {
+	*fakeSender
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingSendTextSender) SendText(ctx context.Context, chatID, text string) error {
+	close(s.started)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.release:
+		return s.fakeSender.SendText(ctx, chatID, text)
+	}
 }
 
 type fakeSenderSnapshot struct {
@@ -284,6 +337,8 @@ func (f *fakeProcessor) snapshot() fakeProcessorSnapshot {
 		actorOK:     f.actorOK,
 		chat:        f.chat,
 		chatOK:      f.chatOK,
+		execution:   f.execution,
+		executionOK: f.executionOK,
 		tools:       f.tools,
 		called:      f.called,
 		calls:       f.calls,
@@ -402,7 +457,24 @@ func waitForReactionDeletes(t *testing.T, sender *fakeSender, want int) fakeSend
 	}
 }
 
-func captureMonitorLogs(t *testing.T) *bytes.Buffer {
+type synchronizedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *synchronizedBuffer) Write(value []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(value)
+}
+
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func captureMonitorLogs(t *testing.T) *synchronizedBuffer {
 	t.Helper()
 	base := logging.Shared()
 	originalWriter := base.Writer()
@@ -416,11 +488,11 @@ func captureMonitorLogs(t *testing.T) *bytes.Buffer {
 		logging.SetLevel(originalLevel)
 	})
 
-	var buf bytes.Buffer
-	base.SetOutput(&buf)
+	buf := &synchronizedBuffer{}
+	base.SetOutput(buf)
 	base.SetFlags(0)
 	base.SetPrefix("")
-	return &buf
+	return buf
 }
 
 func TestNormalizeP2PTextMessage(t *testing.T) {
@@ -911,7 +983,13 @@ func TestHandleTextMessageUsesBridgeAndReplies(t *testing.T) {
 func TestHandleGroupTextMessageRepliesToOriginal(t *testing.T) {
 	processor := &fakeProcessor{}
 	sender := &fakeSender{}
-	b := &bot{handler: processor, sender: sender, botOpenID: testBotOpenID, tools: []tooltypes.Tool{fakeCoreTool{}}}
+	b := &bot{
+		handler:   processor,
+		sender:    sender,
+		botOpenID: testBotOpenID,
+		account:   store.Account{ID: "feishu:cli_test", Name: "admin-bot"},
+		tools:     []tooltypes.Tool{fakeCoreTool{}},
+	}
 	mentions := []*larkim.MentionEvent{
 		feishuMentionWithName("@_bot_1", "bot", testBotOpenID, "", "LingoBridge"),
 	}
@@ -936,6 +1014,9 @@ func TestHandleGroupTextMessageRepliesToOriginal(t *testing.T) {
 	if !processorSnap.chatOK || processorSnap.chat.ChatID != "oc_chat" || processorSnap.chat.MessageID != "om_message" || !processorSnap.chat.IsGroup {
 		t.Fatalf("processor chat = %#v ok=%v, want current group chat", processorSnap.chat, processorSnap.chatOK)
 	}
+	if !processorSnap.executionOK || processorSnap.execution.Platform != store.PlatformFeishu || processorSnap.execution.AccountID != "feishu:cli_test" || processorSnap.execution.UserKey != "feishu:group:oc_chat" {
+		t.Fatalf("processor execution context = %#v ok=%v, want trusted runtime scope", processorSnap.execution, processorSnap.executionOK)
+	}
 	if len(senderSnap.replyCreates) != 1 || senderSnap.replyCreates[0].messageID != "om_message" || senderSnap.replyCreates[0].text != "ok" {
 		t.Fatalf("reply creates = %#v, want ok reply to om_message", senderSnap.replyCreates)
 	}
@@ -944,11 +1025,36 @@ func TestHandleGroupTextMessageRepliesToOriginal(t *testing.T) {
 	}
 }
 
-func TestNewFeishuToolsRegistersEnabledChatHistory(t *testing.T) {
+func TestNewFeishuToolRuntimeRegistersEnabledChatHistory(t *testing.T) {
 	cfg := feishutools.Config{ChatHistory: feishutools.ChatHistoryConfig{Enabled: true}}
-	names := toolNames(newFeishuTools(&lark.Client{}, cfg))
+	names := toolNames(newFeishuToolRuntime(&lark.Client{}, nil, "", cfg, nil, nil, nil, "").Tools())
 	if len(names) != 1 || names[0] != "feishu_chat_history_get" {
 		t.Fatalf("tool names = %#v, want chat history", names)
+	}
+}
+
+func TestNewFeishuToolRuntimeRegistersApprovalGatedDocumentWrites(t *testing.T) {
+	st := openFeishuApprovalTestStore(t)
+	cfg := feishutools.Config{
+		Docs: feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true},
+	}
+	withoutApproval := toolNames(newFeishuToolRuntime(&lark.Client{}, st, "feishu:cli_test", cfg, nil, nil, nil, "runtime_test").Tools())
+	withoutApprovalNames := strings.Join(withoutApproval, ",")
+	if strings.Contains(withoutApprovalNames, "feishu_docs_create") || strings.Contains(withoutApprovalNames, "feishu_docs_append") {
+		t.Fatalf("tools without approval workflow = %#v, document writes must fail closed", withoutApproval)
+	}
+	appendCipher, err := feishutools.NewDocxAppendEnvelopeCipher("test-app-secret", "feishu:cli_test")
+	if err != nil {
+		t.Fatalf("NewDocxAppendEnvelopeCipher returned error: %v", err)
+	}
+	withoutExecutionOwner := toolNames(newFeishuToolRuntime(&lark.Client{}, st, "feishu:cli_test", cfg, fakeToolApprovalRequester{}, fakeResourceAccessController{}, appendCipher, "").Tools())
+	withoutExecutionOwnerNames := strings.Join(withoutExecutionOwner, ",")
+	if strings.Contains(withoutExecutionOwnerNames, "feishu_docs_create") || strings.Contains(withoutExecutionOwnerNames, "feishu_docs_append") {
+		t.Fatalf("tools without append execution owner = %#v, document writes must fail closed", withoutExecutionOwner)
+	}
+	withApproval := toolNames(newFeishuToolRuntime(&lark.Client{}, st, "feishu:cli_test", cfg, fakeToolApprovalRequester{}, fakeResourceAccessController{}, appendCipher, "runtime_test").Tools())
+	if got, want := strings.Join(withApproval, ","), "feishu_docs_request_access,feishu_docs_search,feishu_docs_read,feishu_docs_create,feishu_docs_append,feishu_docs_folder_create,feishu_docs_folder_list"; got != want {
+		t.Fatalf("tools with approval workflow = %q, want %q", got, want)
 	}
 }
 
@@ -1670,6 +1776,66 @@ func TestConfigureP2PChatCreatedSendsCommandOutput(t *testing.T) {
 	}
 }
 
+func TestFeishuRuntimeShutdownWaitsForInFlightCustomEvent(t *testing.T) {
+	runtimeCtx, cancelRuntime := context.WithCancel(context.Background())
+	sender := &blockingSendTextSender{
+		fakeSender: &fakeSender{},
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	b := &bot{
+		sender: sender,
+		eventCommands: map[string][]string{
+			"p2p_chat_create": {"printf 'hello'"},
+		},
+		runCtx: runtimeCtx,
+	}
+	eventDone := make(chan error, 1)
+	go func() {
+		eventDone <- b.handleCustomizedEvent(context.Background(), "p2p_chat_create", &larkevent.EventReq{
+			Body: []byte(`{"event":{"chat_id":"oc_chat"}}`),
+		})
+	}()
+	select {
+	case <-sender.started:
+	case <-time.After(time.Second):
+		t.Fatal("custom event did not reach its outbound send")
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		shutdownFeishuRuntime(
+			cancelRuntime,
+			nil,
+			nil,
+			b,
+			nil,
+			nil,
+		)
+		close(shutdownDone)
+	}()
+	select {
+	case <-shutdownDone:
+		close(sender.release)
+		t.Fatal("runtime shutdown completed while an admitted custom event was still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(sender.release)
+	select {
+	case err := <-eventDone:
+		if err != nil {
+			t.Fatalf("handleCustomizedEvent returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("custom event did not finish after release")
+	}
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("runtime shutdown did not finish after the custom event returned")
+	}
+}
+
 func TestConfigureBotP2PChatEnteredV2SendsCommandOutput(t *testing.T) {
 	sender := &fakeSender{}
 	b := &bot{handler: &fakeProcessor{}, sender: sender, eventCommands: map[string][]string{}}
@@ -1906,7 +2072,7 @@ func TestPlatformRunFailsWhenBotOpenIDMissing(t *testing.T) {
 		CredentialsJSON: `{}`,
 	}
 
-	err := NewPlatform(acc, feishu.Config{
+	err := NewPlatform(nil, acc, feishu.Config{
 		Accounts: map[string]feishu.AccountConfig{
 			"fsbot": {AppID: "cli_xxx", AppSecret: "secret", BaseURL: server.URL},
 		},
@@ -1924,7 +2090,7 @@ func TestPlatformRunRequiresAccountCredentials(t *testing.T) {
 		CredentialsJSON: `{}`,
 	}
 
-	err := NewPlatform(acc, feishu.Config{
+	err := NewPlatform(nil, acc, feishu.Config{
 		Accounts: map[string]feishu.AccountConfig{
 			"fsbot": {},
 		},
@@ -1942,9 +2108,67 @@ func TestPlatformRunRequiresConfiguredAccount(t *testing.T) {
 		CredentialsJSON: `{}`,
 	}
 
-	err := NewPlatform(acc, feishu.Config{}, logging.Info).Run(context.Background(), &fakeProcessor{})
+	err := NewPlatform(nil, acc, feishu.Config{}, logging.Info).Run(context.Background(), &fakeProcessor{})
 	if err == nil || !strings.Contains(err.Error(), "platforms.feishu.accounts.fsbot is required") {
 		t.Fatalf("Run error = %v, want missing account config error", err)
+	}
+}
+
+func TestPlatformRunRequiresStoreForDocumentResources(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/v3/token", "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "ok",
+				"tenant_access_token": "tenant-token",
+				"expire":              7200,
+			})
+		case "/open-apis/bot/v3/info":
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"bot":  map[string]any{"open_id": "ou_bot"},
+			})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	acc := store.Account{ID: "feishu:cli_xxx", Name: "fsbot", Platform: store.PlatformFeishu}
+	err := NewPlatform(nil, acc, feishu.Config{
+		Accounts: map[string]feishu.AccountConfig{
+			"fsbot": {AppID: "cli_xxx", AppSecret: "secret", BaseURL: server.URL},
+		},
+		Tools: feishutools.Config{
+			Docs: feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true},
+		},
+	}, logging.Info).Run(context.Background(), &fakeWorkflowResumeHandler{
+		fakeProcessor:       &fakeProcessor{},
+		fakeWorkflowResumer: &fakeWorkflowResumer{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "Docs tools require a Feishu store") {
+		t.Fatalf("Run error = %v, want missing Feishu runtime store", err)
+	}
+}
+
+func TestPlatformRunRequiresWorkflowResumerBeforeDocsStartup(t *testing.T) {
+	acc := store.Account{ID: "feishu:cli_xxx", Name: "fsbot", Platform: store.PlatformFeishu}
+	err := NewPlatform(nil, acc, feishu.Config{
+		Accounts: map[string]feishu.AccountConfig{
+			"fsbot": {
+				AppID:     "cli_xxx",
+				AppSecret: "secret",
+				BaseURL:   "http://127.0.0.1:1",
+			},
+		},
+		Tools: feishutools.Config{
+			Docs: feishutools.DocsToolsConfig{Enabled: true, AllowWrite: true},
+		},
+	}, logging.Info).Run(t.Context(), &fakeProcessor{})
+	if err == nil || !strings.Contains(err.Error(), "Docs workflows require handler workflow resumption") {
+		t.Fatalf("Run error = %v, want workflow-resumption requirement before Docs startup", err)
 	}
 }
 
@@ -1981,9 +2205,12 @@ func TestSDKLevelLoggerFiltersBeforeSharedLogger(t *testing.T) {
 	next = &fakeSDKLogger{}
 	logger = newSDKLevelLogger(larkcore.LogLevelDebug, next)
 	logger.Debug(context.Background(), "visible")
+	logger.Debug(context.Background(), "receive message, payload: {sensitive}")
+	logger.Debug(context.Background(), "event request: header:map[],body:{sensitive}")
+	logger.Debug(context.Background(), "card request: header:map[],body:{sensitive}")
 
 	if next.debugs != 1 {
-		t.Fatalf("debug sdk logger debug count = %d, want 1", next.debugs)
+		t.Fatalf("debug sdk logger debug count = %d, want one non-payload message", next.debugs)
 	}
 }
 
@@ -1992,7 +2219,7 @@ func TestRunClientClosesOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- runClient(ctx, client)
+		done <- runClient(ctx, client, nil)
 	}()
 
 	cancel()

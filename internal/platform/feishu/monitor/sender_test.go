@@ -161,6 +161,118 @@ func TestSDKSenderCreatesTextAndReturnsMessageID(t *testing.T) {
 	}
 }
 
+func TestSDKSenderCreatesTextWithIdempotencyUUID(t *testing.T) {
+	var messageRequest struct {
+		ReceiveID string `json:"receive_id"`
+		MsgType   string `json:"msg_type"`
+		Content   string `json:"content"`
+		UUID      string `json:"uuid"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/v3/token", "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "ok",
+				"tenant_access_token": "tenant-token",
+				"expire":              7200,
+			})
+		case "/open-apis/im/v1/messages":
+			if err := json.NewDecoder(r.Body).Decode(&messageRequest); err != nil {
+				t.Fatalf("decode message request: %v", err)
+			}
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{"message_id": "om_resume"},
+			})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	sender := &sdkSender{client: client}
+	uuid := "75540b86-28aa-4a80-a257-9ce76a69fef4"
+	messageID, err := sender.CreateTextWithUUID(t.Context(), "oc_chat", "resumed", uuid)
+	if err != nil {
+		t.Fatalf("CreateTextWithUUID returned error: %v", err)
+	}
+	if messageID != "om_resume" || messageRequest.ReceiveID != "oc_chat" || messageRequest.UUID != uuid {
+		t.Fatalf("messageID/request = %q/%#v", messageID, messageRequest)
+	}
+}
+
+func TestSDKSenderCreatesInteractiveCardAndReturnsMessageID(t *testing.T) {
+	var messageRequest struct {
+		ReceiveID string `json:"receive_id"`
+		MsgType   string `json:"msg_type"`
+		Content   string `json:"content"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/v3/token", "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "ok",
+				"tenant_access_token": "tenant-token",
+				"expire":              7200,
+			})
+		case "/open-apis/im/v1/messages":
+			if r.URL.Query().Get("receive_id_type") != "chat_id" {
+				t.Fatalf("receive_id_type = %q, want chat_id", r.URL.Query().Get("receive_id_type"))
+			}
+			if err := json.NewDecoder(r.Body).Decode(&messageRequest); err != nil {
+				t.Fatalf("decode message request: %v", err)
+			}
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{"message_id": "om_card"},
+			})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	sender := &sdkSender{client: client}
+	card := `{"schema":"2.0","body":{"elements":[]}}`
+	messageID, err := sender.CreateCard(t.Context(), "oc_chat", card)
+	if err != nil {
+		t.Fatalf("CreateCard returned error: %v", err)
+	}
+	if messageID != "om_card" {
+		t.Fatalf("messageID = %q, want om_card", messageID)
+	}
+	if messageRequest.ReceiveID != "oc_chat" || messageRequest.MsgType != "interactive" || messageRequest.Content != card {
+		t.Fatalf("message request = %#v, want interactive card", messageRequest)
+	}
+}
+
+func TestSDKSenderRejectsInvalidInteractiveCard(t *testing.T) {
+	sender := &sdkSender{}
+	if _, err := sender.CreateCard(t.Context(), "oc_chat", "not-json"); err == nil {
+		t.Fatal("CreateCard returned nil error for invalid JSON")
+	}
+	if _, err := sender.CreateCard(t.Context(), "oc_chat", "[]"); err == nil {
+		t.Fatal("CreateCard returned nil error for a non-object card")
+	}
+	if err := sender.UpdateCard(t.Context(), "om_card", ""); err == nil {
+		t.Fatal("UpdateCard returned nil error for empty JSON")
+	}
+}
+
 func TestSDKSenderCreatesReplyTextAndReturnsMessageID(t *testing.T) {
 	var replyRequest struct {
 		MsgType       string `json:"msg_type"`
@@ -323,6 +435,95 @@ func TestSDKSenderUpdatesPostRichTextMessage(t *testing.T) {
 		t.Fatalf("unmarshal update content: %v", err)
 	}
 	assertMarkdownContent(t, content, "hello\nworld")
+}
+
+func TestSDKSenderUpdatesInteractiveCard(t *testing.T) {
+	var updateRequest struct {
+		Content string `json:"content"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/v3/token", "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "ok",
+				"tenant_access_token": "tenant-token",
+				"expire":              7200,
+			})
+		case "/open-apis/im/v1/messages/om_card":
+			if r.Method != http.MethodPatch {
+				t.Fatalf("method = %s, want PATCH", r.Method)
+			}
+			if err := json.NewDecoder(r.Body).Decode(&updateRequest); err != nil {
+				t.Fatalf("decode update request: %v", err)
+			}
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "ok",
+				"data": map[string]any{"message_id": "om_card"},
+			})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	sender := &sdkSender{client: client}
+	card := `{"schema":"2.0","body":{"elements":[]}}`
+	if err := sender.UpdateCard(t.Context(), "om_card", card); err != nil {
+		t.Fatalf("UpdateCard returned error: %v", err)
+	}
+	if updateRequest.Content != card {
+		t.Fatalf("update request = %#v, want message-card content", updateRequest)
+	}
+}
+
+func TestSDKSenderDelayUpdatesInteractiveCardAfterCallback(t *testing.T) {
+	var updateRequest struct {
+		Token string                 `json:"token"`
+		Card  map[string]interface{} `json:"card"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/v3/token", "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "ok",
+				"tenant_access_token": "tenant-token",
+				"expire":              7200,
+			})
+		case "/open-apis/interactive/v1/card/update":
+			if r.Method != http.MethodPost {
+				t.Fatalf("method = %s, want POST", r.Method)
+			}
+			if err := json.NewDecoder(r.Body).Decode(&updateRequest); err != nil {
+				t.Fatalf("decode delayed card update request: %v", err)
+			}
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "ok"})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := lark.NewClient("cli_xxx", "secret",
+		lark.WithOpenBaseUrl(server.URL),
+		lark.WithOAuthBaseUrl(server.URL),
+		lark.WithHttpClient(server.Client()),
+	)
+	sender := &sdkSender{client: client}
+	card := `{"schema":"2.0","config":{"update_multi":true},"body":{"elements":[]}}`
+	if err := sender.UpdateCardAfterInteraction(t.Context(), "c_callback", card); err != nil {
+		t.Fatalf("UpdateCardAfterInteraction returned error: %v", err)
+	}
+	if updateRequest.Token != "c_callback" || updateRequest.Card["schema"] != "2.0" {
+		t.Fatalf("delayed update request = %#v, want callback token and raw Card V2 object", updateRequest)
+	}
 }
 
 func TestSDKSenderUpdateTextRecognizesEditLimit(t *testing.T) {

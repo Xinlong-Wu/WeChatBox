@@ -59,6 +59,7 @@ type Session struct {
 	ID        string
 	UserID    string
 	Name      string
+	ModelName string
 	Archived  bool
 	Current   bool
 	CreatedAt string

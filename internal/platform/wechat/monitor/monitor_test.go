@@ -113,12 +113,12 @@ func (h *captureHandler) Handle(ctx context.Context, msg core.InboundMessage, se
 }
 
 type fakeConversationManager struct {
-	sess        *store.Session
-	conv        *store.Conversation
-	saved       *store.Conversation
-	sessions    []store.Session
-	modelByUser map[string]string
-	models      []string
+	sess           *store.Session
+	conv           *store.Conversation
+	saved          *store.Conversation
+	sessions       []store.Session
+	modelBySession map[string]string
+	models         []string
 }
 
 func (f *fakeConversationManager) GetOrCreateCurrentSession(userID string) (*store.Session, error) {
@@ -126,6 +126,13 @@ func (f *fakeConversationManager) GetOrCreateCurrentSession(userID string) (*sto
 		return f.sess, nil
 	}
 	return &store.Session{ID: "session", UserID: userID, Name: "default", Current: true}, nil
+}
+
+func (f *fakeConversationManager) GetSession(userID, sessionID string) (*store.Session, error) {
+	if f.sess != nil && f.sess.ID == sessionID && f.sess.UserID == userID && !f.sess.Archived {
+		return f.sess, nil
+	}
+	return &store.Session{ID: sessionID, UserID: userID, Name: "target"}, nil
 }
 
 func (f *fakeConversationManager) CurrentSession(userID string) (*store.Session, error) {
@@ -139,9 +146,10 @@ func (f *fakeConversationManager) LoadHistory(userID, sessionID string) (*store.
 	return &store.Conversation{}, nil
 }
 
-func (f *fakeConversationManager) SaveHistory(userID, sessionID string, conv *store.Conversation) error {
+func (f *fakeConversationManager) SaveHistoryCAS(userID, sessionID string, expectedRevision int64, conv *store.Conversation) (int64, error) {
+	conv.Revision = expectedRevision + 1
 	f.saved = conv
-	return nil
+	return conv.Revision, nil
 }
 
 func (f *fakeConversationManager) CreateSession(userID, name string) (*store.Session, error) {
@@ -172,18 +180,18 @@ func (f *fakeConversationManager) ClearSession(userID string) (*store.Session, e
 	return &store.Session{ID: "cleared", UserID: userID, Name: "session-1", Current: true}, nil
 }
 
-func (f *fakeConversationManager) CurrentModel(userID string) (string, error) {
-	if f.modelByUser != nil && f.modelByUser[userID] != "" {
-		return f.modelByUser[userID], nil
+func (f *fakeConversationManager) CurrentModel(userID, sessionID string) (string, error) {
+	if f.modelBySession != nil && f.modelBySession[sessionID] != "" {
+		return f.modelBySession[sessionID], nil
 	}
 	return "deepseek", nil
 }
 
-func (f *fakeConversationManager) SetModel(userID, modelName string) error {
-	if f.modelByUser == nil {
-		f.modelByUser = map[string]string{}
+func (f *fakeConversationManager) SetModel(userID, sessionID, modelName string) error {
+	if f.modelBySession == nil {
+		f.modelBySession = map[string]string{}
 	}
-	f.modelByUser[userID] = modelName
+	f.modelBySession[sessionID] = modelName
 	return nil
 }
 
@@ -292,9 +300,9 @@ func (f *fakeLLM) AssistantMessage(resp llm.Response) (store.Message, error) {
 func newTestBot() (*bot, *fakeWechatClient, *fakeConversationManager, *fakeLLM) {
 	client := &fakeWechatClient{}
 	sessions := &fakeConversationManager{
-		sess:        &store.Session{ID: "session", UserID: "user", Name: "default", Current: true},
-		conv:        &store.Conversation{},
-		modelByUser: map[string]string{"user": "deepseek"},
+		sess:           &store.Session{ID: "session", UserID: "user", Name: "default", Current: true},
+		conv:           &store.Conversation{},
+		modelBySession: map[string]string{"session": "deepseek"},
 	}
 	llmClient := &fakeLLM{response: llm.Response{Text: "hello"}}
 	handler := core.New(sessions, testLLMConfig())
@@ -1296,10 +1304,10 @@ func TestAIErrorNoticeTruncatesLongErrors(t *testing.T) {
 	}
 }
 
-func TestProcessOneUsesUserModelPreference(t *testing.T) {
+func TestProcessOneUsesSessionModelPreference(t *testing.T) {
 	b, client, sessions, defaultLLM := newTestBot()
 	preferredLLM := &fakeLLM{response: llm.Response{Text: "from gpt4o"}}
-	sessions.modelByUser["user"] = "gpt4o"
+	sessions.modelBySession["session"] = "gpt4o"
 	b.handler.(*core.Bot).NewLLM = func(model config.ResolvedModel) llm.Client {
 		if model.Name != "gpt4o" {
 			t.Fatalf("created model = %s, want gpt4o", model.Name)
@@ -1322,9 +1330,9 @@ func TestProcessOneUsesUserModelPreference(t *testing.T) {
 	}
 }
 
-func TestProcessOneFallsBackForUnknownUserModel(t *testing.T) {
+func TestProcessOneFallsBackForUnknownSessionModel(t *testing.T) {
 	b, _, sessions, defaultLLM := newTestBot()
-	sessions.modelByUser["user"] = "missing"
+	sessions.modelBySession["session"] = "missing"
 
 	if err := b.processOne(textMessage("hi")); err != nil {
 		t.Fatalf("processOne returned error: %v", err)

@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	DefaultBaseURL = "https://open.feishu.cn"
-	TextChunkLimit = 25 * 1024
+	DefaultBaseURL      = "https://open.feishu.cn"
+	DefaultOAuthBaseURL = "https://accounts.feishu.cn"
+	TextChunkLimit      = 25 * 1024
 )
 
 type Credentials struct {
@@ -31,9 +32,12 @@ type Config struct {
 
 // AccountConfig holds one Feishu self-built app account config.
 type AccountConfig struct {
-	AppID     string `yaml:"app_id"`
-	AppSecret string `yaml:"app_secret"`
-	BaseURL   string `yaml:"base_url"`
+	AppID                      string `yaml:"app_id"`
+	AppSecret                  string `yaml:"app_secret"`
+	BaseURL                    string `yaml:"base_url"`
+	OAuthBaseURL               string `yaml:"oauth_base_url,omitempty"`
+	OAuthCallbackURL           string `yaml:"oauth_callback_url,omitempty"`
+	OAuthCallbackListenAddress string `yaml:"oauth_callback_listen_address,omitempty"`
 }
 
 // EventConfig holds one configured Feishu event shell hook.
@@ -213,8 +217,14 @@ func normalizeAccountConfig(account AccountConfig) AccountConfig {
 	account.AppID = strings.TrimSpace(account.AppID)
 	account.AppSecret = strings.TrimSpace(account.AppSecret)
 	account.BaseURL = strings.TrimRight(strings.TrimSpace(account.BaseURL), "/")
+	account.OAuthBaseURL = strings.TrimRight(strings.TrimSpace(account.OAuthBaseURL), "/")
+	account.OAuthCallbackURL = strings.TrimSpace(account.OAuthCallbackURL)
+	account.OAuthCallbackListenAddress = strings.TrimSpace(account.OAuthCallbackListenAddress)
 	if account.BaseURL == "" {
 		account.BaseURL = DefaultBaseURL
+	}
+	if account.OAuthBaseURL == "" && account.BaseURL == DefaultBaseURL {
+		account.OAuthBaseURL = DefaultOAuthBaseURL
 	}
 	return account
 }

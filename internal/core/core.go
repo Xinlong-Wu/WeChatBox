@@ -74,8 +74,14 @@ type PrepareUserMessageFunc func(ctx context.Context, userID, sessionID string, 
 type ConversationManager interface {
 	commands.SessionManager
 	GetOrCreateCurrentSession(userID string) (*store.Session, error)
+	GetSession(userID, sessionID string) (*store.Session, error)
 	LoadHistory(userID, sessionID string) (*store.Conversation, error)
-	SaveHistory(userID, sessionID string, conv *store.Conversation) error
+	SaveHistoryCAS(userID, sessionID string, expectedRevision int64, conv *store.Conversation) (int64, error)
+}
+
+type WorkflowContinuationManager interface {
+	CommitWorkflowContinuation(requestID, accountID string, committedRevision int64, now time.Time) (store.WorkflowContinuation, bool, error)
+	CancelWorkflowContinuation(requestID, accountID, reason string, now time.Time) error
 }
 
 type LLMFactory func(config.ResolvedModel) llm.Client
@@ -86,12 +92,15 @@ type Bot struct {
 	LLMConfig           config.LLMConfig
 	LLMClients          map[string]llm.Client
 	mu                  sync.Mutex
+	laneMu              sync.Mutex
+	lanes               *sessionLaneSet
 	NewLLM              LLMFactory
 	MutateResponse      ResponseMutator
 	ErrorNotice         func(error) string
 	TextChunkLimit      int
 	EnableTextStreaming bool
 	ToolProvider        tooltypes.Provider
+	Workflows           WorkflowContinuationManager
 }
 
 func New(sessions ConversationManager, cfg config.LLMConfig) *Bot {
@@ -99,6 +108,7 @@ func New(sessions ConversationManager, cfg config.LLMConfig) *Bot {
 		Sessions:            sessions,
 		LLMConfig:           cfg,
 		LLMClients:          map[string]llm.Client{},
+		lanes:               newSessionLaneSet(),
 		NewLLM:              defaultLLMFactory,
 		EnableTextStreaming: false,
 	}
@@ -114,22 +124,57 @@ func (b *Bot) Handle(ctx context.Context, msg InboundMessage, sender Sender) err
 	selection := b.resolveToolsForMessage(ctx, msg)
 	msg.Tools = selection.Tools
 	commandTools := commandToolSummaries(msg.Tools)
-	if resp, handled, err := commands.HandleWithOptions(msg.CommandText, msg.UserKey, b.Sessions, commands.HandleOptions{
+	commandOptions := commands.HandleOptions{
 		Policy: msg.CommandPolicy,
 		Tools:  commandTools,
-	}); handled {
+	}
+	if commandUsesCurrentSessionLane(msg.CommandText) {
+		sess, err := b.Sessions.GetOrCreateCurrentSession(msg.UserKey)
 		if err != nil {
-			coreLog.Warn(ctx, "command error: %v", err)
-			_ = sender.Send(ctx, OutboundMessage{Text: fmt.Sprintf("❌ 错误：%v", err)})
-			return nil
+			coreLog.Error(ctx, "get session for command: %v", err)
+			_ = sender.Send(ctx, OutboundMessage{Text: "❌ 会话加载失败，请重试。"})
+			return err
 		}
-		coreLog.Debug(ctx, "command handled command=%s tools=%d", commandName(msg.CommandText), len(commandTools))
-		return sender.Send(ctx, OutboundMessage{Text: resp})
+		var handled bool
+		err = b.withSessionLane(ctx, msg, sess.ID, func(laneCtx context.Context) error {
+			var commandErr error
+			handled, commandErr = b.handleSharedCommand(laneCtx, msg, sender, commandOptions, len(commandTools))
+			return commandErr
+		})
+		if handled || err != nil {
+			return err
+		}
+	}
+	if handled, err := b.handleSharedCommand(ctx, msg, sender, commandOptions, len(commandTools)); handled || err != nil {
+		return err
 	}
 	if strings.TrimSpace(msg.LLMText) == "" && msg.PrepareUserMessage == nil {
 		return nil
 	}
 	return b.reply(ctx, msg, sender, selection.Options)
+}
+
+func (b *Bot) handleSharedCommand(ctx context.Context, msg InboundMessage, sender Sender, opts commands.HandleOptions, toolCount int) (bool, error) {
+	resp, handled, err := commands.HandleWithOptions(msg.CommandText, msg.UserKey, b.Sessions, opts)
+	if !handled {
+		return false, nil
+	}
+	if err != nil {
+		coreLog.Warn(ctx, "command error: %v", err)
+		_ = sender.Send(ctx, OutboundMessage{Text: fmt.Sprintf("❌ 错误：%v", err)})
+		return true, nil
+	}
+	coreLog.Debug(ctx, "command handled command=%s tools=%d", commandName(msg.CommandText), toolCount)
+	return true, sender.Send(ctx, OutboundMessage{Text: resp})
+}
+
+func commandUsesCurrentSessionLane(text string) bool {
+	switch commandName(text) {
+	case "/current", "/rename", "/archive", "/clear", "/model":
+		return true
+	default:
+		return false
+	}
 }
 
 func (b *Bot) resolveToolsForMessage(ctx context.Context, msg InboundMessage) tooltypes.Selection {
@@ -231,8 +276,13 @@ func (b *Bot) reply(ctx context.Context, msg InboundMessage, sender Sender, tool
 		_ = sender.Send(ctx, OutboundMessage{Text: "❌ 会话加载失败，请重试。"})
 		return err
 	}
+	return b.withSessionLane(ctx, msg, sess.ID, func(laneCtx context.Context) error {
+		return b.replyInSession(laneCtx, msg, sender, toolOptions, sess)
+	})
+}
 
-	model, llmClient, err := b.llmForMessage(ctx, msg)
+func (b *Bot) replyInSession(ctx context.Context, msg InboundMessage, sender Sender, toolOptions tooltypes.Options, sess *store.Session) error {
+	model, llmClient, err := b.llmForMessage(ctx, msg, sess.ID)
 	if err != nil {
 		coreLog.Error(ctx, "resolve LLM: %v", err)
 		_ = sender.Send(ctx, OutboundMessage{Text: "❌ 模型配置不可用，请检查配置。"})
@@ -255,6 +305,26 @@ func (b *Bot) reply(ctx context.Context, msg InboundMessage, sender Sender, tool
 	if err != nil {
 		coreLog.Warn(ctx, "load history: %v", err)
 		conv = &store.Conversation{}
+	}
+	if conv == nil {
+		conv = &store.Conversation{}
+	}
+	backfillWorkflowResumeReceipts(conv)
+	expectedRevision := conv.Revision
+	if userMsg.Internal != nil {
+		userMsg.Internal.CommittedRevision = expectedRevision + 1
+	}
+	if len(msg.Tools) > 0 {
+		var execution tooltypes.ExecutionContext
+		ctx, execution, err = bindToolExecutionContext(ctx, msg, sess.ID, expectedRevision)
+		if err != nil {
+			coreLog.Error(ctx, "bind tool execution context: %v", err)
+			_ = sender.Send(ctx, OutboundMessage{Text: "❌ 工具执行上下文初始化失败，请重试。"})
+			return err
+		}
+		coreLog.Debug(ctx, "bound trusted tool context platform=%s account=%s session=%s turn=%s chat_present=%t actor_present=%t revision=%d",
+			execution.Platform, execution.AccountID, execution.SessionID, execution.TurnID,
+			execution.ChatID != "", execution.ActorOpenID != "" || execution.ActorUserID != "", execution.ConversationRevision)
 	}
 
 	compact := llm.CompactConfig{
@@ -305,9 +375,10 @@ func (b *Bot) reply(ctx context.Context, msg InboundMessage, sender Sender, tool
 	stopTyping := sender.StartTyping(ctx)
 	var llmResponse llm.Response
 	var toolTraces []store.ToolTrace
+	var pendingWorkflowIDs []string
 	if len(msg.Tools) > 0 {
 		if toolClient, ok := llmClient.(llm.ToolCallingClient); ok {
-			llmResponse, toolTraces, err = b.chatWithTools(ctx, toolClient, provider, modelName, systemPrompt, msgs, providerContext, compact, compactAllowed, msg.Tools, toolOptions, onChunk)
+			llmResponse, toolTraces, pendingWorkflowIDs, err = b.chatWithTools(ctx, toolClient, provider, modelName, systemPrompt, msgs, providerContext, compact, compactAllowed, msg.Tools, toolOptions, onChunk)
 		} else {
 			coreLog.Warn(ctx, "model provider=%s model=%s does not support tool calling; continuing without tools", provider, modelName)
 			llmResponse, err = b.chatWithoutTools(ctx, llmClient, provider, modelName, systemPrompt, compactAllowed, providerContext, compact, msgs, onChunk)
@@ -317,6 +388,7 @@ func (b *Bot) reply(ctx context.Context, msg InboundMessage, sender Sender, tool
 	}
 	stopTyping()
 	if err != nil {
+		b.cancelPendingWorkflows(ctx, msg.AccountID, pendingWorkflowIDs, "origin turn did not commit")
 		if ctxErr := ctx.Err(); ctxErr != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			coreLog.Warn(ctx, "reply canceled provider=%s model=%s: %v", provider, modelName, err)
 			return err
@@ -339,11 +411,14 @@ func (b *Bot) reply(ctx context.Context, msg InboundMessage, sender Sender, tool
 
 	assistantHistory, err := llmClient.AssistantMessage(llmResponse)
 	if err != nil {
+		b.cancelPendingWorkflows(ctx, msg.AccountID, pendingWorkflowIDs, "origin turn did not commit")
 		coreLog.Error(ctx, "prepare assistant history failed provider=%s model=%s: %v", provider, modelName, err)
 		_ = sender.Send(ctx, OutboundMessage{Text: b.errorNotice(msg, err)})
 		return err
 	}
 	assistantHistory.ToolTraces = toolTraces
+	rememberWorkflowOriginReceipts(conv, toolTraces, expectedRevision+1)
+	rememberWorkflowResumeReceipt(conv, userMsg, assistantHistory, workflowResumeDeliveryTextChunks(llmResponse.Text, b.chunkLimit()))
 	historyForSave := conv.Messages
 	if compactAllowed {
 		if preCompacted {
@@ -366,9 +441,24 @@ func (b *Bot) reply(ctx context.Context, msg InboundMessage, sender Sender, tool
 	}
 	conv.Messages = append(historyForSave, userMsg, assistantHistory)
 
-	if err := b.Sessions.SaveHistory(msg.UserKey, sess.ID, conv); err != nil {
-		coreLog.Warn(ctx, "save history: %v", err)
-	} else if preCompacted {
+	newRevision, err := b.Sessions.SaveHistoryCAS(msg.UserKey, sess.ID, expectedRevision, conv)
+	if err != nil {
+		b.cancelPendingWorkflows(ctx, msg.AccountID, pendingWorkflowIDs, "origin conversation save failed")
+		coreLog.Error(ctx, "save history with revision cas session=%s expected_revision=%d: %v", sess.ID, expectedRevision, err)
+		notice := "❌ 会话保存失败，本次回复可能未写入历史，请重试。"
+		if errors.Is(err, store.ErrConversationConflict) {
+			notice = "❌ 会话在处理期间发生变化，本次回复未写入历史，请重试。"
+		}
+		_ = sender.Send(ctx, OutboundMessage{Text: notice})
+		return err
+	}
+	coreLog.Debug(ctx, "saved conversation session=%s revision=%d messages=%d", sess.ID, newRevision, len(conv.Messages))
+	if err := b.commitPendingWorkflows(ctx, msg.AccountID, pendingWorkflowIDs, newRevision); err != nil {
+		coreLog.Error(ctx, "commit pending workflow continuations session=%s revision=%d count=%d: %v", sess.ID, newRevision, len(pendingWorkflowIDs), err)
+		_ = sender.Send(ctx, OutboundMessage{Text: "❌ 异步授权状态保存失败，请重新发起操作。"})
+		return err
+	}
+	if preCompacted {
 		if err := finishCompactNotice(ctx, sender, compactNoticeHandle, preCompactNotice); err != nil {
 			return err
 		}
@@ -413,22 +503,24 @@ func (b *Bot) chatWithoutTools(ctx context.Context, client llm.Client, provider,
 	})
 }
 
-func (b *Bot) chatWithTools(ctx context.Context, client llm.ToolCallingClient, provider, modelName, systemPrompt string, msgs []store.Message, providerContext store.ProviderContext, compact llm.CompactConfig, compactAllowed bool, tools []tooltypes.Tool, options tooltypes.Options, onChunk func(string) error) (llm.Response, []store.ToolTrace, error) {
+func (b *Bot) chatWithTools(ctx context.Context, client llm.ToolCallingClient, provider, modelName, systemPrompt string, msgs []store.Message, providerContext store.ProviderContext, compact llm.CompactConfig, compactAllowed bool, tools []tooltypes.Tool, options tooltypes.Options, onChunk func(string) error) (llm.Response, []store.ToolTrace, []string, error) {
 	specs := toolSpecs(tools)
 	if len(specs) == 0 {
 		coreLog.Warn(ctx, "tool calling requested with %d tool entries but no valid tool specs; falling back to plain chat", len(tools))
 		baseClient, ok := client.(llm.Client)
 		if !ok {
-			return llm.Response{}, nil, fmt.Errorf("tool-capable client does not implement base chat")
+			return llm.Response{}, nil, nil, fmt.Errorf("tool-capable client does not implement base chat")
 		}
 		resp, err := b.chatWithoutTools(ctx, baseClient, provider, modelName, systemPrompt, compactAllowed, providerContext, compact, msgs, onChunk)
-		return resp, nil, err
+		return resp, nil, nil, err
 	}
 
 	maxCalls := effectiveMaxToolCalls(options.MaxCalls)
 	lookup := toolMap(tools)
 	coreLog.Debug(ctx, "tool loop start tools=%d max_calls=%d timeout=%s result_limit=%d", len(specs), maxCalls, effectiveToolTimeout(options.Timeout), effectiveToolResultLimit(options.ResultLimit))
 	var traces []store.ToolTrace
+	var pendingWorkflowIDs []string
+	pendingWorkflowSet := map[string]struct{}{}
 	var previous llm.ToolState
 	var results []tooltypes.Result
 	compacted := false
@@ -444,7 +536,7 @@ func (b *Bot) chatWithTools(ctx context.Context, client llm.ToolCallingClient, p
 
 	for {
 		if err := ctx.Err(); err != nil {
-			return llm.Response{}, traces, err
+			return llm.Response{}, traces, pendingWorkflowIDs, err
 		}
 		turnSystemPrompt := toolBudgetSystemPrompt(systemPrompt, maxCalls, pendingBudgetReminder, pendingBudgetRemaining)
 		pendingBudgetReminder = toolBudgetReminderNone
@@ -452,7 +544,7 @@ func (b *Bot) chatWithTools(ctx context.Context, client llm.ToolCallingClient, p
 			return client.ChatStreamWithTools(turnSystemPrompt, msgs, providerContext, effectiveCompact, specs, previous, results, attemptOnChunk)
 		})
 		if err != nil {
-			return llm.Response{}, traces, err
+			return llm.Response{}, traces, pendingWorkflowIDs, err
 		}
 		if len(resp.ToolCalls) == 0 {
 			coreLog.Debug(ctx, "tool loop finish calls=%d traces=%d text_len=%d images=%d", totalCalls, len(traces), len(resp.Text), len(resp.Images))
@@ -463,12 +555,12 @@ func (b *Bot) chatWithTools(ctx context.Context, client llm.ToolCallingClient, p
 			if !providerContext.IsEmpty() && finalResp.ProviderContext.IsEmpty() {
 				finalResp.ProviderContext = providerContext
 			}
-			return finalResp, traces, nil
+			return finalResp, traces, pendingWorkflowIDs, nil
 		}
 		if totalCalls+len(resp.ToolCalls) > maxCalls {
 			err := fmt.Errorf("tool call limit exceeded: %d > %d", totalCalls+len(resp.ToolCalls), maxCalls)
 			coreLog.Warn(ctx, "%v", err)
-			return llm.Response{}, traces, err
+			return llm.Response{}, traces, pendingWorkflowIDs, err
 		}
 
 		previous = appendToolState(previous, resp.ToolState)
@@ -481,7 +573,7 @@ func (b *Bot) chatWithTools(ctx context.Context, client llm.ToolCallingClient, p
 		coreLog.Debug(ctx, "model requested tool calls count=%d total_before=%d", len(resp.ToolCalls), totalCalls)
 		for _, call := range resp.ToolCalls {
 			if err := ctx.Err(); err != nil {
-				return llm.Response{}, traces, err
+				return llm.Response{}, traces, pendingWorkflowIDs, err
 			}
 			call.Name = strings.TrimSpace(call.Name)
 			if _, ok := lookup[call.Name]; !ok {
@@ -490,10 +582,17 @@ func (b *Bot) chatWithTools(ctx context.Context, client llm.ToolCallingClient, p
 			coreLog.Debug(ctx, "tool call start name=%s call_id=%s args=%s", call.Name, call.ID, summarizeToolArgumentsForLog(call.Arguments, defaultToolTraceTextLimit))
 			totalCalls++
 			result, trace, toolErr := runTool(ctx, lookup[call.Name], call, options.Timeout, options.ResultLimit)
+			if requestID := strings.TrimSpace(result.PendingWorkflowID); requestID != "" {
+				trace.PendingWorkflowID = requestID
+				if _, exists := pendingWorkflowSet[requestID]; !exists {
+					pendingWorkflowSet[requestID] = struct{}{}
+					pendingWorkflowIDs = append(pendingWorkflowIDs, requestID)
+				}
+			}
 			if toolErr != nil {
 				traces = append(traces, trace)
 				coreLog.Warn(ctx, "tool loop canceled name=%s call_id=%s duration_ms=%d error=%s", trace.Name, trace.CallID, trace.DurationMillis, truncateText(trace.Error, defaultToolTraceTextLimit))
-				return llm.Response{}, traces, toolErr
+				return llm.Response{}, traces, pendingWorkflowIDs, toolErr
 			}
 			results = append(results, result)
 			traces = append(traces, trace)

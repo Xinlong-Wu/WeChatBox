@@ -61,6 +61,28 @@ func (s *Store) GetCurrentSession(userID string) (*Session, error) {
 	return sess, nil
 }
 
+// GetSession returns one unarchived session by its durable ID.
+func (s *Store) GetSession(userID, sessionID string) (*Session, error) {
+	var sess Session
+	err := s.db.QueryRow(
+		`SELECT id, user_id, name, model_name, archived, created_at FROM sessions
+		 WHERE user_id=? AND id=? AND archived=0`,
+		userID, sessionID,
+	).Scan(&sess.ID, &sess.UserID, &sess.Name, &sess.ModelName, &sess.Archived, &sess.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrSessionNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	currentID, err := s.getCurrentSessionID(userID)
+	if err != nil {
+		return nil, err
+	}
+	sess.Current = sess.ID == currentID
+	return &sess, nil
+}
+
 // ListSessions returns all unarchived sessions for a user.
 func (s *Store) ListSessions(userID string) ([]Session, error) {
 	currentID, err := s.getCurrentSessionID(userID)
@@ -69,7 +91,7 @@ func (s *Store) ListSessions(userID string) ([]Session, error) {
 	}
 
 	rows, err := s.db.Query(
-		`SELECT id, user_id, name, archived, created_at FROM sessions
+		`SELECT id, user_id, name, model_name, archived, created_at FROM sessions
 		 WHERE user_id=? AND archived=0 ORDER BY created_at DESC`,
 		userID,
 	)
@@ -81,7 +103,7 @@ func (s *Store) ListSessions(userID string) ([]Session, error) {
 	var sessions []Session
 	for rows.Next() {
 		var sess Session
-		if err := rows.Scan(&sess.ID, &sess.UserID, &sess.Name, &sess.Archived, &sess.CreatedAt); err != nil {
+		if err := rows.Scan(&sess.ID, &sess.UserID, &sess.Name, &sess.ModelName, &sess.Archived, &sess.CreatedAt); err != nil {
 			return nil, err
 		}
 		sess.Current = sess.ID == currentID
@@ -288,10 +310,10 @@ func ensureCurrentSessionTx(tx *sql.Tx, userID string) (*Session, error) {
 func latestUnarchivedSessionTx(tx *sql.Tx, userID string) (*Session, error) {
 	var sess Session
 	err := tx.QueryRow(
-		`SELECT id, user_id, name, archived, created_at FROM sessions
+		`SELECT id, user_id, name, model_name, archived, created_at FROM sessions
 		 WHERE user_id=? AND archived=0 ORDER BY created_at DESC, id DESC LIMIT 1`,
 		userID,
-	).Scan(&sess.ID, &sess.UserID, &sess.Name, &sess.Archived, &sess.CreatedAt)
+	).Scan(&sess.ID, &sess.UserID, &sess.Name, &sess.ModelName, &sess.Archived, &sess.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrSessionNotFound
 	}
@@ -301,10 +323,10 @@ func latestUnarchivedSessionTx(tx *sql.Tx, userID string) (*Session, error) {
 func sessionByNameTx(tx *sql.Tx, userID, name string) (*Session, error) {
 	var sess Session
 	err := tx.QueryRow(
-		`SELECT id, user_id, name, archived, created_at FROM sessions
+		`SELECT id, user_id, name, model_name, archived, created_at FROM sessions
 		 WHERE user_id=? AND name=? AND archived=0`,
 		userID, name,
-	).Scan(&sess.ID, &sess.UserID, &sess.Name, &sess.Archived, &sess.CreatedAt)
+	).Scan(&sess.ID, &sess.UserID, &sess.Name, &sess.ModelName, &sess.Archived, &sess.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("%w: %q for user %s", ErrSessionNotFound, name, userID)
 	}
@@ -314,10 +336,10 @@ func sessionByNameTx(tx *sql.Tx, userID, name string) (*Session, error) {
 func sessionByIDTx(tx *sql.Tx, userID, sessionID string) (*Session, error) {
 	var sess Session
 	err := tx.QueryRow(
-		`SELECT id, user_id, name, archived, created_at FROM sessions
+		`SELECT id, user_id, name, model_name, archived, created_at FROM sessions
 		 WHERE user_id=? AND id=? AND archived=0`,
 		userID, sessionID,
-	).Scan(&sess.ID, &sess.UserID, &sess.Name, &sess.Archived, &sess.CreatedAt)
+	).Scan(&sess.ID, &sess.UserID, &sess.Name, &sess.ModelName, &sess.Archived, &sess.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrSessionNotFound
 	}

@@ -116,6 +116,16 @@ platforms:
         app_secret: "your-app-secret"
         # Optional. Defaults to https://open.feishu.cn.
         base_url: "https://open.feishu.cn"
+        # Optional OAuth service base URL. The default Feishu API domain uses
+        # https://accounts.feishu.cn.
+        oauth_base_url: "https://accounts.feishu.cn"
+        # Register this exact public URL as the Feishu OAuth redirect URL.
+        # With no listen address, users paste the resulting callback URL or
+        # authorization code into the original Feishu resource card.
+        oauth_callback_url: "https://oauth.wulongxin.com/feishu/oauth/callback"
+        # Optional. Enables direct HTTP callbacks; a reverse proxy may forward
+        # the public callback URL to this local TCP listener.
+        # oauth_callback_listen_address: "127.0.0.1:18080"
 
     # Optional event shell hooks for Feishu events other than
     # im.message.receive_v1, which is always handled by LingoBridge.
@@ -134,8 +144,6 @@ platforms:
     tools:
       max_results: 5
       max_chars: 12000
-      allowed_folder_tokens: []
-      allowed_space_ids: []
 
       chat_history:
         # Disabled by default. When enabled, tool-capable models can read up to
@@ -145,12 +153,17 @@ platforms:
         enabled: false
 
       docs:
-        # Disabled by default. When enabled, the Feishu app's tenant access
-        # token is used, so document visibility follows app permissions rather
-        # than the asking user's personal permissions.
+        # Disabled by default. Search/list and current-chat Bot-owned document
+        # reads are enabled here. Reading an unbound external document requires
+        # a granted docx/read request_id from feishu_docs_request_access.
         enabled: false
-        # Write tools are registered only when this is true and at least one
-        # allowed_folder_tokens entry is configured.
+        # Registers folder/document create and document append. Every create
+        # first requires a granted folder/write request_id; that request is
+        # valid for ten minutes and is consumed by exactly one create workflow.
+        # feishu_docs_create additionally sends a requester-only operation card
+        # unless the same user/account/chat/tool has a 24-hour approval grant.
+        # Appending an unbound external document requires docx/write access.
+        # Subscribe to card.action.trigger in the Feishu app console.
         allow_write: false
 
       litellm:

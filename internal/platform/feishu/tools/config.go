@@ -4,13 +4,11 @@ import "strings"
 
 // Config holds optional LLM tool plugins exposed by the Feishu platform.
 type Config struct {
-	MaxResults          int                `yaml:"max_results,omitempty"`
-	MaxChars            int                `yaml:"max_chars,omitempty"`
-	AllowedFolderTokens []string           `yaml:"allowed_folder_tokens,omitempty"`
-	AllowedSpaceIDs     []string           `yaml:"allowed_space_ids,omitempty"`
-	ChatHistory         ChatHistoryConfig  `yaml:"chat_history,omitempty"`
-	Docs                DocsToolsConfig    `yaml:"docs,omitempty"`
-	LiteLLM             LiteLLMToolsConfig `yaml:"litellm,omitempty"`
+	MaxResults  int                `yaml:"max_results,omitempty"`
+	MaxChars    int                `yaml:"max_chars,omitempty"`
+	ChatHistory ChatHistoryConfig  `yaml:"chat_history,omitempty"`
+	Docs        DocsToolsConfig    `yaml:"docs,omitempty"`
+	LiteLLM     LiteLLMToolsConfig `yaml:"litellm,omitempty"`
 }
 
 // ChatHistoryConfig controls the current-chat Feishu message history tool.
@@ -59,8 +57,6 @@ func NormalizeConfig(cfg Config) Config {
 	if cfg.MaxChars <= 0 {
 		cfg.MaxChars = DefaultMaxChars
 	}
-	cfg.AllowedFolderTokens = normalizeStringList(cfg.AllowedFolderTokens)
-	cfg.AllowedSpaceIDs = normalizeStringList(cfg.AllowedSpaceIDs)
 	cfg.LiteLLM = normalizeLiteLLMConfig(cfg.LiteLLM)
 	return cfg
 }
@@ -102,18 +98,4 @@ func liteLLMConfigPresent(cfg LiteLLMToolsConfig) bool {
 		cfg.Bitable.EmailField != "" ||
 		cfg.Bitable.ReasonField != "" ||
 		cfg.Bitable.OwnerField != ""
-}
-
-func normalizeStringList(values []string) []string {
-	out := []string{}
-	seen := map[string]bool{}
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value == "" || seen[value] {
-			continue
-		}
-		out = append(out, value)
-		seen[value] = true
-	}
-	return out
 }

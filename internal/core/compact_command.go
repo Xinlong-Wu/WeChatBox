@@ -26,8 +26,13 @@ func (b *Bot) handleCompactCommand(ctx context.Context, msg InboundMessage, send
 		_ = sender.Send(ctx, OutboundMessage{Text: "❌ 会话加载失败，请重试。"})
 		return err
 	}
+	return b.withSessionLane(ctx, msg, sess.ID, func(laneCtx context.Context) error {
+		return b.compactSession(laneCtx, msg, sender, sess)
+	})
+}
 
-	model, llmClient, err := b.llmForUser(msg.UserKey)
+func (b *Bot) compactSession(ctx context.Context, msg InboundMessage, sender Sender, sess *store.Session) error {
+	model, llmClient, err := b.llmForSession(msg.UserKey, sess.ID)
 	if err != nil {
 		coreLog.Error(ctx, "resolve LLM for compact: %v", err)
 		_ = sender.Send(ctx, OutboundMessage{Text: "❌ 模型配置不可用，请检查配置。"})
@@ -52,6 +57,11 @@ func (b *Bot) handleCompactCommand(ctx context.Context, msg InboundMessage, send
 		coreLog.Warn(ctx, "load history for compact: %v", err)
 		conv = &store.Conversation{}
 	}
+	if conv == nil {
+		conv = &store.Conversation{}
+	}
+	backfillWorkflowResumeReceipts(conv)
+	expectedRevision := conv.Revision
 	if len(conv.Messages) <= nativeContextKeepRecentMessages {
 		return sender.Send(ctx, OutboundMessage{Text: "当前会话没有足够的旧历史可压缩。"})
 	}
@@ -84,9 +94,13 @@ func (b *Bot) handleCompactCommand(ctx context.Context, msg InboundMessage, send
 	conv.ProviderContexts[model.Name] = compactedContext
 	conv.Messages = retainRecentMessages(conv.Messages, nativeContextKeepRecentMessages)
 	notice.RetainedMessages = len(conv.Messages)
-	if err := b.Sessions.SaveHistory(msg.UserKey, sess.ID, conv); err != nil {
-		coreLog.Warn(ctx, "save compacted history: %v", err)
+	newRevision, err := b.Sessions.SaveHistoryCAS(msg.UserKey, sess.ID, expectedRevision, conv)
+	if err != nil {
+		coreLog.Error(ctx, "save compacted history with revision cas session=%s expected_revision=%d: %v", sess.ID, expectedRevision, err)
+		_ = sender.Send(ctx, OutboundMessage{Text: "❌ 会话压缩结果保存失败，请重试。"})
+		return err
 	}
+	coreLog.Debug(ctx, "saved compacted conversation session=%s revision=%d messages=%d", sess.ID, newRevision, len(conv.Messages))
 
 	return finishCompactNotice(ctx, sender, noticeHandle, notice)
 }

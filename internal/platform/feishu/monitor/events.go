@@ -18,6 +18,7 @@ const (
 
 	feishuMessageReceiveEvent      = "im.message.receive_v1"
 	feishuBotP2PChatEnteredV2Event = "im.chat.access_event.bot_p2p_chat_entered_v1"
+	feishuCardActionEvent          = "card.action.trigger"
 )
 
 type feishuV2EventRegistrar func(*bot, *dispatcher.EventDispatcher) *dispatcher.EventDispatcher
@@ -50,6 +51,11 @@ func (b *bot) configureEventHandlers(d *dispatcher.EventDispatcher, events []fei
 		registeredHandlers[feishuEventVersionV2+":"+name] = true
 		registered = append(registered, name)
 	}
+	if b.cards != nil {
+		d = d.OnP2CardActionTrigger(b.cards.HandleAction)
+		registeredHandlers[feishuEventVersionV2+":"+feishuCardActionEvent] = true
+		registered = append(registered, feishuCardActionEvent)
+	}
 	for i, event := range events {
 		name := strings.TrimSpace(event.Name)
 		version := strings.TrimSpace(event.Version)
@@ -57,7 +63,7 @@ func (b *bot) configureEventHandlers(d *dispatcher.EventDispatcher, events []fei
 		if name == "" {
 			return nil, nil, fmt.Errorf("platforms.feishu.events[%d].name is required", i)
 		}
-		if name == feishuMessageReceiveEvent {
+		if name == feishuMessageReceiveEvent || name == feishuCardActionEvent {
 			return nil, nil, fmt.Errorf("platforms.feishu.events[%d].name %q is built in and cannot be configured", i, name)
 		}
 		if version == "" {
@@ -101,10 +107,28 @@ func (b *bot) configureEventHandlers(d *dispatcher.EventDispatcher, events []fei
 
 func (b *bot) handleCustomizedEvent(ctx context.Context, eventName string, event *larkevent.EventReq) error {
 	env, chatID := customizedFeishuEventEnv(eventName, event)
-	return runFeishuEventCommands(ctx, b.sender, eventName, chatID, b.eventCommands[eventName], env)
+	return b.runTrackedEventCommands(ctx, eventName, chatID, b.eventCommands[eventName], env)
 }
 
 func (b *bot) handleBotP2PChatEntered(ctx context.Context, event *larkim.P2ChatAccessEventBotP2pChatEnteredV1) error {
 	env, chatID := botP2PChatEnteredEnv(event)
-	return runFeishuEventCommands(ctx, b.sender, feishuBotP2PChatEnteredV2Event, chatID, b.eventCommands[feishuBotP2PChatEnteredV2Event], env)
+	return b.runTrackedEventCommands(ctx, feishuBotP2PChatEnteredV2Event, chatID, b.eventCommands[feishuBotP2PChatEnteredV2Event], env)
+}
+
+func (b *bot) runTrackedEventCommands(ctx context.Context, eventName, chatID string, scripts []string, env map[string]string) error {
+	if b.processingContext().Err() != nil {
+		feishuLog.Debug(ctx, "feishu event ignored because the runtime is shutting down event=%s chat=%s", eventName, chatID)
+		return nil
+	}
+	releaseTask, accepted := b.tasks.Reserve()
+	if !accepted {
+		feishuLog.Debug(ctx, "feishu event ignored because event admission is closed event=%s chat=%s", eventName, chatID)
+		return nil
+	}
+	defer releaseTask()
+	if b.processingContext().Err() != nil {
+		feishuLog.Debug(ctx, "feishu event ignored because the runtime stopped before execution event=%s chat=%s", eventName, chatID)
+		return nil
+	}
+	return runFeishuEventCommands(ctx, b.sender, eventName, chatID, scripts, env)
 }

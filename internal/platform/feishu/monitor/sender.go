@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
+	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
@@ -50,6 +52,10 @@ func (s *sdkSender) CreateText(ctx context.Context, chatID, text string) (string
 	return s.createText(ctx, chatID, text, true)
 }
 
+func (s *sdkSender) CreateTextWithUUID(ctx context.Context, chatID, text, uuid string) (string, error) {
+	return s.createTextWithUUID(ctx, chatID, text, strings.TrimSpace(uuid), true)
+}
+
 func (s *sdkSender) CreateReplyText(ctx context.Context, replyToMessageID, text string) (string, error) {
 	body, err := marshalRichTextContent(text)
 	if err != nil {
@@ -76,18 +82,54 @@ func (s *sdkSender) CreateReplyText(ctx context.Context, replyToMessageID, text 
 	return "", fmt.Errorf("reply feishu message missing message_id")
 }
 
-func (s *sdkSender) createText(ctx context.Context, chatID, text string, requireMessageID bool) (string, error) {
-	body, err := marshalRichTextContent(text)
+func (s *sdkSender) CreateCard(ctx context.Context, chatID, cardJSON string) (string, error) {
+	cardJSON, _, err := parseInteractiveCardJSON(cardJSON)
 	if err != nil {
-		return "", fmt.Errorf("marshal feishu rich text content: %w", err)
+		return "", err
 	}
 	req := larkim.NewCreateMessageReqBuilder().
 		ReceiveIdType("chat_id").
 		Body(larkim.NewCreateMessageReqBodyBuilder().
 			ReceiveId(chatID).
-			MsgType(larkim.MsgTypePost).
-			Content(body).
+			MsgType(larkim.MsgTypeInteractive).
+			Content(cardJSON).
 			Build()).
+		Build()
+	resp, err := s.client.Im.Message.Create(ctx, req)
+	if err != nil {
+		return "", fmt.Errorf("send feishu interactive card: %w", err)
+	}
+	if resp == nil || !resp.Success() {
+		if resp == nil {
+			return "", fmt.Errorf("send feishu interactive card: empty response")
+		}
+		return "", fmt.Errorf("send feishu interactive card code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	if resp.Data == nil || resp.Data.MessageId == nil || *resp.Data.MessageId == "" {
+		return "", fmt.Errorf("send feishu interactive card missing message_id")
+	}
+	return *resp.Data.MessageId, nil
+}
+
+func (s *sdkSender) createText(ctx context.Context, chatID, text string, requireMessageID bool) (string, error) {
+	return s.createTextWithUUID(ctx, chatID, text, "", requireMessageID)
+}
+
+func (s *sdkSender) createTextWithUUID(ctx context.Context, chatID, text, uuid string, requireMessageID bool) (string, error) {
+	body, err := marshalRichTextContent(text)
+	if err != nil {
+		return "", fmt.Errorf("marshal feishu rich text content: %w", err)
+	}
+	bodyBuilder := larkim.NewCreateMessageReqBodyBuilder().
+		ReceiveId(chatID).
+		MsgType(larkim.MsgTypePost).
+		Content(body)
+	if uuid != "" {
+		bodyBuilder = bodyBuilder.Uuid(uuid)
+	}
+	req := larkim.NewCreateMessageReqBuilder().
+		ReceiveIdType("chat_id").
+		Body(bodyBuilder.Build()).
 		Build()
 	resp, err := s.client.Im.Message.Create(ctx, req)
 	if err != nil {
@@ -128,6 +170,74 @@ func (s *sdkSender) UpdateText(ctx context.Context, messageID, text string) erro
 		return fmt.Errorf("update feishu message code=%d msg=%s", resp.Code, resp.Msg)
 	}
 	return nil
+}
+
+func (s *sdkSender) UpdateCard(ctx context.Context, messageID, cardJSON string) error {
+	cardJSON, _, err := parseInteractiveCardJSON(cardJSON)
+	if err != nil {
+		return err
+	}
+	req := larkim.NewPatchMessageReqBuilder().
+		MessageId(messageID).
+		Body(larkim.NewPatchMessageReqBodyBuilder().
+			Content(cardJSON).
+			Build()).
+		Build()
+	resp, err := s.client.Im.Message.Patch(ctx, req)
+	if err != nil {
+		return fmt.Errorf("update feishu interactive card: %w", err)
+	}
+	if resp == nil || !resp.Success() {
+		if resp == nil {
+			return fmt.Errorf("update feishu interactive card: empty response")
+		}
+		if resp.Code == 230072 {
+			return fmt.Errorf("%w: code=%d msg=%s", ErrFeishuMessageEditLimit, resp.Code, resp.Msg)
+		}
+		return fmt.Errorf("update feishu interactive card code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	return nil
+}
+
+func (s *sdkSender) UpdateCardAfterInteraction(ctx context.Context, callbackToken, cardJSON string) error {
+	callbackToken = strings.TrimSpace(callbackToken)
+	if callbackToken == "" {
+		return fmt.Errorf("feishu card callback token is required")
+	}
+	_, card, err := parseInteractiveCardJSON(cardJSON)
+	if err != nil {
+		return err
+	}
+	resp, err := s.client.Post(ctx, "/open-apis/interactive/v1/card/update", map[string]interface{}{
+		"token": callbackToken,
+		"card":  card,
+	}, larkcore.AccessTokenTypeTenant)
+	if err != nil {
+		return fmt.Errorf("delay-update feishu interactive card: %w", err)
+	}
+	if resp == nil {
+		return fmt.Errorf("delay-update feishu interactive card: empty response")
+	}
+	var result struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.Unmarshal(resp.RawBody, &result); err != nil {
+		return fmt.Errorf("parse delay-update feishu interactive card response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK || result.Code != 0 {
+		return fmt.Errorf("delay-update feishu interactive card status=%d code=%d msg=%s", resp.StatusCode, result.Code, result.Msg)
+	}
+	return nil
+}
+
+func parseInteractiveCardJSON(cardJSON string) (string, map[string]interface{}, error) {
+	cardJSON = strings.TrimSpace(cardJSON)
+	var card map[string]interface{}
+	if cardJSON == "" || json.Unmarshal([]byte(cardJSON), &card) != nil || card == nil {
+		return "", nil, fmt.Errorf("feishu interactive card must be a valid JSON object")
+	}
+	return cardJSON, card, nil
 }
 
 func marshalRichTextContent(text string) (string, error) {

@@ -63,11 +63,21 @@ func Definition() platform.Definition {
 			if err != nil {
 				return err
 			}
-			if err := feishu.UpsertAccountConfig(ctx.Platform, opts.Name, feishu.AccountConfig{
+			accountConfig := feishu.AccountConfig{
 				AppID:     values.AppID,
 				AppSecret: values.AppSecret,
 				BaseURL:   values.BaseURL,
-			}); err != nil {
+			}
+			existing, ok, err := feishu.ResolveAccountConfig(ctx.Platform, opts.Name)
+			if err != nil {
+				return fmt.Errorf("load existing feishu account config: %w", err)
+			}
+			if ok {
+				accountConfig.OAuthBaseURL = existing.OAuthBaseURL
+				accountConfig.OAuthCallbackURL = existing.OAuthCallbackURL
+				accountConfig.OAuthCallbackListenAddress = existing.OAuthCallbackListenAddress
+			}
+			if err := feishu.UpsertAccountConfig(ctx.Platform, opts.Name, accountConfig); err != nil {
 				return err
 			}
 			fmt.Printf("✅ 已添加飞书账户: %s (%s)\n", acc.Name, acc.ID)
@@ -81,6 +91,12 @@ func Definition() platform.Definition {
 			if err := st.DeleteSyncBuf(ctx.Account.ID); err != nil {
 				return fmt.Errorf("delete sync cursor: %w", err)
 			}
+			if err := st.DeleteToolApprovals(ctx.Account.ID); err != nil {
+				return fmt.Errorf("delete tool approvals: %w", err)
+			}
+			if err := st.DeleteFeishuDocsData(ctx.Account.ID); err != nil {
+				return fmt.Errorf("delete feishu docs data: %w", err)
+			}
 			return nil
 		},
 		NewRuntimePlatform: func(ctx platform.RuntimeContext) (core.Platform, error) {
@@ -88,7 +104,7 @@ func Definition() platform.Definition {
 			if err != nil {
 				return nil, err
 			}
-			return feishumonitor.NewPlatform(ctx.Account, feishuConfig, ctx.LogLevel), nil
+			return feishumonitor.NewPlatform(ctx.Store, ctx.Account, feishuConfig, ctx.LogLevel), nil
 		},
 		CommandPolicy:       commands.DefaultPolicy(),
 		TextChunkLimit:      feishu.TextChunkLimit,

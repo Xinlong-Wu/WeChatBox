@@ -107,15 +107,53 @@ func TestCurrentModelFallsBackToDefault(t *testing.T) {
 			"gpt4o":    {},
 		},
 	})
-	if err := st.SetUserModelName("user", "missing"); err != nil {
-		t.Fatalf("SetUserModelName returned error: %v", err)
+	sess, err := st.CreateSession("user", "work")
+	if err != nil {
+		t.Fatalf("CreateSession returned error: %v", err)
+	}
+	if err := st.SetSessionModelName("user", sess.ID, "missing"); err != nil {
+		t.Fatalf("SetSessionModelName returned error: %v", err)
 	}
 
-	model, err := manager.CurrentModel("user")
+	model, err := manager.CurrentModel("user", sess.ID)
 	if err != nil {
 		t.Fatalf("CurrentModel returned error: %v", err)
 	}
 	if model != "deepseek" {
 		t.Fatalf("CurrentModel = %q, want deepseek", model)
+	}
+}
+
+func TestModelPreferenceIsScopedToSession(t *testing.T) {
+	_, st := newTestManager(t)
+	manager := NewManager(st, config.LLMConfig{
+		DefaultModel: "deepseek",
+		Models: map[string]config.LLMModelConfig{
+			"deepseek": {},
+			"gpt4o":    {},
+		},
+	})
+	work, err := manager.CreateSession("user", "work")
+	if err != nil {
+		t.Fatalf("CreateSession work returned error: %v", err)
+	}
+	play, err := manager.CreateSession("user", "play")
+	if err != nil {
+		t.Fatalf("CreateSession play returned error: %v", err)
+	}
+	if err := manager.SetModel("user", work.ID, "gpt4o"); err != nil {
+		t.Fatalf("SetModel returned error: %v", err)
+	}
+
+	workModel, err := manager.CurrentModel("user", work.ID)
+	if err != nil {
+		t.Fatalf("CurrentModel work returned error: %v", err)
+	}
+	playModel, err := manager.CurrentModel("user", play.ID)
+	if err != nil {
+		t.Fatalf("CurrentModel play returned error: %v", err)
+	}
+	if workModel != "gpt4o" || playModel != "deepseek" {
+		t.Fatalf("models = work:%q play:%q, want gpt4o/deepseek", workModel, playModel)
 	}
 }
