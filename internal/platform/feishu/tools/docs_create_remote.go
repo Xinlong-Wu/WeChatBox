@@ -154,8 +154,8 @@ func (t *docsService) ensureDocumentRemoteResult(ctx context.Context, operation 
 		return operation, "", fmt.Errorf("validate authorized document target: %w", err)
 	}
 	for {
-		switch operation.State {
-		case store.FeishuRemoteOperationStatePrepared:
+		switch classifyRemoteCreateState(operation.State) {
+		case remoteCreateStateActionStart:
 			started, claimed, err := t.store.StartFeishuRemoteOperation(operation.RequestID, operation.AccountID, t.currentTime())
 			if err != nil {
 				return operation, "", fmt.Errorf("start feishu document remote operation: %w", err)
@@ -165,14 +165,11 @@ func (t *docsService) ensureDocumentRemoteResult(ctx context.Context, operation 
 				continue
 			}
 			return t.callAndRecordDocumentCreate(ctx, operation, parent)
-		case store.FeishuRemoteOperationStateRemoteStarted,
-			store.FeishuRemoteOperationStateReconcileRequired,
-			store.FeishuRemoteOperationStateOutcomeUnknown:
+		case remoteCreateStateActionReconcile:
 			return t.reconcileDocumentCreate(ctx, operation, parent)
-		case store.FeishuRemoteOperationStateRemoteSucceeded,
-			store.FeishuRemoteOperationStatePersisted:
+		case remoteCreateStateActionUseRecordedResult:
 			return operation, "", nil
-		case store.FeishuRemoteOperationStateFailed:
+		case remoteCreateStateActionRejectFailed:
 			return operation, "", fmt.Errorf("feishu document creation previously failed before a recoverable result was recorded")
 		default:
 			return operation, "", fmt.Errorf("unsupported feishu document remote operation state %q", operation.State)

@@ -39,6 +39,37 @@ type remoteCreateCandidate struct {
 	CreatedAt    time.Time
 }
 
+type remoteCreateStateAction uint8
+
+const (
+	remoteCreateStateActionInvalid remoteCreateStateAction = iota
+	remoteCreateStateActionStart
+	remoteCreateStateActionReconcile
+	remoteCreateStateActionUseRecordedResult
+	remoteCreateStateActionRejectFailed
+)
+
+// classifyRemoteCreateState is the shared document/folder create transition
+// policy. Resource-specific code performs the action, but the durable ledger
+// states must retain identical retry and reconciliation semantics.
+func classifyRemoteCreateState(state string) remoteCreateStateAction {
+	switch state {
+	case store.FeishuRemoteOperationStatePrepared:
+		return remoteCreateStateActionStart
+	case store.FeishuRemoteOperationStateRemoteStarted,
+		store.FeishuRemoteOperationStateReconcileRequired,
+		store.FeishuRemoteOperationStateOutcomeUnknown:
+		return remoteCreateStateActionReconcile
+	case store.FeishuRemoteOperationStateRemoteSucceeded,
+		store.FeishuRemoteOperationStatePersisted:
+		return remoteCreateStateActionUseRecordedResult
+	case store.FeishuRemoteOperationStateFailed:
+		return remoteCreateStateActionRejectFailed
+	default:
+		return remoteCreateStateActionInvalid
+	}
+}
+
 func remoteOperationPayloadHash(value any) (string, error) {
 	raw, err := json.Marshal(value)
 	if err != nil {

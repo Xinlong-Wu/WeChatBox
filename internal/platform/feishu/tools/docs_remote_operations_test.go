@@ -45,6 +45,28 @@ func TestFeishuCreateResponseUncertainClassification(t *testing.T) {
 	}
 }
 
+func TestRemoteCreateStateActionCompatibilityMatrix(t *testing.T) {
+	for _, tt := range []struct {
+		state string
+		want  remoteCreateStateAction
+	}{
+		{state: store.FeishuRemoteOperationStatePrepared, want: remoteCreateStateActionStart},
+		{state: store.FeishuRemoteOperationStateRemoteStarted, want: remoteCreateStateActionReconcile},
+		{state: store.FeishuRemoteOperationStateReconcileRequired, want: remoteCreateStateActionReconcile},
+		{state: store.FeishuRemoteOperationStateOutcomeUnknown, want: remoteCreateStateActionReconcile},
+		{state: store.FeishuRemoteOperationStateRemoteSucceeded, want: remoteCreateStateActionUseRecordedResult},
+		{state: store.FeishuRemoteOperationStatePersisted, want: remoteCreateStateActionUseRecordedResult},
+		{state: store.FeishuRemoteOperationStateFailed, want: remoteCreateStateActionRejectFailed},
+		{state: "unexpected", want: remoteCreateStateActionInvalid},
+	} {
+		t.Run(tt.state, func(t *testing.T) {
+			if got := classifyRemoteCreateState(tt.state); got != tt.want {
+				t.Fatalf("classifyRemoteCreateState(%q) = %d, want %d", tt.state, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRemoteCreateResourceClaimableRejectsAnotherRequest(t *testing.T) {
 	st := openDocsFolderTestStore(t)
 	now := time.Date(2026, time.August, 4, 11, 0, 0, 0, time.UTC)

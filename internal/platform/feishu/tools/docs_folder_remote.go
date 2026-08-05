@@ -89,8 +89,8 @@ func (t *docsFolderService) ensureFolderRemoteResult(ctx context.Context, operat
 		return operation, "", fmt.Errorf("validate authorized folder target: %w", err)
 	}
 	for {
-		switch operation.State {
-		case store.FeishuRemoteOperationStatePrepared:
+		switch classifyRemoteCreateState(operation.State) {
+		case remoteCreateStateActionStart:
 			started, claimed, err := t.store.StartFeishuRemoteOperation(operation.RequestID, operation.AccountID, t.currentTime())
 			if err != nil {
 				return operation, "", fmt.Errorf("start feishu folder remote operation: %w", err)
@@ -100,14 +100,11 @@ func (t *docsFolderService) ensureFolderRemoteResult(ctx context.Context, operat
 				continue
 			}
 			return t.callAndRecordFolderCreate(ctx, operation, parent, expectedOwnerID)
-		case store.FeishuRemoteOperationStateRemoteStarted,
-			store.FeishuRemoteOperationStateReconcileRequired,
-			store.FeishuRemoteOperationStateOutcomeUnknown:
+		case remoteCreateStateActionReconcile:
 			return t.reconcileFolderCreate(ctx, operation, parent, expectedOwnerID)
-		case store.FeishuRemoteOperationStateRemoteSucceeded,
-			store.FeishuRemoteOperationStatePersisted:
+		case remoteCreateStateActionUseRecordedResult:
 			return operation, "", nil
-		case store.FeishuRemoteOperationStateFailed:
+		case remoteCreateStateActionRejectFailed:
 			return operation, "", fmt.Errorf("feishu folder creation previously failed before a recoverable result was recorded")
 		default:
 			return operation, "", fmt.Errorf("unsupported feishu folder remote operation state %q", operation.State)
